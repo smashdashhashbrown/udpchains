@@ -67,7 +67,7 @@ TESTS    := $(OBJDIR)/test_config $(OBJDIR)/test_socks5 $(OBJDIR)/test_addr \
             $(OBJDIR)/test_matrix $(OBJDIR)/test_fidelity \
             $(OBJDIR)/test_lifecycle $(OBJDIR)/test_thread \
             $(OBJDIR)/leakclient $(OBJDIR)/test_faults \
-            $(OBJDIR)/test_fdtable_mt \
+            $(OBJDIR)/test_fdtable_mt $(OBJDIR)/test_portswitch \
             $(OBJDIR)/bench_latency
 
 .PHONY: all clean test check install uninstall fixtures tests
@@ -136,6 +136,9 @@ $(OBJDIR)/test_fdtable_mt: $(TESTDIR)/test_fdtable_mt.c $(MT_OBJS) | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS) -ldl -lpthread
 
 $(OBJDIR)/test_faults: $(TESTDIR)/test_faults.c | $(OBJDIR)
+	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $< $(LDFLAGS)
+
+$(OBJDIR)/test_portswitch: $(TESTDIR)/test_portswitch.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $< $(LDFLAGS)
 
 $(OBJDIR)/leakclient: $(TESTDIR)/leakclient.c | $(OBJDIR)

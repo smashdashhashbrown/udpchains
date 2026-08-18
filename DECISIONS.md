@@ -26,6 +26,7 @@ a silent drift.
 | [D-12](#d-12) | Datagram limit configured, not discovered | Gap — FR-F-07 assumes the limit is known |
 | [D-13](#d-13) | One association per app socket, shared on `dup` | Derived from FR-P-02 + FR-L-03 |
 | [D-14](#d-14) | IPv4-mapped destinations are emitted as `ATYP 0x01` | Interop defect found against a real proxy |
+| [D-15](#d-15) | A connected socket receives only from its connected peer | Fidelity gap vs. an unhooked socket |
 
 ---
 
@@ -456,3 +457,48 @@ arriving in precisely the shape predicted.
 
 **Revisit if.** A proxy is found that requires the mapped form. None should — RFC 1928 has a
 dedicated IPv4 address type, and a v4-mapped address in an IPv6 field is a client bug.
+
+---
+
+## D-15
+### A connected socket receives only from its connected peer
+
+**Date:** 2026-08-18 · **Status:** Accepted · Recorded after v1 implementation, prompted by a
+question about how TFTP behaves under the shim.
+
+**Context.** An unhooked connected UDP socket receives only from the peer it is connected to; the
+kernel drops everything else before the application sees it. That is why TFTP clients use an
+*unconnected* socket — a TFTP server replies from a different port than the one addressed, and a
+connected socket would discard the reply.
+
+Under the shim, every datagram arrives from the relay, so the kernel's filter can never fire. The
+receive path discarded only oversized, malformed and `FRAG != 0` datagrams, and delivered everything
+else.
+
+**The gap.** The shim was **more permissive** than a real socket. A program that had called
+`connect()` would receive datagrams a real socket would have dropped. That is the wrong direction for
+§3's mandate that the shim be indistinguishable from an unhooked socket, and it silently removes a
+source filter some programs rely on. It also meant a TFTP client that (incorrectly) connected to port
+69 would work under the shim and fail without it — the shim masking a difference rather than
+preserving one.
+
+**Decision.** The receive path reimplements the filter against the true origin in the SOCKS header.
+When the socket is connected and the reply carries a usable address, a datagram whose origin is not
+the connected peer is discarded and the receive continues, exactly as the kernel would.
+
+Two deliberate exceptions:
+
+- **Domain-form replies** (`ATYP 0x03`) carry no address to compare. They are delivered, because the
+  alternative is resolving a name on the receive path, which would both leak a lookup and be a lie.
+- **Both addresses are normalised to the socket's family before comparing.** An `AF_INET6` socket
+  connected to `::ffff:a.b.c.d` whose proxy reports the origin as plain IPv4 is talking to the same
+  peer; comparing raw forms would reject every datagram. This is the D-14 v4-mapped trap in the
+  opposite direction, and it would have been easy to introduce while fixing this.
+
+**Consequences.** TFTP, which uses an unconnected socket, is unaffected and still works. A program
+using `connect()` as a source filter keeps that filter. The cost is one address comparison per
+received datagram, off the allocation path.
+
+**Revisit if.** A proxy is found that reports origins in a form that cannot be normalised to the
+socket's family, which would cause every datagram to be dropped. The `-v` output names the rejected
+origin, so this would be diagnosable rather than mysterious.

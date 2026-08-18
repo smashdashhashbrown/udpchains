@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 static struct sockaddr_in g_echo1, g_echo2;
@@ -490,6 +491,75 @@ static void t_ipv6(void)
 	close(fd);
 }
 
+static void t_connected_peer_filter(void)
+{
+	int fd = udp4();
+	char buf[64];
+	ssize_t n;
+
+	TAP_GROUP("a connected socket receives only from its connected peer");
+
+	/* An unhooked connected UDP socket only ever receives from the peer it
+	 * is connected to; the kernel drops the rest before the application
+	 * sees anything.  Under the shim every datagram arrives from the relay,
+	 * so that filter has to be reimplemented against the true origin -- or
+	 * the shim ends up MORE permissive than a real socket, which is the
+	 * wrong direction for §3.
+	 *
+	 * This is also why TFTP clients use an unconnected socket: the server
+	 * replies from a different port than the one addressed. */
+	TAP_EQ_INT(connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1)), 0,
+	           "connect to the first echo server");
+
+	/* Linux permits sendto with an explicit destination on a connected UDP
+	 * socket, so the second echo server can be provoked into replying from
+	 * an address this socket is NOT connected to. */
+	n = sendto(fd, "stranger", 8, 0, (struct sockaddr *)&g_echo2,
+	           sizeof(g_echo2));
+	TAP_EQ_INT(n, 8, "sendto a different peer is accepted");
+
+	/* Wait for the stranger's reply to actually arrive before checking that
+	 * it is refused.  Without this the non-blocking receive below can report
+	 * EAGAIN merely because nothing has arrived yet -- passing for the wrong
+	 * reason, and leaving the datagram queued to surface later in this test. */
+	{
+		struct timespec ts = { 0, 300000000L }; /* 300 ms */
+		nanosleep(&ts, NULL);
+	}
+
+	errno = 0;
+	n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+	TAP_EQ_INT(n, -1, "its reply is NOT delivered");
+	TAP_OK(errno == EAGAIN || errno == EWOULDBLOCK,
+	       "the socket reports EAGAIN, exactly as the kernel would (errno=%s)",
+	       strerror(errno));
+
+	/* The connected peer must still get through -- the filter has to reject
+	 * the stranger without breaking the ordinary case. */
+	TAP_EQ_INT(send(fd, "expected", 8, 0), 8, "a send to the connected peer works");
+	memset(buf, 0, sizeof(buf));
+	n = recv(fd, buf, sizeof(buf), 0);
+	TAP_OK(n == 8 && memcmp(buf, "expected", 8) == 0,
+	       "and its reply is delivered normally");
+
+	/* Once disconnected, the filter must stop applying. */
+	{
+		struct sockaddr sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_family = AF_UNSPEC;
+		connect(fd, &sa, sizeof(sa));
+	}
+	n = sendto(fd, "now-ok", 6, 0, (struct sockaddr *)&g_echo2,
+	           sizeof(g_echo2));
+	TAP_EQ_INT(n, 6, "after AF_UNSPEC, a send to the other peer works");
+	memset(buf, 0, sizeof(buf));
+	n = recv(fd, buf, sizeof(buf), 0);
+	TAP_OK(n == 6 && memcmp(buf, "now-ok", 6) == 0,
+	       "and an unconnected socket accepts its reply");
+
+	close(fd);
+}
+
 static void t_dualstack_to_ipv4(void)
 {
 	struct timeval tv = { 3, 0 };
@@ -670,6 +740,7 @@ int main(int argc, char **argv)
 	t_ancillary();
 	t_getsockname();
 	t_ipv6();
+	t_connected_peer_filter();
 	t_dualstack_to_ipv4();
 	t_unrepresentable();
 	t_passthrough();

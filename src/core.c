@@ -76,6 +76,45 @@ static int reject_unrepresentable(const struct sockaddr *dst)
 	return 0;
 }
 
+/* A connected UDP socket only receives from its connected peer -- the kernel
+ * drops everything else before the application ever sees it.  Under the shim
+ * every datagram arrives from the relay, so that filter can never fire on its
+ * own and has to be reimplemented against the true origin in the SOCKS header.
+ *
+ * Without this the shim is MORE permissive than an unhooked socket, which is
+ * the wrong direction for §3's "indistinguishable" mandate: a program that uses
+ * connect() as a source filter would silently lose it.
+ *
+ * Both addresses are normalised to the socket's family before comparing.  An
+ * AF_INET6 socket connected to ::ffff:a.b.c.d whose proxy reports the origin as
+ * plain IPv4 is the same peer, and comparing the raw forms would reject every
+ * datagram -- the same v4-mapped trap as D-14, in the other direction. */
+static bool from_unconnected_peer(const struct udpc_fdent *e,
+                                  const struct udpc_socks_hdr *hdr)
+{
+	struct sockaddr_storage got, want;
+	int fam;
+
+	if (!atomic_load_explicit(&e->connected, memory_order_acquire))
+		return false;
+
+	/* A domain-form reply carries no address to compare.  Delivering it is
+	 * the lesser evil: the alternative is resolving a name on the receive
+	 * path, which would both leak a lookup and be a lie. */
+	if (!hdr->addr_valid)
+		return false;
+
+	fam = atomic_load_explicit(&e->family, memory_order_relaxed);
+
+	if (udpc_addr_for_family((const struct sockaddr *)&hdr->addr, fam, &got) != 0)
+		got = hdr->addr;
+	if (udpc_addr_for_family((const struct sockaddr *)&e->app_dst, fam, &want) != 0)
+		want = e->app_dst;
+
+	return !udpc_addr_equal((const struct sockaddr *)&got,
+	                        (const struct sockaddr *)&want);
+}
+
 /* True for the errors that mean "this association is gone", which is what an
  * expired idle association looks like from here: the relay port stops
  * existing, so a connected UDP socket reports the resulting ICMP error. */
@@ -342,6 +381,16 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 				udpc_debug("dropping a relayed datagram with "
 				           "FRAG=%u",
 				           hdr.frag);
+				discard = true;
+			} else if (from_unconnected_peer(e, &hdr)) {
+				char sbuf[UDPC_ADDRSTRLEN];
+
+				udpc_debug("dropping a relayed datagram from %s: "
+				           "the socket is connected to a different "
+				           "peer, and the kernel would drop it too",
+				           udpc_addr_str((const struct sockaddr *)
+				                                 &hdr.addr,
+				                         sbuf, sizeof(sbuf)));
 				discard = true;
 			}
 		}

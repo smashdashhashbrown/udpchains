@@ -75,8 +75,10 @@ PROXY_PORT=$(start_fixture proxy "$BUILD/socks5d" --port 0 --quiet)
 ECHO1=$(start_fixture echo1 "$BUILD/udpecho" --port 0 --quiet)
 ECHO2=$(start_fixture echo2 "$BUILD/udpecho" --port 0 --quiet)
 ECHO6=$(start_fixture echo6 "$BUILD/udpecho" --port 0 -6 --quiet)
+# Replies from a different port than addressed -- the TFTP/SIP pattern.
+ECHOSW=$(start_fixture echosw "$BUILD/udpecho" --port 0 --switch-port --quiet)
 
-echo "fixtures: proxy=$PROXY_PORT echo1=$ECHO1 echo2=$ECHO2 echo6=$ECHO6"
+echo "fixtures: proxy=$PROXY_PORT echo1=$ECHO1 echo2=$ECHO2 echo6=$ECHO6 echosw=$ECHOSW"
 
 export UDPCHAINS_PROXY="127.0.0.1:$PROXY_PORT"
 export UDPCHAINS_QUIET=1
@@ -95,6 +97,9 @@ run_test TST-01-matrix \
 
 run_test TST-05-fidelity \
 	timeout 120 "$WRAPPER" "$BUILD/test_fidelity" "$ECHO1" "$ECHO2" "$ECHO6"
+
+run_test portswitch \
+	timeout 60 "$WRAPPER" "$BUILD/test_portswitch" "$ECHOSW"
 
 run_test TST-06-lifecycle \
 	timeout 120 "$WRAPPER" "$BUILD/test_lifecycle" "$ECHO1" "$ECHO2"

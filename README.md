@@ -136,6 +136,29 @@ Consequences you will actually notice:
 
 - **TCP is not proxied.** `proxychains-ng` already does that well. Composing the two is fine.
 
+### Protocols that depend on your proxy's inbound policy
+
+Some protocols have the server reply from a **different port** than the one it was addressed on —
+TFTP most visibly, and also SIP/RTP and various game protocols. Whether these work is decided by the
+proxy, not by udpchains:
+
+| Proxy inbound policy | Result |
+|---|---|
+| Port-restricted — only accept from an `address:port` already sent to | These protocols **fail**. The reply is dropped at the proxy and never reaches the shim. |
+| Address-restricted — accept from any port at a host already sent to | They work. This is the usual middle ground. |
+| Association-scoped — accept anything once associated | They work, but the relay is effectively open. |
+
+A port-restricted proxy is a defensible choice: it stops the relay being used as an open reflector,
+and RFC 1928 does not require otherwise. But the failure is invisible from the client side — the
+send succeeds, the association stays healthy, and nothing arrives. If a protocol like this hangs
+after the first exchange, check the **proxy's** logs for dropped inbound datagrams before suspecting
+the shim. `udpchains -v` will show the request leaving with the correct destination and `ATYP`, which
+is usually enough to place the fault at the far end.
+
+Note that udpchains applies its own filter only for sockets the application has `connect()`-ed, and
+only to match what the kernel does natively (D-15). An unconnected socket — which is what TFTP
+clients use, precisely because of the port switch — is not filtered by the shim at all.
+
 ### Not implemented in v1
 
 - SOCKS5 username/password authentication (RFC 1929). The credential plumbing exists; the protocol

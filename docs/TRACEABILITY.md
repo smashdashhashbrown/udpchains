@@ -25,7 +25,7 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 381 assertions across 12 groups, all passing.
+**Test totals:** 401 assertions across 13 groups, all passing.
 
 | Group | Assertions |
 |---|---|
@@ -34,7 +34,8 @@ inspection basis is recorded in the notes below.
 | unit-socks5 | 51 |
 | unit-fdtable | 12 |
 | TST-01 hook matrix | 108 |
-| TST-05 fidelity | 85 |
+| TST-05 fidelity | 93 |
+| port switch (TFTP pattern) | 12 |
 | TST-06 lifecycle | 26 |
 | TST-07 threading | 9 |
 | TST-03 leak | 7 checks |
@@ -78,13 +79,13 @@ inspection basis is recorded in the notes below.
 | ID | Pri | Design | Test | Status |
 |---|---|---|---|---|
 | FR-F-01 | M | §5.1 | TST-05, TST-01 | **Verified** — returns 40, not the wrapped 50 |
-| FR-F-02 | M | §5.2 | TST-05 | **Verified** — source is the echo server, not the relay; IPv4, IPv6, and (D-14) reported in the socket's own family so a dual-stack socket sees `::ffff:a.b.c.d` as the kernel would |
+| FR-F-02 | M | §5.2 | TST-05, portswitch | **Verified** — source is the echo server, not the relay; IPv4, IPv6, and (D-14) reported in the socket's own family so a dual-stack socket sees `::ffff:a.b.c.d` as the kernel would |
 | FR-F-03 | M | §5.4 | TST-05, TST-01 | **Verified** |
 | FR-F-04 | M | §5.2 | TST-05 | **Verified** — `MSG_TRUNC` in `msg_flags`; `recvmsg(MSG_TRUNC)` returns the true length |
 | FR-F-05 | M | §5.2 | TST-05 | **Verified** — peek is non-consuming and repeatable |
 | FR-F-06 | M | §5.1, §5.2 | TST-05 | **Verified** — zero-length round-trips; distinct from `EAGAIN` |
 | FR-F-07 | M | §6.4 | TST-05, faults | **Verified** — `EMSGSIZE` over the limit; exactly at the limit succeeds |
-| FR-F-08 | M | §5.1, §3.1 | TST-05 | **Verified** — connect, re-connect, `AF_UNSPEC` dissolve, then `EDESTADDRREQ` |
+| FR-F-08 | M | §5.1, §3.1 | TST-05 | **Verified** — connect, re-connect, `AF_UNSPEC` dissolve, then `EDESTADDRREQ`. A fidelity gap was found and fixed here (D-15): a connected socket accepted datagrams from any origin, where the kernel filters by the connected peer — the shim was *more* permissive than an unhooked socket |
 | FR-F-09 | M | §5.3 | TST-05, TST-01 | **Verified** — `msg_len` carries the app's length. A defect was found and fixed here: `recvmmsg` was applying `MSG_DONTWAIT` after the first message, but the kernel only does that for `MSG_WAITFORONE` |
 | FR-F-10 | M | §5.1, §5.2 | TST-05, TST-01 | **Verified** — 3-iovec send into 4 × 3-byte receive iovecs, where an unstripped 10-byte header would straddle a boundary |
 | FR-F-11 | S | §5.2 | TST-05 | **Verified** — `msg_controllen` zeroed, `MSG_CTRUNC` not set |
