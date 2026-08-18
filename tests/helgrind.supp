@@ -1,0 +1,82 @@
+# Helgrind suppressions for udpchains.
+#
+# Helgrind does not model C11 atomics.  The lock-free fd table (D-07) relies
+# entirely on them: fields are written, then published with a release store, and
+# read only after the matching acquire load.  Helgrind cannot see those
+# happens-before edges, so it reports every such access -- and every memcpy of a
+# field ordered by one, such as the relay address or the connect() destination --
+# as a "possible data race".  There is nothing to fix and nothing to learn.
+#
+# Note the leading "..." in each entry.  Helgrind matches from the innermost
+# frame outwards, and that frame is usually memcpy or memmove inside its own
+# preload library rather than any udpchains function.  Without the wildcard
+# these suppressions silently match nothing.
+#
+# This is why real race detection for the fd table lives in
+# tests/test_fdtable_mt.c under ThreadSanitizer instead: TSan does model C11
+# atomics, and it found -- and we fixed -- a genuine race on the entry's family
+# and type fields that Helgrind's noise would have buried completely.
+#
+# Helgrind is still worth running for what it IS good at: lock ordering and
+# pthread API misuse.  These suppressions silence only the atomics.
+
+{
+   udpchains-c11-atomics-anywhere-in-the-shim
+   Helgrind:Race
+   ...
+   obj:*/libudpchains.so
+}
+{
+   udpchains-c11-atomics-real
+   Helgrind:Race
+   ...
+   fun:udpc_real
+}
+{
+   udpchains-c11-atomics-fdtable
+   Helgrind:Race
+   ...
+   fun:udpc_fd_*
+}
+{
+   udpchains-c11-atomics-fdtable-block
+   Helgrind:Race
+   ...
+   fun:block_for
+}
+{
+   udpchains-c11-atomics-assoc
+   Helgrind:Race
+   ...
+   fun:udpc_assoc_*
+}
+{
+   udpchains-c11-atomics-establish
+   Helgrind:Race
+   ...
+   fun:establish
+}
+{
+   udpchains-c11-atomics-send
+   Helgrind:Race
+   ...
+   fun:send_once
+}
+{
+   udpchains-c11-atomics-core
+   Helgrind:Race
+   ...
+   fun:udpc_core_*
+}
+{
+   udpchains-c11-atomics-addr
+   Helgrind:Race
+   ...
+   fun:udpc_addr_for_family
+}
+{
+   udpchains-c11-atomics-connect-hook
+   Helgrind:Race
+   ...
+   fun:connect
+}

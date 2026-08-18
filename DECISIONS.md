@@ -25,6 +25,7 @@ a silent drift.
 | [D-11](#d-11) | Asymmetric buffer strategy | NFR-02 (mechanism unspecified) |
 | [D-12](#d-12) | Datagram limit configured, not discovered | Gap — FR-F-07 assumes the limit is known |
 | [D-13](#d-13) | One association per app socket, shared on `dup` | Derived from FR-P-02 + FR-L-03 |
+| [D-14](#d-14) | IPv4-mapped destinations are emitted as `ATYP 0x01` | Interop defect found against a real proxy |
 
 ---
 
@@ -404,3 +405,54 @@ fresh association is established. Control-connection fds are `FD_CLOEXEC` (FR-L-
 concern noted in D-04 and D-05. Accepted for v1; pooling would mean a second association model.
 
 **Revisit if.** Association count becomes a practical limit against real proxies.
+
+---
+
+## D-14
+### IPv4-mapped destinations are emitted as `ATYP 0x01`, never `ATYP 0x04`
+
+**Date:** 2026-08-18 · **Status:** Accepted · Recorded after v1 implementation, in response to an
+interop failure against a real proxy.
+
+**Context.** An application that opens an `AF_INET6` dual-stack socket and connects to an IPv4
+destination ends up with `::ffff:a.b.c.d` as its destination address. This is not an edge case: it
+is what `getaddrinfo`-based clients, `nc`, and most modern runtimes do by default on a dual-stack
+host, without the application asking for it or being able to see it.
+
+The original encoder branched on `sa_family` alone, so such a destination was written into the SOCKS5
+header as `ATYP 0x04` with all sixteen bytes. That asks the proxy to reach an IPv6 address which, as
+an IPv6 address, does not exist.
+
+**How it presented.** Against a real SOCKS5 proxy: `UDP ASSOCIATE` succeeds, the association looks
+healthy from both ends, the control connection stays open, and the datagram simply never arrives at
+the destination. No error on either side. The proxy has no reason to log anything — it forwarded, or
+declined to forward, an address it was given.
+
+**Why the test suite missed it.** The in-repo fixture (D-06) uses a dual-stack relay socket. It
+decoded the mapped address and sent it from that socket, where the kernel converted it back to IPv4
+and delivered it. Two bugs cancelling: the shim sent the wrong form, the fixture forgave it, and the
+108-cell hook matrix stayed green. The IPv6 tests all used genuine `::1` addresses on both ends, so
+the mapped case was never exercised at all.
+
+This is exactly the failure mode D-06 named — "a green fixture suite is not evidence of interop" —
+arriving in precisely the shape predicted.
+
+**Decision.**
+
+- The header encoder normalises: an `AF_INET6` address that satisfies `IN6_IS_ADDR_V4MAPPED` is
+  emitted as `ATYP 0x01` with the four embedded bytes. A genuine IPv6 address still uses `ATYP 0x04`.
+  This applies to datagram headers and to the address declared in the `UDP ASSOCIATE` request.
+- Symmetrically on receive, the source address is reported in the **socket's own** family: an
+  `AF_INET6` socket that heard from an IPv4 peer is told `::ffff:a.b.c.d`, which is what the kernel
+  would have told it. An `AF_INET` sockaddr is not something such an application has anywhere to put.
+- **The fixture is now strict about this**: `ATYP 0x04` carrying a v4-mapped address is rejected and
+  logged rather than quietly forwarded, so the fixture can no longer conceal this class of defect.
+
+**Consequences.**
+- The dual-stack-to-IPv4 path is now covered by a byte-level unit test and an end-to-end test, both
+  of which fail against the old encoder.
+- The fixture became less forgiving than a permissive real proxy. That is the right direction: a test
+  double should be stricter than production, not more lenient, or it certifies nothing.
+
+**Revisit if.** A proxy is found that requires the mapped form. None should — RFC 1928 has a
+dedicated IPv4 address type, and a v4-mapped address in an IPv6 field is a client bug.

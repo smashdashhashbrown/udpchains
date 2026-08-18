@@ -1,0 +1,94 @@
+#!/bin/sh
+# test_symbols.sh -- TST-02, the exported-symbol check.
+#
+# Asserts every function named in FR-I-03/04/05 is present in the shim's dynamic
+# symbol table.  A missing receive hook FAILS THE BUILD rather than a test run,
+# because the failure it guards against -- a program that sends successfully and
+# then reads back data with the SOCKS header still attached (FR-I-02, baseline
+# §0.3.2) -- is silent data corruption, not a visible error.
+#
+# It also asserts that the readiness calls are ABSENT.  FR-I-07 redirects the
+# application's own fd to the relay rather than shadowing it, so poll/select/
+# epoll need no hooking; if one ever appears here, the architecture has drifted.
+
+set -eu
+
+SHIM="${1:-libudpchains.so}"
+
+if [ ! -f "$SHIM" ]; then
+	echo "TST-02: $SHIM not found" >&2
+	exit 1
+fi
+
+SYMS=$(nm -D --defined-only "$SHIM" | awk '{print $3}')
+
+fail=0
+
+want() {
+	for sym in "$@"; do
+		if printf '%s\n' "$SYMS" | grep -qx "$sym"; then
+			echo "ok - $sym is hooked"
+		else
+			echo "not ok - $sym is NOT hooked" >&2
+			fail=1
+		fi
+	done
+}
+
+reject() {
+	for sym in "$@"; do
+		if printf '%s\n' "$SYMS" | grep -qx "$sym"; then
+			echo "not ok - $sym is hooked, but FR-I-07 says it must not be" >&2
+			fail=1
+		else
+			echo "ok - $sym is correctly not hooked"
+		fi
+	done
+}
+
+echo "# TST-02: FR-I-03 send hooks"
+want sendto sendmsg sendmmsg send write writev
+
+echo "# TST-02: FR-I-03 receive hooks"
+want recvfrom recvmsg recvmmsg recv read readv
+
+echo "# TST-02: FR-I-04 lifecycle hooks"
+want socket connect bind close dup dup2 dup3
+
+# NFR-01a / D-09: close_range is conditionally compiled.  Assert the right set
+# for this build rather than failing spuriously on a deliberate omission.
+if [ "${GLIBC_NO_CLOSE_RANGE:-}" = "" ]; then
+	want close_range
+else
+	echo "# close_range hook omitted deliberately (GLIBC_NO_CLOSE_RANGE)"
+	reject close_range
+fi
+
+echo "# TST-02: FR-I-05 introspection hooks"
+want getpeername getsockname
+
+echo "# TST-02: FR-I-07 -- readiness calls must NOT be hooked"
+reject poll ppoll select pselect epoll_wait epoll_pwait setsockopt getsockopt
+
+echo "# TST-02: FR-I-02 -- send/receive hook symmetry"
+# Every send-path function must have its receive-path counterpart.  Checked as
+# pairs so that adding a send hook without its partner fails here.
+for pair in "sendto:recvfrom" "sendmsg:recvmsg" "sendmmsg:recvmmsg" \
+            "send:recv" "write:read" "writev:readv"; do
+	s=${pair%%:*}
+	r=${pair##*:}
+	shave=$(printf '%s\n' "$SYMS" | grep -cx "$s" || true)
+	rhave=$(printf '%s\n' "$SYMS" | grep -cx "$r" || true)
+	if [ "$shave" = "$rhave" ]; then
+		echo "ok - $s/$r are symmetric"
+	else
+		echo "not ok - $s and $r are asymmetric: this is the FR-I-02 defect" >&2
+		fail=1
+	fi
+done
+
+if [ "$fail" -ne 0 ]; then
+	echo "TST-02 FAILED" >&2
+	exit 1
+fi
+echo "# TST-02 passed"
