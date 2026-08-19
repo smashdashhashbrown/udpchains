@@ -83,12 +83,23 @@ This section is the honest part. Read it before deciding whether this tool suits
 | **Go binaries** | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. |
 | **setuid/setgid binaries** | The loader ignores `LD_PRELOAD` for them. `udpchains` detects this and **refuses to run them** rather than running them unproxied. Binaries with file capabilities are refused for the same reason. |
 | **Programs calling `syscall()` directly** | Same reason. `ptrace`-based interception is the only answer, and is out of scope. |
+| **Programs using raw sockets** | `SOCK_RAW` is not intercepted, and SOCKS5 has no way to carry a raw IP packet. Such traffic goes **direct** — see the warning below. `nmap`, `traceroute` and similar tools are in this category. |
 
 ### Traffic it deliberately refuses
 
 **There is no bypass in v1.** Every intercepted datagram is either proxied or fails. That is what
 makes the leak test meaningful — a bypass rule set would need its own list of expected direct
 traffic, and that list is exactly where a leak hides.
+
+> **The one exception, and it is a real one: raw sockets.** The shim intercepts `SOCK_DGRAM` in
+> `AF_INET`/`AF_INET6` and nothing else. A program that opens a `SOCK_RAW` socket gets unproxied
+> network access, with no diagnostic and nothing in the logs — the shim never sees it. SOCKS5 cannot
+> express a raw IP packet, so there is no honest way to proxy it, but "cannot proxy" should mean
+> "refuse", and today it means "pass through". Raw sockets need `CAP_NET_RAW`, so this is not
+> reachable by an ordinary unprivileged program — but if you are relying on this tool to guarantee
+> that a **privileged** process cannot reach the network directly, it does not. Deferred rather than
+> dropped; refusing raw socket creation the way multicast and broadcast sends already fail is the
+> obvious v2 change.
 
 Consequences you will actually notice:
 

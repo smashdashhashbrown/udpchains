@@ -587,3 +587,46 @@ program opens, so this cannot grow without bound, but it is not zero. Documented
 **Why the test suite missed it.** Every test client closes through libc, so every close reached the
 hook. The condition needs a program whose runtime does not — which is a property of the *client*, not
 of the proxy or the protocol, and so was invisible to a suite that supplies its own clients.
+
+---
+
+## D-18
+### Raw sockets are not intercepted, and v1 documents that rather than refusing
+
+**Date:** 2026-08-19 · **Status:** Accepted for v1, with a named successor · Prompted by trying
+`nmap` under the shim.
+
+**Context.** `is_intercepted_kind` claims `SOCK_DGRAM` in `AF_INET`/`AF_INET6` and nothing else. A
+`SOCK_RAW` socket is therefore never claimed, so its traffic goes direct.
+
+**Why this is a real gap and not just a limitation.** SEC-01 and the README both state that traffic
+is either proxied or fails, and that there is no bypass. Raw sockets are a bypass. Unlike the
+statically-linked and Go cases — where the shim is never loaded and cannot be expected to do anything
+— here the shim **is** loaded, sees the `socket()` call, and lets it through. That is the leak class
+D-05 rejected a bypass list to avoid, arriving by a different route.
+
+**Why v1 does not refuse.** Refusing `SOCK_RAW` creation is a behaviour change reaching well beyond
+the tool that exposed it. Raw sockets require `CAP_NET_RAW`, so nothing an ordinary unprivileged
+program does is affected; but a privileged program that opens one for a purpose unrelated to the
+traffic being proxied would start failing, and v1 has no interop evidence about what those programs
+are. Shipping a refusal on the strength of one `nmap` run would be guessing.
+
+The severity is also bounded in a specific way: the capability requirement means this is not
+reachable by the threat model most users have in mind. It matters when the guarantee being sought is
+"this privileged process cannot reach the network directly", and v1 does not provide that.
+
+**Decision.** v1 documents it prominently — in the "cannot help" table and as an explicit exception
+beside the no-bypass claim, in the same terms used here. No code change.
+
+**v2 should refuse `SOCK_RAW` creation** with a diagnostic naming the reason, exactly as multicast
+and broadcast sends fail with `ENETUNREACH` under D-05 R1. That is the consistent position: SOCKS5
+cannot express a raw IP packet, and "cannot proxy" should mean "refuse", not "pass through".
+
+**Note on `nmap` specifically.** It would not work even with raw sockets refused. It reads responses
+with libpcap rather than through the socket API, and a UDP scan classifies a closed port from an
+ICMP type 3 code 3 that RFC 1928 has no way to convey. `nmap -sU --unprivileged` uses ordinary
+datagram sockets and is intercepted, but can only ever report `open|filtered`.
+
+**Revisit if:** a refusal is implemented (v2), or a program is found that legitimately needs raw
+sockets alongside proxied UDP — which would argue for a narrow opt-out rather than the current
+silent pass-through.
