@@ -63,6 +63,7 @@ TMP=""
 PIDS=()
 PROXY=""
 ECHO1=""
+ECHO2=""
 ECHO6=""
 
 stop_fixtures() {
@@ -93,6 +94,14 @@ start_fixtures() {
 	PIDS+=($!)
 	"$BUILD/udpecho" --port 0 --quiet > "$TMP/e1.out" 2>&1 &
 	PIDS+=($!)
+	# A SECOND IPv4 echo server, distinct from the first.  test_fidelity's
+	# connected-peer filter (D-15) provokes a reply from an address the
+	# socket is NOT connected to; with one server passed twice the
+	# "stranger" IS the connected peer, its reply is correctly delivered,
+	# and the test fails while the shim is behaving perfectly.
+	# test_lifecycle likewise connects to two different peers.
+	"$BUILD/udpecho" --port 0 --quiet > "$TMP/e2.out" 2>&1 &
+	PIDS+=($!)
 	"$BUILD/udpecho" --port 0 -6 --quiet > "$TMP/e6.out" 2>&1 &
 	PIDS+=($!)
 
@@ -100,8 +109,10 @@ start_fixtures() {
 	for ((i = 0; i < 200; i++)); do
 		PROXY=$(awk '/^PORT/{print $2; exit}' "$TMP/proxy.out" 2>/dev/null)
 		ECHO1=$(awk '/^PORT/{print $2; exit}' "$TMP/e1.out" 2>/dev/null)
+		ECHO2=$(awk '/^PORT/{print $2; exit}' "$TMP/e2.out" 2>/dev/null)
 		ECHO6=$(awk '/^PORT/{print $2; exit}' "$TMP/e6.out" 2>/dev/null)
-		[ -n "$PROXY" ] && [ -n "$ECHO1" ] && [ -n "$ECHO6" ] && return 0
+		[ -n "$PROXY" ] && [ -n "$ECHO1" ] && [ -n "$ECHO2" ] &&
+			[ -n "$ECHO6" ] && return 0
 		sleep 0.05
 	done
 	echo "FATAL: fixtures did not start" >&2
@@ -216,14 +227,14 @@ run_valgrind() {
 
 	echo "--- fidelity"
 	LD_PRELOAD="$ROOT/libudpchains.so" "${VG[@]}" \
-		"$BUILD/test_fidelity" "$ECHO1" "$ECHO1" "$ECHO6" \
+		"$BUILD/test_fidelity" "$ECHO1" "$ECHO2" "$ECHO6" \
 		> "$TMP/vg_fidelity.out" 2>&1
 	rc=$?
 	report fidelity "$TMP/vg_fidelity.out" "$rc"
 
 	echo "--- lifecycle"
 	LD_PRELOAD="$ROOT/libudpchains.so" "${VG[@]}" \
-		"$BUILD/test_lifecycle" "$ECHO1" "$ECHO1" > "$TMP/vg_life.out" 2>&1
+		"$BUILD/test_lifecycle" "$ECHO1" "$ECHO2" > "$TMP/vg_life.out" 2>&1
 	rc=$?
 	report lifecycle "$TMP/vg_life.out" "$rc"
 
