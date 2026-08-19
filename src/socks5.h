@@ -91,6 +91,19 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 
 /* Closes the control connection, which is what tells the proxy to release the
  * association (baseline §0.5). */
+/* Rewrites a BND.ADDR that cannot be taken literally.
+ *
+ * A wildcard relay (0.0.0.0 / ::) always means "the address you already reached
+ * me on".  A LOOPBACK relay means the same thing whenever the proxy is not on
+ * this host -- the proxy can only describe its own local view of the socket it
+ * bound.  Both are replaced by the configured proxy address, keeping the port.
+ *
+ * Exposed separately from udpc_socks_associate so it can be tested: the
+ * loopback case only arises with a non-local proxy, which no single-host
+ * fixture run can produce. */
+void udpc_socks_fixup_relay(struct sockaddr_storage *relay,
+                            const struct udpc_config *cfg);
+
 void udpc_socks_disconnect(struct udpc_socks_conn *conn);
 
 /* True while the control connection is still open.  Used to detect an

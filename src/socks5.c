@@ -333,6 +333,65 @@ static int connect_with_timeout(int fd, const struct sockaddr *sa, socklen_t len
 	return 0;
 }
 
+/* BND.ADDR is the address the client must send datagrams to, but two common
+ * forms cannot be taken literally.
+ *
+ * A wildcard (0.0.0.0 or ::) means "the address you already reached me on".
+ * Sent to literally, it would mean sending to the wildcard address.
+ *
+ * A loopback address means the same thing whenever the proxy is NOT on this
+ * host: the proxy is describing its own local view of the socket it bound,
+ * which is the only view it has.  Taken literally it points the application's
+ * socket at *this* host's loopback, where nothing is listening -- so every
+ * datagram is discarded, the resulting ICMP port unreachable surfaces as
+ * ECONNREFUSED on the next receive, and the association machinery reads that as
+ * expiry and re-associates indefinitely.
+ *
+ * When the proxy IS on this host, a loopback relay is correct and must be left
+ * alone.  That is why proxy_is_local gates the loopback case and the wildcard
+ * case is unconditional.
+ *
+ * Found against a real proxy on 2026-08-19: the fixture had always advertised a
+ * reachable relay, so no fixture run could reach this.
+ */
+void udpc_socks_fixup_relay(struct sockaddr_storage *relay,
+                            const struct udpc_config *cfg)
+{
+	bool wildcard = false, unusable_loopback = false;
+	char rbuf[UDPC_ADDRSTRLEN];
+	uint16_t port;
+
+	if (relay->ss_family == AF_INET) {
+		const struct sockaddr_in *r = (const struct sockaddr_in *)relay;
+		wildcard = (r->sin_addr.s_addr == INADDR_ANY);
+	} else if (relay->ss_family == AF_INET6) {
+		const struct sockaddr_in6 *r = (const struct sockaddr_in6 *)relay;
+		wildcard = IN6_IS_ADDR_UNSPECIFIED(&r->sin6_addr);
+	} else {
+		return;
+	}
+
+	if (!wildcard && !cfg->proxy_is_local)
+		unusable_loopback =
+			udpc_addr_is_loopback((const struct sockaddr *)relay);
+
+	if (!wildcard && !unusable_loopback)
+		return;
+
+	if (unusable_loopback)
+		udpc_debug("proxy returned loopback relay %s but is not on this "
+		           "host; using the proxy address instead",
+		           udpc_addr_str((const struct sockaddr *)relay, rbuf,
+		                         sizeof(rbuf)));
+	else
+		udpc_debug("proxy returned a wildcard relay address; using the "
+		           "proxy address instead");
+
+	port = udpc_sa_port((const struct sockaddr *)relay);
+	*relay = cfg->proxy;
+	udpc_sa_set_port((struct sockaddr *)relay, port);
+}
+
 int udpc_socks_associate(const struct udpc_config *cfg,
                          const struct sockaddr *bind_addr,
                          struct udpc_socks_conn *conn, int *out_errno)
@@ -523,30 +582,7 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 
 	conn->relay = hdr.addr;
 
-	/* A proxy may legitimately return 0.0.0.0 or :: to mean "the address
-	 * you already reached me on".  Substituting the proxy's own address is
-	 * the standard reading, and without it the shim would send datagrams to
-	 * the wildcard address. */
-	{
-		bool wildcard = false;
-		if (conn->relay.ss_family == AF_INET) {
-			const struct sockaddr_in *r =
-				(const struct sockaddr_in *)&conn->relay;
-			wildcard = (r->sin_addr.s_addr == INADDR_ANY);
-		} else if (conn->relay.ss_family == AF_INET6) {
-			const struct sockaddr_in6 *r =
-				(const struct sockaddr_in6 *)&conn->relay;
-			wildcard = IN6_IS_ADDR_UNSPECIFIED(&r->sin6_addr);
-		}
-		if (wildcard) {
-			uint16_t port = udpc_sa_port(
-				(const struct sockaddr *)&conn->relay);
-			conn->relay = cfg->proxy;
-			udpc_sa_set_port((struct sockaddr *)&conn->relay, port);
-			udpc_debug("proxy returned a wildcard relay address; "
-			           "using the proxy address instead");
-		}
-	}
+	udpc_socks_fixup_relay(&conn->relay, cfg);
 
 	conn->control_fd = fd;
 	return 0;

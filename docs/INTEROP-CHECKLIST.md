@@ -184,6 +184,67 @@ CPython uses libc sockets, so interception works — but the process being proxi
 
 ---
 
+## 4b. A genuinely remote proxy (D-05 R2, D-16)
+
+Every other test here can be run with the proxy on this host. This one cannot: it needs the SOCKS5
+listener reachable at the **proxy's own address**, which is usually a proxy config change rather than
+a different `-p`. It is the only way `proxy_is_local` becomes false.
+
+```sh
+# precondition -- must NOT print "(local)"
+./udpchains -v -p <remote-ip>:<port> true
+
+# it still proxies at all
+./udpchains -v -p <remote-ip>:<port> dig +short myip.opendns.com @208.67.222.222
+
+# the loopback guard, warning form
+./udpchains -v -p <remote-ip>:<port> nc -u 127.0.0.1 9999
+
+# the loopback guard, error form
+UDPCHAINS_STRICT_LOOPBACK=1 ./udpchains -v -p <remote-ip>:<port> nc -u 127.0.0.1 9999
+```
+
+**Pass:** no `(local)`; the guard warns, then refuses with `ENETUNREACH` under `strict_loopback`; and
+the `dig` returns the proxy's egress address. The guard fires only on `connect()`-ed sockets, which
+`nc -u` uses.
+
+**Watch the relay address in every `association up` line.** If it is `127.0.0.1` while the proxy is
+remote, the datagrams are going to *this* host's loopback and nothing will arrive — that is D-16.
+The shim now substitutes the proxy address in that case; seeing a loopback relay from a remote proxy
+after the fix means the substitution has regressed.
+
+⚠️ **First attempted 2026-08-19: the guard passed, the run failed.** `proxy_is_local` was correctly
+false and the guard produced exactly the right message — its first end-to-end exercise. But the proxy
+advertised `BND.ADDR = 127.0.0.1`, which the shim took literally (**D-16**), so every datagram went
+to local loopback. The resulting ICMP port-unreachable read as an expired association, and the
+repeated re-association exposed a second defect (**D-17**): entries stranded by closes the shim never
+saw, refused on reuse with a spurious `EMFILE`.
+
+✅ **Re-run 2026-08-19 after the fixes: both are confirmed against the real proxy.** The substitution
+fires (`proxy returned loopback relay 127.0.0.1:52711 ... using the proxy address instead`, and the
+association line then names `<vps>:52711`), and the stale-entry reclaim produces exactly one line
+with no `EMFILE` — dig retries three times and gives up honestly. The loopback guard passes in both
+forms: it warns, and under `strict_loopback` it refuses with `ENETUNREACH`. Note the refusal surfaces
+on the first **send**, not on `connect()`, because `connect()` on a UDP socket transmits nothing.
+
+❌ **Still blocked, and now on the proxy side.** Datagrams reach `<vps>:52711` and nothing comes back.
+The proxy's own log shows three associations opened and **zero datagrams received**, then an idle
+close. It advertised `127.0.0.1` because that is where it actually bound its relay socket, so the
+substituted public address is correct in principle and still has nothing listening on it.
+
+SOCKS5 `UDP ASSOCIATE` requires the relay port to be reachable *from the client*. To locate it, run
+this on the proxy host while an association is open:
+
+```sh
+ss -uanp
+```
+
+A relay bound to `127.0.0.1:NNNNN` means the proxy must bind `0.0.0.0` and advertise a routable
+`BND.ADDR`. Bound to `0.0.0.0:NNNNN` means a firewall is dropping inbound UDP on ephemeral ports.
+Neither is something the shim can work around.
+
+---
+
 ## 5. Many short-lived sockets — association churn
 
 Every UDP socket gets its own association and control connection (D-13). TFTP used one.

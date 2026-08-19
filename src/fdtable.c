@@ -70,19 +70,42 @@ struct udpc_fdent *udpc_fd_claim(int fd, int family, int type)
 
 	e = &blk[(unsigned)fd & (UDPC_FD_BLOCK_SIZE - 1)];
 
-	/* The kernel guarantees this fd number is not concurrently live, so the
-	 * only states we can legitimately find are FREE or a stale DYING from a
-	 * close that has already dropped its reference. */
+	/* Every caller passes an fd the kernel has JUST allocated -- from
+	 * socket(), or as the target of a dup.  The kernel does not hand out a
+	 * descriptor number that is already live, so finding anything other than
+	 * FREE here is proof that the entry is STALE, not proof of a conflict.
+	 *
+	 * Stale entries are not hypothetical.  The table is released from the
+	 * close() hook, and a program whose runtime closes descriptors by a
+	 * route that does not go through libc's PLT entry never reaches it --
+	 * dig, via libuv, makes 64 close syscalls of which 4 reach the hook.
+	 * Its descriptor is then stranded ACTIVE, and the next socket() landing
+	 * on that number used to be refused with EMFILE, breaking a program that
+	 * had done nothing wrong.  Worse, the stranded entry still held a
+	 * reference to its association, so the control connection leaked too.
+	 *
+	 * Recycling the slot fixes both: udpc_fd_release drops the association
+	 * reference (closing the control connection, releasing the association
+	 * at the proxy) and returns the slot to FREE, bumping the generation so
+	 * anything still holding the old entry is rejected (FR-L-02).
+	 *
+	 * Found on 2026-08-19 against a real proxy.  The fixture suite never
+	 * reached it because its clients close through libc. */
 	if (!atomic_compare_exchange_strong_explicit(&e->state, &expected,
 	                                             UDPC_FD_CLAIMING,
 	                                             memory_order_acq_rel,
 	                                             memory_order_acquire)) {
-		expected = UDPC_FD_DYING;
+		udpc_debug("fd %d: reclaiming a stale entry (state %d) -- the "
+		           "descriptor was closed without the shim seeing it",
+		           fd, atomic_load(&e->state));
+		udpc_fd_release(fd);
+
+		expected = UDPC_FD_FREE;
 		if (!atomic_compare_exchange_strong_explicit(&e->state, &expected,
 		                                             UDPC_FD_CLAIMING,
 		                                             memory_order_acq_rel,
 		                                             memory_order_acquire)) {
-			udpc_debug("fd %d already claimed (state %d)", fd,
+			udpc_debug("fd %d still not claimable (state %d)", fd,
 			           atomic_load(&e->state));
 			return NULL;
 		}

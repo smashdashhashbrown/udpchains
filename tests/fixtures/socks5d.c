@@ -68,7 +68,8 @@ static struct {
 	bool peer_lock;
 	int reject_atyp;
 	bool quiet;
-} opt = { 0, false, false, 0, 0, 0, 8192, false, true, -1, false };
+	bool dead_relay;
+} opt = { 0, false, false, 0, 0, 0, 8192, false, true, -1, false, false };
 
 static void logf_(const char *fmt, ...)
 	__attribute__((format(printf, 1, 2)));
@@ -438,6 +439,31 @@ static void *client_thread(void *arg)
 	{
 		uint16_t port = ((struct sockaddr_in6 *)&relay_addr)->sin6_port;
 
+		/* --dead-relay advertises a port nothing is listening on, which
+		 * is what a proxy that reports its own loopback view looks like
+		 * to a REMOTE client: the datagrams leave, land nowhere, and the
+		 * ICMP port unreachable comes back as ECONNREFUSED.  That is the
+		 * failure a real proxy produced on 2026-08-19, and nothing in the
+		 * fixture could produce it before. */
+		if (opt.dead_relay) {
+			int probe = socket(AF_INET, SOCK_DGRAM, 0);
+			struct sockaddr_in pa;
+			socklen_t plen = sizeof(pa);
+
+			memset(&pa, 0, sizeof(pa));
+			pa.sin_family = AF_INET;
+			pa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+			pa.sin_port = 0;
+			if (probe >= 0 &&
+			    bind(probe, (struct sockaddr *)&pa, sizeof(pa)) == 0 &&
+			    getsockname(probe, (struct sockaddr *)&pa, &plen) == 0)
+				port = pa.sin_port;
+			if (probe >= 0)
+				close(probe); /* now nothing listens there */
+			logf_("--dead-relay: advertising dead port %u",
+			      ntohs(port));
+		}
+
 		memset(&relay_addr, 0, sizeof(relay_addr));
 		if (family == AF_INET) {
 			struct sockaddr_in *a = (struct sockaddr_in *)&relay_addr;
@@ -649,6 +675,8 @@ int main(int argc, char **argv)
 			opt.reject_atyp = atoi(argv[++i]);
 		else if (strcmp(a, "--quiet") == 0)
 			opt.quiet = true;
+		else if (strcmp(a, "--dead-relay") == 0)
+			opt.dead_relay = true;
 		else {
 			fprintf(stderr, "socks5d: unknown option %s\n", a);
 			return 1;

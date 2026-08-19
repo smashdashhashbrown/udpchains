@@ -207,5 +207,49 @@ int main(void)
 		       "number cannot inherit stale state");
 	}
 
+
+	/* A descriptor closed WITHOUT the shim seeing it strands its entry
+	 * ACTIVE.  That is not hypothetical: dig closes through libuv, which
+	 * does not reach the interposed close(), so 60 of its 64 close syscalls
+	 * are invisible to the shim.  When the kernel then hands the same fd
+	 * number to a later socket(), the claim used to be refused and the
+	 * caller got EMFILE -- a working program broken by a descriptor it had
+	 * closed correctly.  The stranded entry also kept its association
+	 * reference, leaking the control connection.
+	 *
+	 * The kernel never hands out a live descriptor number, so a non-FREE
+	 * entry at claim time is proof of staleness, not of a conflict. */
+	TAP_GROUP("a stale entry is recycled, not refused (uninterposed close)");
+	{
+		struct udpc_fdent *first, *second;
+		unsigned gen_before;
+
+		first = udpc_fd_claim(91, AF_INET, SOCK_DGRAM);
+		TAP_OK(first != NULL, "descriptor 91 is claimed");
+		udpc_fd_publish(first);
+		gen_before = atomic_load(&first->generation);
+
+		/* No udpc_fd_release: this is precisely the close the shim
+		 * never saw. */
+		second = udpc_fd_claim(91, AF_INET6, SOCK_DGRAM);
+		TAP_OK(second != NULL,
+		       "claiming it again SUCCEEDS rather than returning NULL, "
+		       "which is what produced a spurious EMFILE");
+		TAP_OK(second == first,
+		       "and reuses the same slot, as the fd number demands");
+		TAP_OK(atomic_load(&second->generation) != gen_before,
+		       "the generation advanced, so anything holding the old "
+		       "entry is rejected (FR-L-02)");
+		TAP_EQ_INT(atomic_load(&second->family), AF_INET6,
+		           "the slot carries the NEW socket's family, not the "
+		           "stranded one's");
+		TAP_OK(atomic_load(&second->assoc) == NULL,
+		       "and no association is inherited from the stale entry");
+
+		udpc_fd_publish(second);
+		TAP_OK(udpc_fd_lookup(91) != NULL, "the recycled entry is usable");
+		udpc_fd_release(91);
+	}
+
 	TAP_DONE();
 }

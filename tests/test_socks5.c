@@ -241,5 +241,98 @@ int main(void)
 		           "a NULL destination is refused");
 	}
 
+
+	/* The relay address a proxy advertises in BND.ADDR cannot always be
+	 * taken literally.  The loopback case is only reachable with a NON-local
+	 * proxy, so no single-host fixture run can produce it -- it reached a
+	 * real proxy undetected on 2026-08-19 and cost an afternoon.  These
+	 * assertions are the only guard against it regressing. */
+	TAP_GROUP("BND.ADDR relay addresses that cannot be taken literally");
+	{
+		struct udpc_config cfg;
+		struct sockaddr_storage relay;
+		struct sockaddr_in *r4 = (struct sockaddr_in *)&relay;
+		struct sockaddr_in6 *r6 = (struct sockaddr_in6 *)&relay;
+		struct sockaddr_in proxy4;
+
+		/* A remote proxy at 203.0.113.9:1080 (TEST-NET-3). */
+		memset(&cfg, 0, sizeof(cfg));
+		make_v4(&proxy4, "203.0.113.9", 1080);
+		memcpy(&cfg.proxy, &proxy4, sizeof(proxy4));
+		cfg.proxy_is_local = false;
+
+		/* Loopback relay from a REMOTE proxy: unusable as given.  The
+		 * port must survive; only the address is replaced. */
+		make_v4(r4, "127.0.0.1", 51464);
+		udpc_socks_fixup_relay(&relay, &cfg);
+		TAP_EQ_INT(relay.ss_family, AF_INET, "family is preserved");
+		TAP_OK(r4->sin_addr.s_addr == proxy4.sin_addr.s_addr,
+		       "a loopback relay from a remote proxy becomes the proxy "
+		       "address");
+		TAP_EQ_INT(ntohs(r4->sin_port), 51464,
+		           "and keeps the relay PORT, not the proxy's");
+
+		/* Wildcard from a remote proxy: same substitution. */
+		make_v4(r4, "0.0.0.0", 40000);
+		udpc_socks_fixup_relay(&relay, &cfg);
+		TAP_OK(r4->sin_addr.s_addr == proxy4.sin_addr.s_addr,
+		       "a wildcard relay becomes the proxy address");
+		TAP_EQ_INT(ntohs(r4->sin_port), 40000, "keeping its port");
+
+		/* A routable relay from a remote proxy is left ALONE.  A proxy
+		 * that relays from a different host than it accepts control
+		 * connections on is legitimate. */
+		make_v4(r4, "198.51.100.7", 5555);
+		udpc_socks_fixup_relay(&relay, &cfg);
+		TAP_OK(r4->sin_addr.s_addr != proxy4.sin_addr.s_addr,
+		       "a routable relay from a remote proxy is left untouched");
+		TAP_EQ_INT(ntohs(r4->sin_port), 5555, "port untouched too");
+
+		/* Now a LOCAL proxy.  Here a loopback relay is correct and must
+		 * survive verbatim -- this is every test run before today, and
+		 * substituting would break it. */
+		cfg.proxy_is_local = true;
+		make_v4(&proxy4, "127.0.0.1", 1080);
+		memcpy(&cfg.proxy, &proxy4, sizeof(proxy4));
+
+		make_v4(r4, "127.0.0.1", 51464);
+		udpc_socks_fixup_relay(&relay, &cfg);
+		TAP_EQ_INT(ntohs(r4->sin_port), 51464,
+		           "a loopback relay from a LOCAL proxy is untouched");
+		TAP_OK(ntohl(r4->sin_addr.s_addr) == INADDR_LOOPBACK,
+		       "still loopback, not rewritten");
+
+		/* A wildcard is substituted even for a local proxy: 0.0.0.0 is
+		 * never a usable destination. */
+		make_v4(r4, "0.0.0.0", 41000);
+		udpc_socks_fixup_relay(&relay, &cfg);
+		TAP_OK(ntohl(r4->sin_addr.s_addr) == INADDR_LOOPBACK,
+		       "a wildcard is substituted even for a local proxy");
+
+		/* IPv6, remote proxy: ::1 is as unusable as 127.0.0.1. */
+		{
+			struct sockaddr_in6 proxy6;
+
+			memset(&cfg, 0, sizeof(cfg));
+			make_v6(&proxy6, "2001:db8::9", 1080);
+			memcpy(&cfg.proxy, &proxy6, sizeof(proxy6));
+			cfg.proxy_is_local = false;
+
+			make_v6(r6, "::1", 6000);
+			udpc_socks_fixup_relay(&relay, &cfg);
+			TAP_EQ_INT(relay.ss_family, AF_INET6,
+			           "IPv6 family preserved");
+			TAP_OK(memcmp(&r6->sin6_addr, &proxy6.sin6_addr, 16) == 0,
+			       "a ::1 relay from a remote proxy becomes the proxy "
+			       "address");
+			TAP_EQ_INT(ntohs(r6->sin6_port), 6000, "keeping its port");
+
+			make_v6(r6, "::", 6001);
+			udpc_socks_fixup_relay(&relay, &cfg);
+			TAP_OK(memcmp(&r6->sin6_addr, &proxy6.sin6_addr, 16) == 0,
+			       "a :: relay is substituted too");
+		}
+	}
+
 	TAP_DONE();
 }

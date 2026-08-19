@@ -502,3 +502,88 @@ received datagram, off the allocation path.
 **Revisit if.** A proxy is found that reports origins in a form that cannot be normalised to the
 socket's family, which would cause every datagram to be dropped. The `-v` output names the rejected
 origin, so this would be diagnosable rather than mysterious.
+
+---
+
+## D-16
+### A loopback or wildcard `BND.ADDR` is replaced by the proxy's own address
+
+**Date:** 2026-08-19 · **Status:** Accepted · Recorded after the first run against a genuinely
+**remote** proxy.
+
+**Context.** RFC 1928 §7 says the `UDP ASSOCIATE` reply's `BND.ADDR`/`BND.PORT` is where the client
+must send its datagrams. The shim already substituted the configured proxy address when `BND.ADDR`
+was a wildcard (`0.0.0.0` / `::`), on the standard reading that a wildcard means "the address you
+already reached me on".
+
+**The gap.** A proxy may equally return a **loopback** address, because that is genuinely what it
+sees: it binds a relay socket and reports the address it bound. That is correct information about the
+proxy's own host and useless to a client anywhere else. Taken literally it pointed the application's
+socket at *this* host's loopback, where nothing is listening.
+
+The failure was silent and its symptoms pointed away from the cause. Datagrams left successfully.
+The association looked healthy at both ends. Nothing arrived, and the ICMP port-unreachable that came
+back surfaced as `ECONNREFUSED` on the next receive — which FR-P-08 reads as an expired association,
+so the shim re-associated, got another loopback relay, and repeated.
+
+**Decision.** A loopback `BND.ADDR` is replaced by the configured proxy address, keeping the relay
+port, **when and only when the proxy is not on this host**. `proxy_is_local` already exists for D-05
+R2 and is reused here.
+
+The gate matters in both directions. With a local proxy a loopback relay is correct and must survive
+untouched — that is every test run before this one. With a remote proxy it is unusable by
+construction, so substituting cannot lose information the client could otherwise have used.
+
+A **routable** `BND.ADDR` that differs from the proxy address is left alone: a proxy that relays from
+a different host than it accepts control connections on is legitimate, and second-guessing it would
+break a valid deployment to fix an invalid one.
+
+**Why the test suite missed it.** The fixture (D-06) runs on the same host as its clients, so
+`proxy_is_local` was true in every automated run and the loopback relay it advertises was always
+correct. No fixture run could reach this. The fixture gained `--dead-relay` to reproduce the
+downstream symptom, and the substitution itself is unit-tested with a synthetic non-local
+configuration, since a single host cannot produce one.
+
+**Revisit if:** a proxy is found that returns a loopback `BND.ADDR` and genuinely means it — which
+would require the client to be in the same network namespace while the proxy is not considered local.
+
+---
+
+## D-17
+### A non-`FREE` fd-table entry at claim time is stale, and is recycled
+
+**Date:** 2026-08-19 · **Status:** Accepted · Found while investigating D-16's downstream symptoms.
+
+**Context.** The fd table is populated in the `socket()` hook and released in the `close()` hook.
+`udpc_fd_claim` treated an entry that was not `FREE` (or a stale `DYING`) as a conflict, logged
+`already claimed`, and returned `NULL`. The `socket()` hook turns that into `EMFILE`, because an
+untrackable descriptor must fail rather than pass through unproxied (SEC-01).
+
+**The gap.** Release depends on interposing `close()`, and **not every program's closes reach it**.
+`dig` closes descriptors through libuv: of its 64 `close` syscalls, 4 reach the shim's hook. The rest
+are invisible, so those entries are stranded `ACTIVE` for descriptors the kernel has already freed.
+
+Two consequences, neither of which is the application's fault:
+
+- When the kernel later hands the same descriptor number to a new socket, the claim was refused and
+  the program got `EMFILE` while nowhere near any descriptor limit.
+- The stranded entry still held a reference to its association, so the control connection leaked and
+  the association was never released at the proxy (against FR-P-02).
+
+**Decision.** Every caller of `udpc_fd_claim` passes a descriptor the kernel has *just* allocated —
+from `socket()`, or as a dup target. The kernel does not hand out a descriptor number that is
+already live. Therefore a non-`FREE` entry at claim time is **proof that the entry is stale**, not
+evidence of a conflict. The slot is released and re-claimed rather than refused.
+
+`udpc_fd_release` does the right work already: it drops the association reference (closing the
+control connection and releasing the association at the proxy) and bumps the generation counter, so
+anything still holding the old entry is rejected under FR-L-02.
+
+**Residual limitation.** A stale entry is reclaimed when its descriptor *number* is reused. A program
+that closes a proxied socket by an uninterposed route and never reuses the number keeps that
+association open until it exits. The control connection is bounded by the number of UDP sockets the
+program opens, so this cannot grow without bound, but it is not zero. Documented in the README.
+
+**Why the test suite missed it.** Every test client closes through libc, so every close reached the
+hook. The condition needs a program whose runtime does not — which is a property of the *client*, not
+of the proxy or the protocol, and so was invisible to a suite that supplies its own clients.

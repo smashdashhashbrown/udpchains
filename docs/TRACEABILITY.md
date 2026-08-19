@@ -25,14 +25,14 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 401 assertions across 13 groups, all passing.
+**Test totals:** 422 assertions across 13 groups, all passing.
 
 | Group | Assertions |
 |---|---|
 | unit-addr | 51 |
 | unit-config | 38 |
-| unit-socks5 | 51 |
-| unit-fdtable | 12 |
+| unit-socks5 | 65 |
+| unit-fdtable | 19 |
 | TST-01 hook matrix | 108 |
 | TST-05 fidelity | 93 |
 | port switch (TFTP pattern) | 12 |
@@ -65,7 +65,7 @@ inspection basis is recorded in the notes below.
 |---|---|---|---|---|
 | FR-P-01 | M | §4.1 | TST-01, TST-04 | **Verified** |
 | FR-P-02 | M | §3.2, §4.1 | TST-06 | **Verified** — 8 open/associate/close cycles leak no control connections |
-| FR-P-03 | M | §4.3 | unit-socks5, TST-05 | **Verified** — all three ATYP forms, byte-level against RFC 1928 §7. An interop defect was found and fixed here (D-14): a v4-mapped IPv6 destination was emitted as ATYP 0x04 rather than ATYP 0x01, which a real proxy silently failed to deliver. Re-confirmed against `dtun` on 2026-08-19 by two independent checks in one run — the logged ATYP byte and the 10-byte wire overhead, the latter being unforgeable by a mislabelled encoding. The 16-byte ATYP 0x04 form remains fixture-only |
+| FR-P-03 | M | §4.3 | unit-socks5, TST-05 | **Verified** — all three ATYP forms, byte-level against RFC 1928 §7. An interop defect was found and fixed here (D-14): a v4-mapped IPv6 destination was emitted as ATYP 0x04 rather than ATYP 0x01, which a real proxy silently failed to deliver. Re-confirmed against `dtun` on 2026-08-19 by two independent checks in one run — the logged ATYP byte and the 10-byte wire overhead, the latter being unforgeable by a mislabelled encoding. The 16-byte ATYP 0x04 form remains fixture-only. A second interop defect was found here on 2026-08-19 (D-16): a loopback `BND.ADDR` from a REMOTE proxy was taken literally, pointing the application socket at this host's loopback, so every datagram was silently discarded |
 | FR-P-04 | M | §4.3, §5.2 | unit-socks5, faults | **Verified** — fixture injects `FRAG=1`; datagram is discarded, never delivered |
 | FR-P-05 | M | §4.1 | TST-05, TST-06 | **Verified** — `0.0.0.0:0` unless a concrete `bind()` |
 | FR-P-06 | M | §1, §4.1 | TST-07 | **Verified** — automatic: the app's fd is the only data socket. TST-07 confirms one association from an 8-way race |
@@ -95,7 +95,7 @@ inspection basis is recorded in the notes below.
 | ID | Pri | Design | Test | Status |
 |---|---|---|---|---|
 | FR-L-01 | M | §3.1, §3.5 | TST-07, unit-fdtable | **Verified** — TST-07 under the real shim; unit-fdtable under TSan, which found and fixed a genuine race on the entry `family`/`type` fields |
-| FR-L-02 | M | §3.1, §3.3 | TST-06, unit-fdtable | **Verified** — a reused fd reports `ENOTCONN`, and the generation counter advances |
+| FR-L-02 | M | §3.1, §3.3 | TST-06, unit-fdtable | **Verified** — a reused fd reports `ENOTCONN`, and the generation counter advances. A defect was found and fixed here on 2026-08-19 (D-17): release depends on interposing `close()`, and a program whose runtime closes by another route (dig via libuv: 4 of 64 closes reach the hook) stranded its entry, so the next socket on that descriptor number was refused with a spurious `EMFILE` and the association leaked. A non-`FREE` entry at claim time is now treated as stale and recycled |
 | FR-L-03 | M | §3.3 | TST-06, unit-fdtable | **Verified** — `dup` adds no control connection; association survives the original's close |
 | FR-L-04 | M | §3.4 | TST-06 | **Verified** — a defect was found and fixed here: parent and child share one open file description, so the child re-pointing the socket also re-pointed the parent's. The child now gets a private socket |
 | FR-L-05 | M | §3.2, §4.1 | TST-06 | **Verified** — every control connection carries `FD_CLOEXEC` |
@@ -184,11 +184,18 @@ carried no traffic at all, and the cause was a genuine defect (D-14) that the in
 been forgiving. D-06's warning — that a green fixture suite is not evidence of interop — was
 correct, and the remaining items below are worth the same suspicion.
 
-1. **A run against a genuinely REMOTE proxy.** `dtun`'s client runs on the local host, so the relay
-   has always been `127.0.0.1` and `proxy_is_local` has always been true. The D-05 R2 loopback guard
-   — which covers the silent-wrong-destination case, the most consequential thing v1 chose to
-   accept — has therefore been unit-tested but never exercised end to end. This is now the largest
-   untested area.
+1. **A successful end-to-end run against a genuinely REMOTE proxy.** First attempted 2026-08-19.
+   `proxy_is_local` was correctly false and the **D-05 R2 loopback guard fired end to end for the
+   first time**, with the right message — that part is done. The run itself failed, and productively:
+   it found D-16 (a loopback `BND.ADDR` taken literally) and, downstream of it, D-17 (a stranded
+   fd-table entry causing a spurious `EMFILE`). Both are fixed and covered by unit tests, but the
+   fixes were re-run against that same proxy the same day and **both are confirmed**: the
+   substitution fires and names the proxy address, and the stale-entry reclaim happens once with no
+   `EMFILE`. The D-05 R2 guard passes in both its warning and `strict_loopback` forms.
+   What remains is **not a shim defect**: the proxy binds its UDP relay to its own loopback, so the
+   substituted address is correct and still unreachable, and its log records zero datagrams received.
+   SOCKS5 `UDP ASSOCIATE` needs the relay port reachable from the client. Closing this row needs a
+   proxy that binds a routable relay; the shim side is done.
 2. **A genuine IPv6 destination against `dtun`.** The v4-mapped half of D-14 was confirmed against
    the real proxy on 2026-08-19 (`ATYP 0x01`, 10-byte header, from an `AF_INET6` socket), but this
    host has no global IPv6 address, so the 16-byte `ATYP 0x04` form is still exercised only against

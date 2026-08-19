@@ -125,6 +125,14 @@ Consequences you will actually notice:
   A program that depends on them will misbehave, and the cause will not be obvious — this is the
   most likely source of a confusing failure.
 
+- **A socket closed by a route that bypasses libc keeps its association until the descriptor number
+  is reused.** The shim releases its per-socket state from the `close()` hook, and not every runtime
+  goes through it — `dig`, via libuv, makes 64 `close` syscalls of which 4 reach the hook. A stranded
+  entry is detected and recycled when the kernel hands the same descriptor number to a new socket
+  (D-17), so nothing breaks; but a program that closes such a socket and never reuses the number
+  holds that association open until it exits. Bounded by the number of UDP sockets opened, not
+  unbounded, and invisible in normal use.
+
 - **After `fork()`, a child that keeps using an inherited UDP socket gets a fresh socket.** The child
   must not share the parent's association, and parent and child share one open file description, so
   the child's socket is replaced with a private one. `O_NONBLOCK`, close-on-exec and a concrete
