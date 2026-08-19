@@ -1,0 +1,324 @@
+# Interop checklist — manual tests against a real proxy
+
+TST-04 and acceptance criterion 4 are the open items in
+[`TRACEABILITY.md`](TRACEABILITY.md). The automated suite proves conformance to the RFC *as this
+project reads it*, against a fixture that shares an author with the code under test — which is
+exactly how the D-14 (v4-mapped `ATYP`) defect survived 108 green matrix cells. Everything here has
+to be run by hand against a real proxy.
+
+Tests are grouped by **what property they exercise**, not by tool, because several tools prove the
+same thing and one is usually enough.
+
+Run everything with `-v` and keep the output. The per-datagram debug line names the destination, the
+`ATYP` byte and the relay, which is what makes a silent non-delivery diagnosable.
+
+---
+
+## 0. Already done
+
+| | Result |
+|---|---|
+| `nc -u` to a remote listener | ✅ passed — found D-14 |
+| TFTP, 10 MB file | ✅ passed — port switch, ~20 000 datagrams each way, strictly sequential so any loss or reordering would have stalled or corrupted it |
+| `dig myip.opendns.com` (§1) | ✅ passed 2026-08-18 — the resolver reported the **proxy's** egress address, not the host's. First proof the traffic traverses the tunnel rather than merely arriving |
+| `iperf -u` rate sweep (§2) | ✅ passed 2026-08-18 — 0% loss to 15 Mbit/s; the cliff above it is the proxy's tunnel ceiling, attributed by kernel counters on both hosts. Closes the burst gap. A direct (unproxied) run to the same host saturated at ~17.5 Mbit/s, so the tunnel delivers ~94% of raw path capacity |
+| `ntpdate -q` (§4) | ✅ passed 2026-08-19 — stratum-2 offsets accepted. The only test so far run by a client that validates a reply's **source address** rather than just its port |
+| dual-stack → v4-mapped (§6a) | ✅ passed 2026-08-19 — `ATYP 0x01` with a 10-byte header from an `AF_INET6` socket. D-14 confirmed fixed against the real proxy, outbound direction |
+
+TFTP is **lockstep**: one block, wait for the ACK. It never has more than one datagram in flight, so
+despite the volume it says nothing about burst behaviour, receive-queue pressure, or batching. That
+is the main gap the tests below close.
+
+---
+
+## 1. Prove the traffic is genuinely proxied
+
+Everything so far proves datagrams *arrive*. Nothing yet proves they took the tunnel.
+
+First the baseline, **without** the shim, so you know the target is reachable at all:
+
+```sh
+dig +short myip.opendns.com @208.67.222.222        # returns this host's egress address
+```
+
+Then through the shim:
+
+```sh
+./udpchains -v -p <proxy-host>:<port> dig +short myip.opendns.com @208.67.222.222
+```
+
+**Pass:** the two answers differ, and the second is the **proxy's** egress address. This is the
+cheapest possible end-to-end proof of proxying, and it is worth running first — everything below
+assumes it holds.
+
+✅ **Passed 2026-08-18.** The addresses are deliberately not recorded here; the observation is that
+they differed and the proxied one was the VPS. Together with FR-F-02 (the application sees the true
+remote source, not the relay) this closes the loop: the datagram left through the tunnel *and* was
+reported back honestly.
+
+Use the resolver's **numeric** address, not `@resolver1.opendns.com`. A hostname makes `dig` consult
+the system resolver first, and on a systemd-resolved host that means a datagram to `127.0.0.53` —
+which under the shim is resolved *at the proxy* and hits the loopback caveat in the README. The test
+then fails before it has begun, for a reason that has nothing to do with what it is measuring.
+
+If OpenDNS is unreachable from your network, any of these answer the same question (all numeric):
+
+```sh
+dig +short TXT o-o.myaddr.l.google.com @216.239.32.10    # ns1.google.com
+dig +short whoami.akamai.net @193.108.88.1               # ns1-1.akamaitech.net
+dig +short ch txt whoami.cloudflare @1.1.1.1
+```
+
+A STUN client (`stunclient`, `turnutils_stunclient`) gives the same answer if one is available.
+
+---
+
+## 2. Burst and throughput — the gap TFTP leaves
+
+Sweep the rate rather than picking one — a single number cannot distinguish a defect from a
+saturation ceiling, and the shape of the curve can:
+
+```sh
+for b in 5M 10M 15M 20M; do
+  echo "== $b =="
+  ./udpchains -p $P iperf -u -c <host> -b $b -l 1200 -t 10 -i 1
+done
+```
+
+Do **not** add `-v`: it emits a debug line per datagram, and tens of thousands of them distort the
+measurement.
+
+Loss alone does not attribute blame, so bracket the run with kernel UDP counters on **both** hosts.
+There are three places a datagram can die and each is visible somewhere different:
+
+| Where | Drop point | Seen by |
+|---|---|---|
+| A — client | shim's `sendto` → the proxy's local relay socket overflows | client `netstat -su` |
+| B — tunnel | the proxy discards internally rather than backpressuring | **neither** |
+| C — server | the proxy's `sendto` → the receiving app's socket overflows | server `netstat -su` |
+
+```sh
+netstat -su | grep -iE 'receive buffer errors|packet receive errors'   # before, on both hosts
+# ...run the sweep...
+netstat -su | grep -iE 'receive buffer errors|packet receive errors'   # after, on both hosts
+```
+
+Counters are system-wide, so take the baseline immediately before the run on an otherwise idle box.
+
+**Watch for:** loss climbing sharply with rate, or the association dropping under load. Some loss is
+normal for UDP; a cliff is not. A cliff with *zero* loss below it is a capacity ceiling, not a defect.
+
+✅ **Passed 2026-08-18**, against `dtun` with `iperf` 2 (not iperf3):
+
+| offered | delivered | loss |
+|---|---|---|
+| 5M | 5.26 Mbit/s | 0/5465 (0%) |
+| 10M | 10.5 Mbit/s | 0/10926 (0%) |
+| 15M | 15.4 Mbit/s | 0/16387 (0%) |
+| 20M | 16.5 Mbit/s | 3922/21848 (18%) |
+
+Zero loss up to 15 Mbit/s, then a hard cliff at a ~16.5 Mbit/s ceiling. Client UDP error counters did
+not move at all (0 → 0) and the server's moved by 16, so the ~3900 missing datagrams are accounted
+for by neither kernel: case **B**, discarded inside the proxy's tunnel. The shim absorbed 21 Mbit/s
+of offered load and wrote every datagram into the relay socket without that socket backing up.
+
+Combined with the fail-closed property — `udpc_core_send` has no silent-drop branch, every failure
+returns `-1` with an errno — the accounting closes: iperf handed the shim 21 849 datagrams, the shim
+reported no errors, the client kernel dropped none, therefore all 21 849 reached the proxy. This is
+the first test to exercise sustained concurrent datagrams rather than lockstep request/response.
+
+---
+
+## 3. Datagram size boundary (D-12)
+
+`max_datagram` defaults to 8192. TFTP used 512-byte blocks, so this is untested territory.
+
+```sh
+udpchains curl -o out --tftp-blksize 8192 tftp://<host>/<file>   # large blocks, known-good path
+udpchains iperf3 -u -c <host> -l 8192 -b 5M -t 10                # exactly at the limit
+udpchains iperf3 -u -c <host> -l 9000 -b 5M -t 10                # over it
+```
+
+**Pass:** 8192 works; 9000 fails with `EMSGSIZE` rather than being silently dropped. If your proxy's
+real limit is below 8192, datagrams in between vanish silently — set `UDPCHAINS_MAX_DATAGRAM` to the
+proxy's actual limit. The association log line reports the configured value for exactly this reason.
+
+---
+
+## 4. A client that validates the source address
+
+`nc` ignores the source entirely; TFTP only uses the port. NTP checks that the reply came from the
+server it asked.
+
+```sh
+dig +short pool.ntp.org | head -1                       # use a NUMERIC server below
+
+./udpchains -v -p $P /usr/sbin/ntpdate -q <ntp-ip>      # note /usr/sbin, not on the user PATH
+./udpchains -v -p $P ntpdig -d <ntp-ip>                 # same thing, one less layer
+```
+
+A numeric server address matters: a hostname is resolved through the shim against `127.0.0.53`,
+which is resolved *at the proxy*. That happens to work with a local proxy and will mislead you with
+a remote one.
+
+**Pass:** a plausible offset. A rejection here means FR-F-02 is reporting something subtly wrong that
+neither previous test could see.
+
+✅ **Passed 2026-08-19.** Two runs against a stratum-2 server returned consistent offsets
+(+0.126 s and +0.116 s, error bounds ~0.25 s). The offset itself is the assertion: NTP validates a
+response's source address against the address it queried and discards a mismatch silently, so a
+wrong source would have produced a timeout rather than a bad number.
+
+Two incidental confirmations from the same `-v` output:
+
+- `sent 48 payload bytes ... 58 bytes on the wire` — 48 is exactly an SNTP client packet and the
+  10-byte delta is precisely the `ATYP 0x01` header (2 RSV + 1 FRAG + 1 ATYP + 4 addr + 2 port), so
+  header construction is right and not merely tolerated.
+- `association up: fd 3 via relay ...` names no destination, where iperf's named one. `ntpdig` uses
+  an **unconnected** socket, so there is no destination at association time — a small confirmation
+  that associations are per-socket, not per-destination (D-13).
+
+`ntpdate` here is a `/bin/sh` shim that execs `ntpdig`, a Python script, so `shim ready` appears
+twice: two `execve`s in one process, not double initialisation. `LD_PRELOAD` survives both and
+CPython uses libc sockets, so interception works — but the process being proxied is `python3`.
+
+---
+
+## 5. Many short-lived sockets — association churn
+
+Every UDP socket gets its own association and control connection (D-13). TFTP used one.
+
+```sh
+for i in $(seq 1 100); do udpchains dig +short +tries=1 @<resolver> test$i.example.com & done; wait
+```
+
+**Watch for:** the proxy's connection limit, file-descriptor exhaustion, or associations not being
+released. Check the proxy log for opens without matching closes.
+
+---
+
+## 6. IPv6 destination — `ATYP 0x04` for real
+
+Everything so far has been IPv4, so the 16-byte address form has only been exercised against the
+fixture.
+
+Two halves, and they are independent.
+
+**(a) Dual-stack socket to an IPv4 destination — the D-14 fix from the other side.** Needs no IPv6
+connectivity at all, and is the half that actually broke against a real proxy:
+
+```sh
+# listener
+nc -u -l 5001
+
+# client
+./udpchains -v -p $P python3 -c '
+import socket
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.sendto(b"PING\n", ("::ffff:<dest-ip>", 5001))
+s.settimeout(3)
+print(s.recvfrom(1500))' 2>&1 | grep -E 'ATYP|PING'
+```
+
+**Pass:** `ATYP 0x01`, **and** a 10-byte wire overhead. Check both — the byte count is independent of
+the ATYP field, so a regression that encoded the 16-byte form would show 22 bytes of overhead even if
+the ATYP byte looked right.
+
+✅ **Passed 2026-08-19.** `sent 5 payload bytes ... (ATYP 0x01) ... 15 bytes on the wire`, and the
+payload arrived. Destination and relay both printed as `[::ffff:...]`, which is correct and is worth
+distinguishing from the bug: the shim *reports* addresses in the socket's own family, as the kernel
+would, but *encodes* the family the address actually denotes. D-14 was those two being conflated.
+
+Only the outbound direction was covered, since `nc -u -l` does not echo. Inbound v4-mapped source
+*reporting* remains covered by TST-05 alone. To close that too, type a line into the listener after
+the PING arrives — `nc -u -l` connects back to its first sender — and the client should print a
+source of `('::ffff:...', 5001, 0, 0)` rather than timing out.
+
+**(b) A genuine IPv6 destination.** Blocked on this host: it has no global IPv6 address, so the
+16-byte form is still only exercised against the fixture.
+
+```sh
+./udpchains -v -p $P dig -6 +short myip.opendns.com @2620:119:35::35
+./udpchains -v -p $P nc -6 -u <ipv6-host> <port>
+```
+
+**Pass:** `-v` shows `ATYP 0x04`, 22 bytes of overhead, and the exchange completes.
+
+---
+
+## 7. Idle longer than the proxy's expiry (FR-P-08)
+
+Your proxy closes idle associations. That path has only been tested against the fixture.
+
+```sh
+udpchains -v nc -u <host> <port>
+# send a line, confirm arrival
+# wait ~90s, past the idle timeout
+# send another
+```
+
+**Pass:** the second line arrives, and `-v` reports re-associating. **Fail:** it silently vanishes —
+the pre-send liveness probe did not detect your proxy's teardown.
+
+---
+
+## 8. Fail-closed under real conditions (SEC-01/SEC-02)
+
+The security property the project exists for, on live traffic.
+
+```sh
+# terminal 1 — any direct UDP to the target is a leak
+sudo tcpdump -ni <iface> "udp and host <dest> and port <port>"
+
+# terminal 2
+udpchains -v nc -u <dest> <port>     # send a few lines
+# then kill the proxy client and keep typing
+```
+
+**Pass:** tcpdump captures **zero** packets — during normal operation (traffic should appear only as
+the tunnel's TCP) *and* after the proxy dies, where sends must fail rather than fall back to direct.
+
+---
+
+## 9. Negative tests — verify the failures are clean
+
+These are **expected** to fail. What matters is that they fail promptly and legibly rather than
+hanging or corrupting data.
+
+```sh
+udpchains -v curl --http3 -sS -o /dev/null https://cloudflare-quic.com/   # QUIC: §8 non-goal
+udpchains -v traceroute -U <host>                                        # needs ICMP back
+udpchains -v avahi-browse -at                                            # multicast
+```
+
+QUIC is the most valuable of the three: it is the busiest `sendmmsg`/`recvmmsg` path any real client
+produces, so even its failure exercises code nothing else reaches. Multicast must fail with
+`ENETUNREACH` and a diagnostic naming the reason, never a hang.
+
+---
+
+## 10. Long-lived, high-volume, userspace VPN
+
+The most demanding realistic workload, if you have somewhere to point it:
+
+```sh
+udpchains openvpn --config <client.ovpn>     # UDP mode
+```
+
+Long-lived association, continuous bidirectional traffic, MTU-sized datagrams, and its own keepalive
+and rekeying. Note that **WireGuard is not a substitute** — it runs in the kernel and never touches
+libc, so the shim cannot see it at all.
+
+---
+
+## Reporting a failure
+
+Capture, in this order:
+
+1. `udpchains -v` stderr — especially the `sent N payload bytes to <dst> (ATYP 0x..)` lines.
+2. The **proxy's** log for the same window. Several failures so far have been visible only there.
+3. `tcpdump` on loopback for the relay port, if the question is whether the datagram left at all.
+
+The pattern to watch for is a send that succeeds, an association that stays healthy, and nothing
+arriving. That signature has now appeared twice — once as a shim defect (D-14) and once as a proxy
+policy (port-restricted inbound filtering) — and only the proxy's log distinguishes them.

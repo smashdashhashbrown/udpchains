@@ -195,6 +195,7 @@ syscalls on the datagram path, so a send from a signal handler cannot deadlock.
 | [`DECISIONS.md`](DECISIONS.md) | every design decision, with consequences and revisit conditions |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | how it is built |
 | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | every requirement mapped to design section and test |
+| [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | manual tests against a real proxy, and what each one proves |
 
 ## Licence
 

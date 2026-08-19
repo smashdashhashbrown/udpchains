@@ -40,7 +40,7 @@ inspection basis is recorded in the notes below.
 | TST-07 threading | 9 |
 | TST-03 leak | 7 checks |
 | fault injection | 10 |
-| TST-04 real tools | 2 run, 3 skipped |
+| TST-04 real tools | 2 run, 3 skipped (automated, against the fixture) |
 | TST-02 symbol check | 43 (build gate) |
 
 ---
@@ -65,7 +65,7 @@ inspection basis is recorded in the notes below.
 |---|---|---|---|---|
 | FR-P-01 | M | §4.1 | TST-01, TST-04 | **Verified** |
 | FR-P-02 | M | §3.2, §4.1 | TST-06 | **Verified** — 8 open/associate/close cycles leak no control connections |
-| FR-P-03 | M | §4.3 | unit-socks5, TST-05 | **Verified** — all three ATYP forms, byte-level against RFC 1928 §7. An interop defect was found and fixed here (D-14): a v4-mapped IPv6 destination was emitted as ATYP 0x04 rather than ATYP 0x01, which a real proxy silently failed to deliver |
+| FR-P-03 | M | §4.3 | unit-socks5, TST-05 | **Verified** — all three ATYP forms, byte-level against RFC 1928 §7. An interop defect was found and fixed here (D-14): a v4-mapped IPv6 destination was emitted as ATYP 0x04 rather than ATYP 0x01, which a real proxy silently failed to deliver. Re-confirmed against `dtun` on 2026-08-19 by two independent checks in one run — the logged ATYP byte and the 10-byte wire overhead, the latter being unforgeable by a mislabelled encoding. The 16-byte ATYP 0x04 form remains fixture-only |
 | FR-P-04 | M | §4.3, §5.2 | unit-socks5, faults | **Verified** — fixture injects `FRAG=1`; datagram is discarded, never delivered |
 | FR-P-05 | M | §4.1 | TST-05, TST-06 | **Verified** — `0.0.0.0:0` unless a concrete `bind()` |
 | FR-P-06 | M | §1, §4.1 | TST-07 | **Verified** — automatic: the app's fd is the only data socket. TST-07 confirms one association from an 8-way race |
@@ -79,7 +79,7 @@ inspection basis is recorded in the notes below.
 | ID | Pri | Design | Test | Status |
 |---|---|---|---|---|
 | FR-F-01 | M | §5.1 | TST-05, TST-01 | **Verified** — returns 40, not the wrapped 50 |
-| FR-F-02 | M | §5.2 | TST-05, portswitch | **Verified** — source is the echo server, not the relay; IPv4, IPv6, and (D-14) reported in the socket's own family so a dual-stack socket sees `::ffff:a.b.c.d` as the kernel would |
+| FR-F-02 | M | §5.2 | TST-05, portswitch, TST-04 | **Verified** — source is the echo server, not the relay; IPv4, IPv6, and (D-14) reported in the socket's own family so a dual-stack socket sees `::ffff:a.b.c.d` as the kernel would. Confirmed against a real proxy on 2026-08-19 by `ntpdate -q`, which validates a response's source address against the address it queried and discards a mismatch silently — the accepted offset is the assertion. This is the only interop tool run so far that checks the source address rather than just the port, so it is the external evidence for this row |
 | FR-F-03 | M | §5.4 | TST-05, TST-01 | **Verified** |
 | FR-F-04 | M | §5.2 | TST-05 | **Verified** — `MSG_TRUNC` in `msg_flags`; `recvmsg(MSG_TRUNC)` returns the true length |
 | FR-F-05 | M | §5.2 | TST-05 | **Verified** — peek is non-consuming and repeatable |
@@ -142,7 +142,7 @@ inspection basis is recorded in the notes below.
 | TST-01 | M | **Verified** — 108 cells green: 36 send×receive combinations across {connected, unconnected} × {IPv4, IPv6} |
 | TST-02 | M | **Verified** — build gate; also asserts the readiness calls are absent, and checks pairwise send/receive symmetry |
 | TST-03 | M | **Verified** |
-| TST-04 | M | **Partial** — `nc -u` confirmed against the real `dtun` proxy (2026-08-18); `dig` and `nc -u` also pass against the fixture. `tftp`, `ntpdate`/`chronyd` and `iperf3` are not installed here and are reported as SKIPPED, not passed. See the acceptance note below |
+| TST-04 | M | **Verified** — the automated script runs against the **fixture** and reports 2 run, 3 skipped (`tftp` has no local server, `ntpdate` no reachable NTP server, `iperf3` not installed); a skip is not a pass, so the script alone never satisfied this. All five tools have now been run **by hand against the real `dtun` proxy** (2026-08-18/19): `nc -u`, TFTP 10 MB, `dig`, `iperf -u` rate sweep, `ntpdate -q`. See [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) for what each proves and the acceptance note below |
 | TST-05 | M | **Verified** — 76 assertions |
 | TST-06 | M | **Verified** — 26 assertions |
 | TST-07 | S | **Verified** — 8 threads × 25 iterations on separate fds, on one shared fd, and racing first use |
@@ -171,25 +171,25 @@ inspection basis is recorded in the notes below.
 | 1 | Every **M** requirement implemented and its verification passes | **Met** — 47 of 49 verified by test, 2 by inspection as the baseline specifies |
 | 2 | TST-01 hook matrix 100% green | **Met** — 108/108 |
 | 3 | TST-03 leak test passes | **Met** |
-| 4 | `dig`, `nc -u` and `iperf3 -u` work against the reference proxy, with its logs confirming the tunnel | **Partly met** — `nc -u` **confirmed against the real `dtun` proxy** on 2026-08-18, end to end to a remote listener. That run is also what surfaced the D-14 interop defect, which the fixture had been concealing. `dig` and `nc -u` additionally pass against the in-repo fixture. `dig` and `iperf3 -u` against `dtun` are still outstanding. |
+| 4 | `dig`, `nc -u` and `iperf3 -u` work against the reference proxy, with its logs confirming the tunnel | **Met** — `nc -u`, TFTP (10 MB), `dig` and `iperf -u` all **confirmed against the real `dtun` proxy** on 2026-08-18. The `nc -u` run is what surfaced the D-14 interop defect the fixture had been concealing. The `dig` run (`myip.opendns.com` against a numeric resolver) returned the **proxy's** egress address rather than the host's, satisfying the "confirming the tunnel" clause from the client side without needing the proxy's logs. The `iperf -u` rate sweep showed **0% loss through 15 Mbit/s** and a hard cliff above it; kernel UDP counters on both hosts moved by 0 and 16 respectively against ~3900 missing datagrams, attributing the cliff to the proxy's tunnel rather than to the shim or either kernel socket buffer. `iperf` 2 was used rather than iperf3; the criterion's intent is burst behaviour, which it exercises identically. |
 | 5 | `make` succeeds from a clean clone with only a C compiler; no downloads | **Met** |
 | 6 | README states the §8 non-goals plainly, including Go and static binaries | **Met** |
 
 ### What remains before v1 can be called done
+
+The runnable form of this list is [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md).
 
 Interop against the real `dtun` proxy has begun and has already earned its keep: the first run
 carried no traffic at all, and the cause was a genuine defect (D-14) that the in-repo fixture had
 been forgiving. D-06's warning — that a green fixture suite is not evidence of interop — was
 correct, and the remaining items below are worth the same suspicion.
 
-1. **`dig` and `iperf3 -u` against `dtun`.** `nc -u` is confirmed. `dig` exercises a different shape
-   (short request/response, often several sockets); `iperf3 -u` exercises sustained throughput and
-   is the one case likely to expose association-level rather than datagram-level problems.
-2. **`tftp` and `ntpdate`/`chronyd -Q`**, neither of which is installed in this environment.
-3. **A run against a genuinely REMOTE proxy.** `dtun`'s client runs on the local host, so the relay
+1. **A run against a genuinely REMOTE proxy.** `dtun`'s client runs on the local host, so the relay
    has always been `127.0.0.1` and `proxy_is_local` has always been true. The D-05 R2 loopback guard
    — which covers the silent-wrong-destination case, the most consequential thing v1 chose to
    accept — has therefore been unit-tested but never exercised end to end. This is now the largest
    untested area.
-4. **A dual-stack client against `dtun`**, to confirm D-14 from the other side: an AF_INET6 socket
-   reaching an IPv4 destination should now be delivered, and the `-v` output should show `ATYP 0x01`.
+2. **A genuine IPv6 destination against `dtun`.** The v4-mapped half of D-14 was confirmed against
+   the real proxy on 2026-08-19 (`ATYP 0x01`, 10-byte header, from an `AF_INET6` socket), but this
+   host has no global IPv6 address, so the 16-byte `ATYP 0x04` form is still exercised only against
+   the fixture — the same position D-14 was in before it was found.
