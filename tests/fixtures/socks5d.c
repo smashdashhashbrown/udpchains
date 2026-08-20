@@ -11,7 +11,9 @@
  * usage: socks5d [options]
  *   --port N            listen port (0 = ephemeral, the default)
  *   --refuse-associate  reply to UDP ASSOCIATE with a general failure
- *   --auth-required     offer only username/password, which v1 cannot do
+ *   --auth-required     require RFC 1929 username/password authentication
+ *   --auth-user U       expected username (default testuser)
+ *   --auth-pass P       expected password (default testpass)
  *   --expire-after N    tear the association down after N seconds idle
  *   --drop-nth N        drop every Nth relayed datagram
  *   --delay-ms N        delay each relayed datagram
@@ -69,7 +71,10 @@ static struct {
 	int reject_atyp;
 	bool quiet;
 	bool dead_relay;
-} opt = { 0, false, false, 0, 0, 0, 8192, false, true, -1, false, false };
+	const char *auth_user;
+	const char *auth_pass;
+} opt = { 0, false, false, 0, 0, 0, 8192, false, true, -1, false, false,
+          "testuser", "testpass" };
 
 static void logf_(const char *fmt, ...)
 	__attribute__((format(printf, 1, 2)));
@@ -335,8 +340,10 @@ static void *client_thread(void *arg)
 
 		out[0] = SOCKS_VER;
 		if (opt.auth_required) {
-			/* Offer only 0x02 so the shim's "method I cannot do"
-			 * path is exercised (FR-P-09 is deferred in v1). */
+			/* Demand 0x02.  A client that does not offer it is
+			 * refused, which is how a real proxy behaves and is what
+			 * makes the shim's "no credentials configured"
+			 * diagnostic reachable. */
 			out[1] = METHOD_USERPASS;
 			bool client_offers_userpass = false;
 			for (uint8_t i = 0; i < nmethods; i++)
@@ -350,9 +357,52 @@ static void *client_thread(void *arg)
 				if (buf[i] == METHOD_NONE)
 					out[1] = METHOD_NONE;
 		}
-		if (write_all(cfd, out, 2) != 0 || out[1] == METHOD_UNACCEPTABLE ||
-		    out[1] == METHOD_USERPASS)
+		if (write_all(cfd, out, 2) != 0 || out[1] == METHOD_UNACCEPTABLE)
 			goto done;
+
+		/* RFC 1929 sub-negotiation.  Deliberately STRICT, in the same
+		 * spirit as rejecting a v4-mapped ATYP 0x04: a fixture that
+		 * forgives a malformed exchange is how D-14 survived 108 green
+		 * cells.  The version byte must be 0x01, not SOCKS5's 0x05. */
+		if (out[1] == METHOD_USERPASS) {
+			uint8_t ulen, plen;
+			char user[256], pass[256];
+			bool ok;
+
+			if (read_all(cfd, buf, 2) != 0)
+				goto done;
+			if (buf[0] != 0x01) {
+				logf_("auth: bad sub-negotiation version 0x%02x, "
+				      "expected 0x01",
+				      buf[0]);
+				goto done;
+			}
+			ulen = buf[1];
+			if (ulen == 0 || read_all(cfd, buf, ulen) != 0)
+				goto done;
+			memcpy(user, buf, ulen);
+			user[ulen] = '\0';
+
+			if (read_all(cfd, buf, 1) != 0)
+				goto done;
+			plen = buf[0];
+			if (plen > 0 && read_all(cfd, buf, plen) != 0)
+				goto done;
+			memcpy(pass, buf, plen);
+			pass[plen] = '\0';
+
+			ok = (strcmp(user, opt.auth_user) == 0 &&
+			      strcmp(pass, opt.auth_pass) == 0);
+
+			/* Log the outcome and the username, never the password. */
+			logf_("auth: user '%s' %s", user,
+			      ok ? "accepted" : "REJECTED");
+
+			out[0] = 0x01;
+			out[1] = ok ? 0x00 : 0x01;
+			if (write_all(cfd, out, 2) != 0 || !ok)
+				goto done;
+		}
 	}
 
 	/* Request: VER CMD RSV ATYP ADDR PORT */
@@ -677,6 +727,10 @@ int main(int argc, char **argv)
 			opt.quiet = true;
 		else if (strcmp(a, "--dead-relay") == 0)
 			opt.dead_relay = true;
+		else if (strcmp(a, "--auth-user") == 0 && i + 1 < argc)
+			opt.auth_user = argv[++i];
+		else if (strcmp(a, "--auth-pass") == 0 && i + 1 < argc)
+			opt.auth_pass = argv[++i];
 		else {
 			fprintf(stderr, "socks5d: unknown option %s\n", a);
 			return 1;

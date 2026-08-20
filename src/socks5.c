@@ -17,6 +17,9 @@
 #define METHOD_USERPASS 0x02
 #define METHOD_UNACCEPTABLE 0xff
 #define CMD_UDP_ASSOCIATE 0x03
+/* RFC 1929's sub-negotiation carries its OWN version byte, 0x01, not SOCKS5's
+ * 0x05.  Confusing the two is the classic implementation bug here. */
+#define UDPC_AUTH_VER 0x01
 #define REP_SUCCEEDED 0x00
 
 /* --- header codec ---------------------------------------------------------- */
@@ -136,6 +139,59 @@ ssize_t udpc_socks_encode_domain(uint8_t *buf, size_t buflen, const char *host,
 	memcpy(buf + 5 + hlen, &nport, 2);
 
 	return (ssize_t)(7 + hlen);
+}
+
+
+/* RFC 1929 username/password sub-negotiation request:
+ *
+ *   +----+------+----------+------+----------+
+ *   |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+ *   +----+------+----------+------+----------+
+ *   | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+ *
+ * VER here is 0x01 -- the sub-negotiation's own version, NOT the SOCKS5 0x05.
+ * Getting that wrong is the classic RFC 1929 bug: the proxy reads 0x05 as an
+ * unknown auth version and closes, which looks like a network fault rather than
+ * a protocol error.
+ *
+ * An empty username is refused.  RFC 1929 gives ULEN a range of 1 to 255, and a
+ * zero-length name would be encoded as a well-formed message that no proxy can
+ * match against an account -- failing later, and less clearly.
+ */
+ssize_t udpc_socks_encode_userpass(uint8_t *buf, size_t buflen, const char *user,
+                                   const char *pass)
+{
+	size_t ulen, plen;
+
+	if (buf == NULL || user == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	pass = (pass != NULL) ? pass : "";
+
+	ulen = strlen(user);
+	plen = strlen(pass);
+
+	if (ulen == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (ulen > 255 || plen > 255) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (buflen < 3 + ulen + plen) {
+		errno = ENOBUFS;
+		return -1;
+	}
+
+	buf[0] = UDPC_AUTH_VER;
+	buf[1] = (uint8_t)ulen;
+	memcpy(buf + 2, user, ulen);
+	buf[2 + ulen] = (uint8_t)plen;
+	memcpy(buf + 3 + ulen, pass, plen);
+
+	return (ssize_t)(3 + ulen + plen);
 }
 
 ssize_t udpc_socks_decode(const uint8_t *buf, size_t len,
@@ -433,14 +489,24 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 
 	/* Method negotiation: VER, NMETHODS, METHODS.
 	 *
-	 * v1 offers only "no authentication" (0x00).  FR-P-09 (RFC 1929
-	 * username/password) is deferred per D-08; when it lands, this is where
-	 * 0x02 joins the list and a sub-negotiation follows the reply. */
-	buf[0] = SOCKS_VER;
-	buf[1] = 1;
-	buf[2] = METHOD_NONE;
-	if (write_all(fd, buf, 3, cfg->connect_timeout_ms) != 0)
-		goto fail;
+	 * "No authentication" is always offered.  Username/password (0x02) is
+	 * offered only when credentials are configured, so a proxy that accepts
+	 * either does not get pushed into an authenticated exchange the user did
+	 * not ask for -- and so the "method I cannot do" diagnostic stays
+	 * accurate when no credentials exist. */
+	{
+		uint8_t nmethods = 0;
+
+		buf[0] = SOCKS_VER;
+		buf[2 + nmethods++] = METHOD_NONE;
+		if (cfg->have_credentials)
+			buf[2 + nmethods++] = METHOD_USERPASS;
+		buf[1] = nmethods;
+
+		if (write_all(fd, buf, 2 + (size_t)nmethods,
+		              cfg->connect_timeout_ms) != 0)
+			goto fail;
+	}
 
 	if (read_all(fd, buf, 2, cfg->connect_timeout_ms) != 0)
 		goto fail;
@@ -451,16 +517,71 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 	}
 	if (buf[1] == METHOD_UNACCEPTABLE) {
 		udpc_err("proxy rejected all offered authentication methods");
-		if (cfg->have_credentials)
-			udpc_err("credentials are configured but SOCKS5 "
-			         "username/password auth is not implemented in v1 "
-			         "(FR-P-09, deferred)");
+		if (!cfg->have_credentials)
+			udpc_err("no credentials are configured; set "
+			         "UDPCHAINS_USERNAME and UDPCHAINS_PASSWORD_FILE "
+			         "if the proxy requires authentication");
 		errno = EACCES;
 		goto fail;
 	}
-	if (buf[1] != METHOD_NONE) {
-		udpc_err("proxy selected authentication method 0x%02x, which v1 "
-		         "does not implement (FR-P-09, deferred)",
+	if (buf[1] == METHOD_USERPASS) {
+		/* FR-P-09 / RFC 1929.  A separate buffer: the request can reach
+		 * 513 bytes, twice the datagram header maximum that sizes buf. */
+		uint8_t authbuf[3 + 255 + 255];
+		ssize_t alen;
+
+		if (!cfg->have_credentials) {
+			/* Unreachable unless the proxy selected a method we did
+			 * not offer, which is a protocol violation worth naming
+			 * rather than treating as an auth failure. */
+			udpc_err("proxy selected username/password authentication, "
+			         "which was not offered -- no credentials are "
+			         "configured");
+			errno = EPROTO;
+			goto fail;
+		}
+
+		alen = udpc_socks_encode_userpass(authbuf, sizeof(authbuf),
+		                                  cfg->username, cfg->password);
+		if (alen < 0) {
+			udpc_err("cannot encode credentials: username must be 1 "
+			         "to 255 bytes and the password at most 255");
+			errno = EINVAL;
+			goto fail;
+		}
+
+		/* NFR-05: the length is logged, never the bytes. */
+		udpc_debug("proxy selected username/password auth; sending "
+		           "credentials for user of %zu bytes",
+		           strlen(cfg->username));
+
+		if (write_all(fd, authbuf, (size_t)alen,
+		              cfg->connect_timeout_ms) != 0) {
+			explicit_bzero(authbuf, sizeof(authbuf));
+			goto fail;
+		}
+		explicit_bzero(authbuf, sizeof(authbuf));
+
+		if (read_all(fd, buf, 2, cfg->connect_timeout_ms) != 0)
+			goto fail;
+		if (buf[0] != UDPC_AUTH_VER) {
+			udpc_err("proxy replied to authentication with version "
+			         "0x%02x, expected 0x01 (RFC 1929)",
+			         buf[0]);
+			errno = EPROTO;
+			goto fail;
+		}
+		if (buf[1] != 0x00) {
+			udpc_err("proxy rejected the supplied credentials "
+			         "(status 0x%02x)",
+			         buf[1]);
+			errno = EACCES;
+			goto fail;
+		}
+		udpc_debug("authenticated");
+	} else if (buf[1] != METHOD_NONE) {
+		udpc_err("proxy selected authentication method 0x%02x, which is "
+		         "not implemented (only 0x00 and 0x02 are supported)",
 		         buf[1]);
 		errno = EACCES;
 		goto fail;

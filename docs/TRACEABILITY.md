@@ -25,19 +25,20 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 429 assertions across 14 groups, all passing.
+**Test totals:** 455 assertions across 15 groups, all passing.
 
 | Group | Assertions |
 |---|---|
 | unit-addr | 51 |
 | unit-config | 38 |
-| unit-socks5 | 65 |
+| unit-socks5 | 83 |
 | unit-fdtable | 19 |
 | TST-01 hook matrix | 108 |
 | TST-05 fidelity | 93 |
 | port switch (TFTP pattern) | 12 |
 | TST-06 lifecycle | 26 |
 | TST-07 threading | 9 |
+| FR-P-09 auth | 8 |
 | wrapper loadability | 7 |
 | TST-03 leak | 7 checks |
 | fault injection | 10 |
@@ -72,7 +73,7 @@ inspection basis is recorded in the notes below.
 | FR-P-06 | M | §1, §4.1 | TST-07 | **Verified** — automatic: the app's fd is the only data socket. TST-07 confirms one association from an 8-way race |
 | FR-P-07 | M | §4.3 | unit-socks5 | **Verified** — encode/decode of ATYP 0x03. Not reachable via the socket API (no libc UDP call takes a hostname); covered by unit test, as §4.3 notes |
 | FR-P-08 | S | §4.4 | faults | **Verified** — fixture expires an association; the shim re-associates before the send, so no datagram is lost |
-| FR-P-09 | S | — | — | **Deferred** (D-08) — negotiation refuses unsupported methods with a clear message |
+| FR-P-09 | S | §4.1 | unit-socks5, FR-P-09-auth | **Verified** — RFC 1929 implemented (D-20, superseding the D-08 deferral). `0x02` is offered only when credentials are configured; the sub-negotiation version byte is `0x01`, not SOCKS5's `0x05`, which the unit test asserts specifically. End-to-end against a fixture performing real authentication: correct credentials round-trip, and wrong or absent credentials deliver **nothing** rather than falling through to a direct send. A test asserts the password appears in no log on either side (NFR-05, SEC-03) |
 | FR-P-10 | C | — | — | **Deferred** — already a §8 non-goal |
 
 ## §3 Syscall fidelity
@@ -121,7 +122,7 @@ inspection basis is recorded in the notes below.
 | NFR-01a | M | §10 | build, TST-02 | **Verified** — glibc floor enforced in `compat.h`; TST-02 knows about the `close_range` conditional |
 | NFR-02 | M | §3.1, §5 | inspection, unit-fdtable | **Verified** — allocation only in `socket`/`dup*` and once per thread; the datagram path is atomic loads |
 | NFR-03 | M | §3.1, §3.5 | inspection | **Implemented** — no locks, no allocation, no syscalls on the datagram path. The one place a signal handler could have waited on itself (association setup re-entered on the same fd) returns `EAGAIN` rather than spinning |
-| NFR-04 | S | §10 | bench | **Verified (reported)** — median 51–69 µs, p99 305–564 µs for the *whole* round trip including the proxy hop, which the 100 µs budget excludes. Not a CI gate (D-08) |
+| NFR-04 | S | §10 | bench | **Verified (reported)** — the bench now runs the same binary against the same echo server **with and without** the shim, so loopback, the echo server and the syscall path cancel and the delta is what the shim adds: **42 µs added median** (direct 32 µs → proxied 74 µs), p99 +136 µs. Inside the 100 µs budget, and that figure still contains the proxy hop the budget excludes, so it is an upper bound rather than the shim's share. Previously a single run reported the whole round trip and could not be compared against the budget at all. Not a CI gate (D-08) |
 | NFR-05 | M | §7.3 | inspection | **Verified** — no payload bytes at any verbosity; there is deliberately no hex-dump helper |
 | NFR-06 | S | §10 | build | **Verified** — `-Wall -Wextra -Werror` plus `-Wshadow -Wcast-qual -Wstrict-prototypes` and more; it caught two real truncation hazards during development |
 

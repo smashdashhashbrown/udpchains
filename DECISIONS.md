@@ -271,7 +271,7 @@ each rather than drifting.
 |---|---|---|
 | FR-I-08 | Loopback bypass | D-05 |
 | FR-I-09 | Multicast/broadcast bypass | D-05 — these fail with `ENETUNREACH` per rider R1 |
-| FR-P-09 | RFC 1929 username/password auth | The reference proxy offers only method `0x00`, so v1 cannot exercise it end to end; the fixture (D-06) would have to grow auth support to test a path with no reference behaviour to validate against |
+| FR-P-09 | RFC 1929 username/password auth | **Superseded by D-20 — implemented before release.** Originally deferred because the reference proxy offered only method `0x00` |
 | FR-C-04 | `proxychains.conf`-style `[ProxyList]` | Ergonomic rather than functional; a second config syntax to test and document |
 | FR-P-10 | Proxy chains | Already a §8 non-goal |
 
@@ -281,6 +281,10 @@ FR-P-09 later does not tempt anyone into a `--password` flag.
 
 **Revisit if.** A target proxy requires authentication — FR-P-09 then becomes blocking, not
 optional.
+
+**Outcome.** FR-P-09 was implemented before release; see **D-20**. The plumbing decision above is
+what made that a small change rather than a redesign: the credential path already existed and had
+nowhere to leak to.
 
 ---
 
@@ -679,6 +683,74 @@ execution would still be a leak. The `noexec` case is verified by hand rather th
 because creating such a mount needs root or unprivileged user namespaces and a test run can assume
 neither; the script records the manual procedure.
 
-**Residual.** This closes the wrapper path only. A user who sets `LD_PRELOAD` by hand, without the
-wrapper, still gets the loader's silent fallback — there is nothing in the shim that can run to
-prevent it, because the failure is that the shim did not run.
+**Residual, and narrower than it first appears.**
+
+1. This closes the wrapper path only. A user who sets `LD_PRELOAD` by hand still gets the loader's
+   silent fallback — nothing in the shim can run to prevent it, because the failure is that the shim
+   did not run.
+
+2. **LSM coverage is conditional on the wrapper and the target sharing a security domain.** The probe
+   runs in the *wrapper's* process; the loader's mapping happens in the *target's*. If the target
+   transitions into a confined SELinux or AppArmor domain on `exec`, the wrapper can be permitted
+   while the target is denied — the probe passes, the wrapper execs, and the program runs unproxied
+   exactly as before.
+
+   Not hypothetical: it is how the failure that prompted this decision behaved. On one VPS
+   `mmap(..., PROT_READ|PROT_EXEC, ..., 0x3000)` returned **`EACCES`**, which is the LSM hook rather
+   than the mount — a `noexec` mount returns `EPERM` from `do_mmap`, and `findmnt` confirmed no
+   `noexec`. A `/bin/true` target loaded the shim successfully while an `nc` target did not.
+
+   The checks therefore rank by reliability: ELF-header and architecture are unconditional, `noexec`
+   is caught because mount flags are not domain-specific, and LSM denials are caught only when
+   wrapper and target are confined alike.
+
+**Revisit if:** a way is found to test the target's own domain before `exec`. That would mean probing
+after the domain transition — i.e. from inside the target, which is exactly where nothing of ours can
+run. The honest framing may be that this class is uncatchable from the wrapper, in which case it
+belongs in the README beside the other things the shim cannot promise.
+
+
+---
+
+## D-20
+### RFC 1929 username/password authentication, implemented before release
+
+**Date:** 2026-08-20 · **Status:** Accepted · Supersedes the FR-P-09 deferral in D-08.
+
+**Context.** D-08 deferred FR-P-09 on the grounds that the reference proxy offered only method
+`0x00`, so there was no reference behaviour to validate against and the fixture would have to grow
+auth support to test it. That reasoning was sound at the time and expired for a simple reason: a
+release that cannot talk to an authenticated proxy has a usability ceiling its version number does
+not hint at, and D-08's own revisit condition was "a target proxy requires authentication".
+
+**Decision.** Implemented, in the shape D-08's consequences paragraph anticipated.
+
+- `0x02` is offered **only when credentials are configured.** A proxy that accepts either method is
+  not pushed into an authenticated exchange the user did not ask for, and the "no credentials are
+  configured" diagnostic stays accurate rather than becoming a lie about what was offered.
+- The sub-negotiation version byte is `0x01`, RFC 1929's own, **not** SOCKS5's `0x05`. This is the
+  classic bug in this exchange: a proxy reads `0x05` as an unknown auth version and closes the
+  connection, which presents as a network fault rather than a protocol error. The unit test asserts
+  this byte specifically, and the fixture rejects anything else.
+- An empty username is refused at encode time. RFC 1929 gives `ULEN` the range 1 to 255, and a
+  zero-length name encodes as a well-formed message no proxy can match to an account — failing
+  later, and less clearly. An empty *password* is legal and is encoded as `PLEN 0`.
+- A proxy selecting `0x02` when it was never offered is reported as `EPROTO`, not as an
+  authentication failure: it is a protocol violation and deserves its own diagnostic.
+- The request buffer is zeroed with `explicit_bzero` after the write, which the compiler may not
+  elide.
+
+**SEC-03 and NFR-05.** Credentials are still never accepted on the command line, because `argv` is
+world-readable via `ps`. The debug log records the username's *length* and the outcome, never the
+password; the fixture logs the username and outcome, never the password. A test asserts the password
+appears in no log on either side, which is the only form of that guarantee worth having.
+
+**Testing.** Byte layout is asserted against the RFC directly, written out literally rather than
+computed by the code under test. The exchange is asserted end to end against a fixture that performs
+real authentication and is deliberately strict about the version byte — a forgiving fixture is
+exactly how D-14 survived 108 green cells. The negative cases carry the weight: a wrong password, and
+no credentials at all, must each deliver **nothing**, because a failure that falls through to a
+direct send would be an SEC-01 violation wearing an authentication error as a disguise.
+
+**Still not implemented:** GSSAPI (method `0x01`), and any method beyond `0x00` and `0x02`. A proxy
+selecting one is refused with a diagnostic naming what is supported.

@@ -5,3 +5,13 @@ build-asan.log
 build-tsan.log
 *.o
 *.d
+
+# Artifacts from manual interop runs (tftp/curl transfers, iperf captures).
+# Deliberately specific: a blanket *.txt would silently swallow real files.
+/test.txt
+/randomfile.txt
+/out.bin
+/big.bin
+/*.pcap
+/vgcore.*
+core

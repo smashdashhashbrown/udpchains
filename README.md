@@ -24,7 +24,8 @@ No dependencies beyond a C compiler. Linux, glibc ≥ 2.34.
 
 ```sh
 make
-sudo make install          # /usr/local/bin/udpchains, /usr/local/lib/libudpchains.so
+sudo make install          # bin/udpchains, lib/libudpchains.so, man1/udpchains.1
+man udpchains
 ```
 
 Run the suite:
@@ -68,8 +69,17 @@ strict_loopback = no
 ```
 
 Credentials are never accepted on the command line, because `argv` is visible in `ps`. Use a file or
-the environment. (SOCKS5 username/password authentication itself is not implemented in v1 — see
-below.)
+the environment:
+
+```sh
+UDPCHAINS_USERNAME=alice UDPCHAINS_PASSWORD_FILE=~/.udpchains.pw \
+    udpchains -p proxy.example:1080 dig @9.9.9.9 example.com
+```
+
+RFC 1929 username/password authentication is supported. Method `0x02` is offered **only** when
+credentials are configured, so a proxy that accepts either is not pushed into an authenticated
+exchange you did not ask for. If authentication fails, the send fails — there is no fallback to an
+unauthenticated or direct send.
 
 ## What does not work
 
@@ -180,8 +190,9 @@ clients use, precisely because of the port switch — is not filtered by the shi
 
 ### Not implemented in v1
 
-- SOCKS5 username/password authentication (RFC 1929). The credential plumbing exists; the protocol
-  exchange does not. A proxy requiring authentication will be refused with a clear message.
+- SOCKS5 GSSAPI authentication (method `0x01`), and any method other than `0x00` and `0x02`. A proxy
+  selecting one is refused with a diagnostic naming what is supported. Username/password (RFC 1929)
+  **is** implemented — see above.
 - `proxychains.conf`-style `[ProxyList]` config. A `[ProxyList]` line produces a message pointing
   here rather than a generic parse error.
 - Proxy chains (multi-hop UDP).
@@ -215,6 +226,7 @@ syscalls on the datagram path, so a send from a signal handler cannot deadlock.
 | [`docs/DESIGN.md`](docs/DESIGN.md) | how it is built |
 | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | every requirement mapped to design section and test |
 | [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | manual tests against a real proxy, and what each one proves |
+| [`CHANGELOG.md`](CHANGELOG.md) | what changed, and what is known not to work |
 
 ## Licence
 

@@ -109,6 +109,9 @@ run_test TST-07-thread \
 
 # --- SEC-01 / SEC-02: the leak test (TST-03) ---------------------------------
 
+run_test FR-P-09-auth "$ROOT/tests/test_auth.sh" "$BUILD/socks5d" \
+	"$BUILD/udpecho" "$WRAPPER"
+
 run_test wrapper-loadable "$ROOT/tests/test_wrapper.sh" "$WRAPPER" \
 	"$ROOT/libudpchains.so"
 
@@ -130,7 +133,46 @@ if want NFR-04-bench; then
 	echo "=============================================================="
 	echo "  NFR-04-bench (reported, not a gate)"
 	echo "=============================================================="
-	timeout 120 "$WRAPPER" "$BUILD/bench_latency" "$ECHO1" || true
+	# NFR-04 excludes proxy and network time, which a single run cannot
+	# separate from the shim's own cost.  Running the SAME binary against the
+	# SAME echo server with and without the shim makes loopback, the echo
+	# server and the syscall path cancel, so the delta bounds what the shim
+	# adds.  The proxy hop is still inside that delta -- it is an upper
+	# bound, not the shim's share, and the output says so.
+	BENCH_DIRECT=$(timeout 120 "$BUILD/bench_latency" "$ECHO1" \
+		--tag direct 2>/dev/null | awk '/^NFR04/{print}') || true
+	BENCH_SHIM=$(timeout 120 "$WRAPPER" "$BUILD/bench_latency" "$ECHO1" \
+		--tag proxied 2>/dev/null | awk '/^NFR04/{print}') || true
+
+	d_med=$(printf '%s\n' "$BENCH_DIRECT" | sed -n 's/.*median=\([0-9.]*\).*/\1/p')
+	s_med=$(printf '%s\n' "$BENCH_SHIM"   | sed -n 's/.*median=\([0-9.]*\).*/\1/p')
+	d_p99=$(printf '%s\n' "$BENCH_DIRECT" | sed -n 's/.*p99=\([0-9.]*\).*/\1/p')
+	s_p99=$(printf '%s\n' "$BENCH_SHIM"   | sed -n 's/.*p99=\([0-9.]*\).*/\1/p')
+
+	if [ -n "$d_med" ] && [ -n "$s_med" ]; then
+		printf '#   %-8s median %8.1f us   p99 %8.1f us\n' direct \
+			"$d_med" "$d_p99"
+		printf '#   %-8s median %8.1f us   p99 %8.1f us\n' proxied \
+			"$s_med" "$s_p99"
+		awk -v a="$s_med" -v b="$d_med" -v c="$s_p99" -v d="$d_p99" \
+		    -v budget=100 'BEGIN {
+			dm = a - b; dp = c - d;
+			printf "#\n";
+			printf "#   ADDED    median %8.1f us   p99 %8.1f us\n", dm, dp;
+			printf "#\n";
+			printf "# NFR-04 budget is %d us per datagram, excluding proxy and\n", budget;
+			printf "# network time.  The added figure above still CONTAINS the\n";
+			printf "# proxy hop, which this harness cannot separate, so it is an\n";
+			printf "# upper bound: the shim%s own share is at most this.\n", "\47s";
+			if (dm <= budget)
+				printf "#   -> within budget even counting the proxy hop.\n";
+			else
+				printf "#   -> ABOVE budget, but only as an upper bound; the\n" \
+				       "#      proxy hop is included and is not the shim%s cost.\n", "\47s";
+		}'
+	else
+		echo "# NFR-04: benchmark did not produce results"
+	fi
 fi
 
 echo

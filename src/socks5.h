@@ -85,6 +85,15 @@ struct udpc_socks_conn {
  * the request declares 0.0.0.0:0 unless the application bound a concrete
  * address, because proxies pin the association to a declared address and
  * declaring one the shim will not send from breaks the association. */
+/* Encodes an RFC 1929 username/password sub-negotiation request into buf.
+ * Returns its length, or -1 with errno set: EINVAL for an empty or over-long
+ * username, or an over-long password; ENOBUFS if buf is too small.
+ *
+ * Exposed so the byte layout can be asserted against the RFC directly, rather
+ * than only through a live exchange with the fixture. */
+ssize_t udpc_socks_encode_userpass(uint8_t *buf, size_t buflen, const char *user,
+                                   const char *pass);
+
 int udpc_socks_associate(const struct udpc_config *cfg,
                          const struct sockaddr *bind_addr,
                          struct udpc_socks_conn *conn, int *out_errno);

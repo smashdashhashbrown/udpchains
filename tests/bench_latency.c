@@ -12,7 +12,14 @@
  * hop.  The proxy hop is NOT excluded and is called out in the output, since
  * NFR-04 excludes it and this harness cannot.
  *
- * usage: bench_latency <echoport>          (run under the shim)
+ * usage: bench_latency <echoport> [--tag NAME]
+ *
+ * Run it TWICE -- once under the shim, once directly against the same echo
+ * server -- and subtract.  The fixed cost of loopback, the echo server and the
+ * syscall path cancels, leaving the shim plus the proxy hop.  The proxy hop is
+ * not separable by this harness, so the delta is an UPPER BOUND on the shim's
+ * own share, which is the honest form of the NFR-04 claim.  tests/run.sh does
+ * both runs and the subtraction; the NFR04 line below is what it parses.
  */
 #define _GNU_SOURCE 1
 
@@ -100,11 +107,16 @@ int main(int argc, char **argv)
 {
 	static double samples[ITERS];
 	double median = 0, p99 = 0;
-	int n;
+	const char *tag = "run";
+	int n, i;
 
 	if (argc < 2) {
-		fprintf(stderr, "usage: bench_latency <echoport>\n");
+		fprintf(stderr, "usage: bench_latency <echoport> [--tag NAME]\n");
 		return 2;
+	}
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--tag") == 0 && i + 1 < argc)
+			tag = argv[++i];
 	}
 
 	memset(&g_echo, 0, sizeof(g_echo));
@@ -118,14 +130,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	printf("# NFR-04: round-trip latency over %d samples\n", n);
-	printf("#   median   %8.1f us\n", median);
-	printf("#   p99      %8.1f us\n", p99);
-	printf("#\n");
-	printf("# This is the WHOLE round trip: application -> shim -> proxy ->\n");
-	printf("# echo server and back.  NFR-04's 100 us budget excludes proxy\n");
-	printf("# time, which this harness cannot separate, so the shim's own\n");
-	printf("# share is strictly less than the number above.  Compare against\n");
-	printf("# the same binary run without the shim for the delta.\n");
+	printf("#   %-8s median %8.1f us   p99 %8.1f us   (%d samples)\n", tag,
+	       median, p99, n);
+	/* Machine-readable, parsed by tests/run.sh to do the subtraction. */
+	printf("NFR04 %s median=%.1f p99=%.1f n=%d\n", tag, median, p99, n);
+	fflush(stdout);
 	return 0;
 }

@@ -8,8 +8,9 @@ CC      ?= cc
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
 LIBDIR  ?= $(PREFIX)/lib
+MANDIR  ?= $(PREFIX)/share/man/man1
 
-VERSION := 0.1.0
+VERSION := 1.0.0
 
 WARNINGS := -Wall -Wextra -Werror \
             -Wshadow -Wpointer-arith -Wcast-qual -Wstrict-prototypes \
@@ -77,7 +78,11 @@ all: $(SHIM) $(WRAPPER)
 $(OBJDIR):
 	@mkdir -p $(OBJDIR)
 
-$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
+# Objects depend on the Makefile itself: VERSION and the sanitiser flags live
+# in CFLAGS, so without this a version bump or a switch to ASAN=1 silently
+# reuses objects built with the old settings.  `make` then reports the previous
+# version, which is exactly the sort of thing that ships.
+$(OBJDIR)/%.o: $(SRCDIR)/%.c Makefile | $(OBJDIR)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 $(SHIM): $(SHIM_OBJS)
@@ -156,12 +161,14 @@ test: all fixtures tests check
 	@$(TESTDIR)/run.sh
 
 install: all
-	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR)
+	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(MANDIR)
 	install -m 0755 $(WRAPPER) $(DESTDIR)$(BINDIR)/$(WRAPPER)
 	install -m 0644 $(SHIM) $(DESTDIR)$(LIBDIR)/$(SHIM)
+	install -m 0644 docs/udpchains.1 $(DESTDIR)$(MANDIR)/udpchains.1
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/$(WRAPPER) $(DESTDIR)$(LIBDIR)/$(SHIM)
+	rm -f $(DESTDIR)$(BINDIR)/$(WRAPPER) $(DESTDIR)$(LIBDIR)/$(SHIM) \
+	      $(DESTDIR)$(MANDIR)/udpchains.1
 
 clean:
 	rm -rf $(OBJDIR) $(SHIM) $(WRAPPER)

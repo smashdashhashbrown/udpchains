@@ -1,0 +1,150 @@
+.TH UDPCHAINS 1 "2026-08-20" "udpchains 1.0.0" "User Commands"
+.SH NAME
+udpchains \- route a program's UDP traffic through a SOCKS5 proxy
+.SH SYNOPSIS
+.B udpchains
+[\fIoptions\fR] \fIprogram\fR [\fIargs\fR...]
+.SH DESCRIPTION
+.B udpchains
+runs
+.I program
+with an
+.BR LD_PRELOAD (8)
+shim that redirects its
+.B UDP
+traffic through a SOCKS5 proxy supporting
+.BR "UDP ASSOCIATE" " (RFC 1928 \[sc]7)."
+The program is not modified or recompiled.
+.PP
+Unlike
+.BR proxychains (1),
+which is TCP\-only and lets UDP go direct with no error,
+.B udpchains
+.B fails closed:
+if a datagram cannot be proxied the call fails with an appropriate
+.IR errno .
+It never falls back to sending directly.
+.PP
+There is no built\-in default proxy. If none is configured,
+.B udpchains
+prints a diagnostic and refuses to run the program rather than running it
+unproxied.
+.SH OPTIONS
+.TP
+.BI \-f " file"
+Configuration file.
+.TP
+.BI \-p " addr"
+Proxy address, as \fIhost:port\fR or \fI[v6]:port\fR.
+.TP
+.B \-q
+Quiet: errors only.
+.TP
+.B \-v
+Verbose: log protocol steps. Never logs payload bytes.
+.TP
+.B \-V
+Print version and exit.
+.TP
+.B \-h
+Show help.
+.SH ENVIRONMENT
+Configuration is resolved in precedence order: command line, environment,
+configuration file.
+.TP
+.B UDPCHAINS_PROXY
+Proxy as \fIhost:port\fR.
+.TP
+.B UDPCHAINS_CONFIG
+Configuration file path.
+.TP
+.B UDPCHAINS_MAX_DATAGRAM
+Maximum payload in bytes. Default 8192. Payloads above this fail with
+.BR EMSGSIZE .
+.TP
+.B UDPCHAINS_STRICT_LOOPBACK
+Promote the loopback\-destination warning to an error.
+.TP
+.B UDPCHAINS_CONNECT_TIMEOUT
+Proxy connect timeout in milliseconds.
+.TP
+.B UDPCHAINS_LIB
+Explicit path to \fIlibudpchains.so\fR.
+.TP
+.BR UDPCHAINS_USERNAME ", " UDPCHAINS_PASSWORD_FILE
+Credentials for RFC 1929 username/password authentication. Never accepted on
+the command line, because
+.I argv
+is visible in
+.BR ps (1).
+Method
+.B 0x02
+is offered only when credentials are configured. GSSAPI is not implemented.
+.SH FILES
+.TP
+.I ~/.udpchains.conf
+.TQ
+.I /etc/udpchains.conf
+Configuration, as \fIkey = value\fR lines.
+.SH EXIT STATUS
+.TP
+.B 0
+The program ran and exited successfully.
+.TP
+.B 1
+Configuration, proxy or shim\-loading failure. The program was not run.
+.TP
+.B 126
+The program could not be executed.
+.TP
+.B 127
+The program was not found.
+.SH LIMITATIONS
+Cannot help statically\-linked binaries, Go binaries, or programs issuing raw
+syscalls: there is no libc call to interpose on. Refuses setuid, setgid and
+capability\-endowed binaries, because the loader ignores
+.B LD_PRELOAD
+for them and running them would mean running them unproxied.
+.PP
+.B Raw sockets are not intercepted.
+A program using
+.B SOCK_RAW
+reaches the network directly. See
+.I DECISIONS.md
+D\-18.
+.PP
+TCP is not proxied. Multicast and broadcast fail with
+.BR ENETUNREACH .
+A loopback destination is resolved at the proxy, so with a remote proxy it
+reaches the proxy host's loopback, not this one.
+.PP
+Ancillary data
+.RB ( msg_control )
+is returned empty.
+.SH EXAMPLES
+.PP
+Resolve a name through the proxy:
+.PP
+.RS
+.EX
+udpchains \-p 127.0.0.1:1080 dig @9.9.9.9 example.com
+.EE
+.RE
+.PP
+Confirm the traffic really takes the tunnel \- this should report the proxy's
+egress address, not the local one:
+.PP
+.RS
+.EX
+udpchains \-p 127.0.0.1:1080 dig +short myip.opendns.com @208.67.222.222
+.EE
+.RE
+.SH SEE ALSO
+.BR proxychains (1),
+.BR ld.so (8),
+.BR socket (7),
+.BR udp (7)
+.PP
+RFC 1928, section 7.
+.SH AUTHORS
+Implemented clean\-room from RFC 1928 and the relevant manual pages.

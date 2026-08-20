@@ -334,5 +334,61 @@ int main(void)
 		}
 	}
 
+
+	/* FR-P-09 / RFC 1929.  Byte expectations written out literally from the
+	 * RFC, not computed by the code under test. */
+	TAP_GROUP("RFC 1929 username/password sub-negotiation");
+	{
+		uint8_t b[600];
+		ssize_t an;
+		char big[300];
+
+		an = udpc_socks_encode_userpass(b, sizeof(b), "alice", "s3cret");
+		TAP_EQ_INT(an, 3 + 5 + 6, "encoded length is 3 + ULEN + PLEN");
+		TAP_EQ_INT(b[0], 0x01,
+		           "VER is 0x01 -- the sub-negotiation's own version, "
+		           "NOT SOCKS5's 0x05");
+		TAP_EQ_INT(b[1], 5, "ULEN");
+		TAP_OK(memcmp(b + 2, "alice", 5) == 0, "UNAME");
+		TAP_EQ_INT(b[7], 6, "PLEN follows the username immediately");
+		TAP_OK(memcmp(b + 8, "s3cret", 6) == 0, "PASSWD");
+
+		/* An empty password is legal on the wire; an empty username is
+		 * not -- RFC 1929 gives ULEN the range 1 to 255. */
+		an = udpc_socks_encode_userpass(b, sizeof(b), "bob", "");
+		TAP_EQ_INT(an, 3 + 3 + 0, "an empty password encodes as PLEN 0");
+		TAP_EQ_INT(b[5], 0, "with a zero length byte");
+
+		errno = 0;
+		an = udpc_socks_encode_userpass(b, sizeof(b), "", "x");
+		TAP_EQ_INT(an, -1, "an empty username is refused");
+		TAP_EQ_INT(errno, EINVAL, "reporting EINVAL");
+
+		memset(big, 'u', sizeof(big));
+		big[256] = '\0';
+		errno = 0;
+		an = udpc_socks_encode_userpass(b, sizeof(b), big, "x");
+		TAP_EQ_INT(an, -1, "a 256-byte username is refused (max 255)");
+		TAP_EQ_INT(errno, EINVAL, "reporting EINVAL");
+
+		big[255] = '\0';
+		an = udpc_socks_encode_userpass(b, sizeof(b), big, "x");
+		TAP_EQ_INT(an, 3 + 255 + 1, "exactly 255 is accepted");
+		TAP_EQ_INT(b[1], 255, "ULEN is 255, the largest a byte can carry");
+
+		errno = 0;
+		an = udpc_socks_encode_userpass(b, 8, "alice", "s3cret");
+		TAP_EQ_INT(an, -1, "a short buffer is refused");
+		TAP_EQ_INT(errno, ENOBUFS, "reporting ENOBUFS");
+
+		errno = 0;
+		TAP_EQ_INT(udpc_socks_encode_userpass(b, sizeof(b), NULL, "x"), -1,
+		           "a NULL username is refused");
+
+		/* A NULL password means "no password", not a crash. */
+		an = udpc_socks_encode_userpass(b, sizeof(b), "carol", NULL);
+		TAP_EQ_INT(an, 3 + 5 + 0, "a NULL password is treated as empty");
+	}
+
 	TAP_DONE();
 }
