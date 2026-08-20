@@ -109,6 +109,9 @@ run_test TST-07-thread \
 
 # --- SEC-01 / SEC-02: the leak test (TST-03) ---------------------------------
 
+run_test wrapper-loadable "$ROOT/tests/test_wrapper.sh" "$WRAPPER" \
+	"$ROOT/libudpchains.so"
+
 run_test TST-03-leak "$ROOT/tests/test_leak.sh" "$ECHO1"
 
 # --- fault injection: FR-P-08, FR-P-04, D-12 ---------------------------------

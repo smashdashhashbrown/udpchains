@@ -7,11 +7,15 @@
  */
 #include "compat.h"
 
+#include <elf.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
+#include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -193,6 +197,126 @@ static int find_shim(char *out, size_t outlen)
 	return -1;
 }
 
+
+/* Reads the ELF class and machine of an object, so the shim can be compared
+ * against this wrapper rather than against a compile-time #ifdef ladder. */
+static int elf_ident(const char *path, unsigned char *cls, uint16_t *machine)
+{
+	ElfW(Ehdr) eh;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, &eh, sizeof(eh));
+	close(fd);
+
+	if (n != (ssize_t)sizeof(eh) || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0)
+		return -1;
+
+	*cls = eh.e_ident[EI_CLASS];
+	*machine = eh.e_machine;
+	return 0;
+}
+
+/* SEC-06, second half.  find_shim() proves the file is READABLE; this proves it
+ * is LOADABLE, which is not the same thing and fails in ways that are hard to
+ * attribute after the fact.
+ *
+ * If the loader cannot map the shim it prints a warning and RUNS THE PROGRAM
+ * ANYWAY, unproxied.  That is the exact outcome SEC-06 refuses to allow for
+ * setuid binaries -- LD_PRELOAD ignored, traffic going direct -- reached by a
+ * different route, and for a tool whose distinguishing claim is that it fails
+ * closed it is the worst possible failure mode: silent, and visible only as one
+ * line on stderr that a scripted run will not notice.
+ *
+ * Three causes, all seen in practice and each with its own diagnostic:
+ *
+ *   - the filesystem is mounted noexec, or a security policy (SELinux,
+ *     AppArmor) denies mapping the file executable.  The PROT_EXEC probe is
+ *     what catches this; it is the same mapping the loader will attempt.
+ *   - the object is for another architecture, from copying a build between
+ *     hosts rather than rebuilding.
+ *   - the file is truncated or otherwise not an ELF object, from an interrupted
+ *     transfer.
+ */
+static int check_shim_loadable(const char *shim)
+{
+	unsigned char self_cls = 0, shim_cls = 0;
+	uint16_t self_machine = 0, shim_machine = 0;
+	long pagesize;
+	void *p;
+	int fd;
+
+	if (elf_ident(shim, &shim_cls, &shim_machine) != 0) {
+		fprintf(stderr,
+		        "udpchains: %s is not a valid ELF shared object.\n"
+		        "udpchains: it may be truncated or incompletely copied; "
+		        "rebuild it with make.\n"
+		        "udpchains: refusing to run unproxied (SEC-06).\n",
+		        shim);
+		return -1;
+	}
+
+	/* A mismatch here means the object was built elsewhere.  Compared
+	 * against this wrapper, which is by definition the right answer. */
+	if (elf_ident("/proc/self/exe", &self_cls, &self_machine) == 0 &&
+	    (shim_cls != self_cls || shim_machine != self_machine)) {
+		fprintf(stderr,
+		        "udpchains: %s was built for a different architecture "
+		        "(ELF class %u machine %u; this wrapper is class %u "
+		        "machine %u).\n"
+		        "udpchains: rebuild it on this host rather than copying "
+		        "the binary.\n"
+		        "udpchains: refusing to run unproxied (SEC-06).\n",
+		        shim, shim_cls, shim_machine, self_cls, self_machine);
+		return -1;
+	}
+
+	pagesize = sysconf(_SC_PAGESIZE);
+	if (pagesize <= 0)
+		pagesize = 4096;
+
+	fd = open(shim, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		fprintf(stderr, "udpchains: cannot open %s: %s\n", shim,
+		        strerror(errno));
+		return -1;
+	}
+
+	/* The same mapping ld.so will make for the text segment.  If this is
+	 * refused, the preload will be refused. */
+	p = mmap(NULL, (size_t)pagesize, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd,
+	         0);
+	if (p == MAP_FAILED) {
+		int err = errno;
+
+		close(fd);
+		fprintf(stderr,
+		        "udpchains: %s cannot be mapped executable: %s\n",
+		        shim, strerror(err));
+		if (err == EACCES || err == EPERM)
+			fprintf(stderr,
+			        "udpchains: the filesystem is probably mounted "
+			        "noexec, or a security policy (SELinux, "
+			        "AppArmor) forbids it.\n"
+			        "udpchains: check with: findmnt -no OPTIONS -T "
+			        "%s\n"
+			        "udpchains: then move the shim to a filesystem "
+			        "that permits execution.\n",
+			        shim);
+		fprintf(stderr,
+		        "udpchains: refusing to run unproxied -- the loader "
+		        "would ignore LD_PRELOAD and the program would send "
+		        "directly (SEC-06).\n");
+		return -1;
+	}
+
+	munmap(p, (size_t)pagesize);
+	close(fd);
+	return 0;
+}
+
 static int set_preload(const char *shim)
 {
 	const char *existing = getenv("LD_PRELOAD");
@@ -320,6 +444,9 @@ int main(int argc, char **argv)
 		return 1;
 
 	if (find_shim(shim, sizeof(shim)) != 0)
+		return 1;
+
+	if (check_shim_loadable(shim) != 0)
 		return 1;
 
 	if (udpc_config_export(&cfg) != 0 || set_preload(shim) != 0) {

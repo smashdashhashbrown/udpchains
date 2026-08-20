@@ -630,3 +630,55 @@ datagram sockets and is intercepted, but can only ever report `open|filtered`.
 **Revisit if:** a refusal is implemented (v2), or a program is found that legitimately needs raw
 sockets alongside proxied UDP — which would argue for a narrow opt-out rather than the current
 silent pass-through.
+
+---
+
+## D-19
+### The wrapper proves the shim is loadable, not merely readable
+
+**Date:** 2026-08-20 · **Status:** Accepted · Found when the shim failed to preload on a VPS.
+
+**Context.** `find_shim()` located the shim and checked `access(path, R_OK)`. Readable is not the same
+as loadable, and the gap is not academic:
+
+```
+ERROR: ld.so: object '/root/udpchains/libudpchains.so' from LD_PRELOAD
+cannot be preloaded (failed to map segment from shared object): ignored.
+```
+
+Note the last word. The loader prints a warning and **runs the program anyway**, with no
+interposition. The traffic went direct.
+
+**Why this is the same defect as SEC-06.** SEC-06 already refuses to run setuid, setgid and
+capability-endowed binaries, on the reasoning that the loader ignores `LD_PRELOAD` for them, so
+running them would mean running them unproxied. An unmappable shim produces exactly that outcome by a
+different route, and was not covered. For a tool whose distinguishing claim over `proxychains` is
+that it fails closed, silently proxying nothing is the worst failure mode available: the only
+evidence is one line on stderr that a scripted run will not notice.
+
+**Decision.** Before `exec`, the wrapper verifies the shim can actually be mapped:
+
+1. **A valid ELF header**, catching truncated or interrupted copies.
+2. **Matching ELF class and machine**, compared against `/proc/self/exe` rather than a compile-time
+   `#ifdef` ladder — the wrapper is by definition the right answer. Catches a build copied between
+   hosts instead of rebuilt.
+3. **A `PROT_READ|PROT_EXEC` mapping of the first page**, which is the same mapping the loader will
+   attempt for the text segment. Catches a `noexec` mount and a security policy (SELinux, AppArmor)
+   that forbids mapping the file executable.
+
+Any failure refuses to exec, with a diagnostic naming the specific cause and, for the `EACCES`/
+`EPERM` case, the `findmnt` command that confirms it.
+
+**Why a `PROT_EXEC` probe rather than `dlopen`.** `dlopen` would be a more faithful test, but it
+would load the shim into the *wrapper's* address space and run its constructor — which resolves
+configuration and logs. The probe is side-effect free and tests the condition that actually fails.
+
+**Testing.** `tests/test_wrapper.sh` asserts two things per case, and the second matters more: the
+wrapper exits non-zero, **and the target program never ran**. A diagnostic followed by an unproxied
+execution would still be a leak. The `noexec` case is verified by hand rather than in the suite,
+because creating such a mount needs root or unprivileged user namespaces and a test run can assume
+neither; the script records the manual procedure.
+
+**Residual.** This closes the wrapper path only. A user who sets `LD_PRELOAD` by hand, without the
+wrapper, still gets the loader's silent fallback — there is nothing in the shim that can run to
+prevent it, because the failure is that the shim did not run.

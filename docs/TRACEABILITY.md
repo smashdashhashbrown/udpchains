@@ -25,7 +25,7 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 422 assertions across 13 groups, all passing.
+**Test totals:** 429 assertions across 14 groups, all passing.
 
 | Group | Assertions |
 |---|---|
@@ -38,6 +38,7 @@ inspection basis is recorded in the notes below.
 | port switch (TFTP pattern) | 12 |
 | TST-06 lifecycle | 26 |
 | TST-07 threading | 9 |
+| wrapper loadability | 7 |
 | TST-03 leak | 7 checks |
 | fault injection | 10 |
 | TST-04 real tools | 2 run, 3 skipped (automated, against the fixture) |
