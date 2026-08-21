@@ -325,19 +325,62 @@ the pre-send liveness probe did not detect your proxy's teardown.
 
 ## 8. Fail-closed under real conditions (SEC-01/SEC-02)
 
-The security property the project exists for, on live traffic.
+The security property the project exists for, observed on the **wire** rather than at the
+destination. TST-03 already asserts that zero datagrams arrive, by watching the destination; that
+cannot see a datagram which leaves this host and goes somewhere else, because a leak to the wrong
+address looks identical to no leak at all.
+
+Automated, since getting this right by hand turns out to be harder than it looks:
 
 ```sh
-# terminal 1 — any direct UDP to the target is a leak
-sudo tcpdump -ni <iface> "udp and host <dest> and port <port>"
-
-# terminal 2
-udpchains -v nc -u <dest> <port>     # send a few lines
-# then kill the proxy client and keep typing
+sudo tests/test_failclosed_capture.sh [dest_ip] [dest_port]
 ```
 
-**Pass:** tcpdump captures **zero** packets — during normal operation (traffic should appear only as
-the tunnel's TCP) *and* after the proxy dies, where sends must fail rather than fall back to direct.
+**The positive control is the point.** The first case runs the client with **no shim** and requires
+the capture to see traffic. A capture that sees nothing because the filter, interface or buffering is
+wrong would pass every fail-closed assertion while proving nothing — and for a test whose purpose is
+to prove *nothing was sent*, an artefact that looks like proof is the worst available failure. If the
+control fails the script aborts and says the rest is meaningless.
+
+✅ **Passed 2026-08-20.** Positive control captured 11 packets, exactly the datagram count
+`leakclient` sends. Then, at the wire:
+
+| scenario | sends | packets on the wire |
+|---|---|---|
+| proxy never existed | all fail | **0** |
+| TCP accepted, `UDP ASSOCIATE` refused | all fail | **0** |
+| shim loaded, unconfigured | all fail | **0** |
+
+These three do not depend on which proxy implementation is in use — they are about what the shim does
+when no working proxy is available — so this is evidence about `udpchains` itself rather than about
+the fixture.
+
+Three things cost real time getting here, and are worth knowing before running it elsewhere:
+
+- **`--immediate-mode` is required.** libpcap on Linux uses a TPACKET_V3 ring that retires blocks on
+  a timer. Stopping the capture shortly after the traffic discards unretired blocks and reports
+  `0 packets captured, 0 dropped` — which reads exactly like a clean run. This produced three
+  consecutive false failures of the positive control, which is the only reason it was noticed.
+- **Capture broadly, filter offline.** An in-kernel filter that silently matches nothing is
+  indistinguishable from a clean run. The script captures all UDP and applies the destination match
+  when reading the file back, so a miss shows up as captured-but-unmatched packets it can print.
+- **Capture on the route's real interface**, not the `any` pseudo-device.
+
+### What this still cannot show
+
+A shim that sends a datagram **both** ways round — correctly to the relay *and* directly — is not
+detectable with a proxy on this host, because a co-located proxy relays the datagram onward from the
+same interface. A packet to the destination is then expected behaviour, indistinguishable from a
+leak. Asserting zero there fails against a correctly working system.
+
+It needs a proxy on another host, where any packet leaving this one for the destination is
+unambiguous:
+
+```sh
+REMOTE_PROXY=<host:port> sudo tests/test_failclosed_capture.sh <dest> <port>
+```
+
+Still outstanding. It is the last thing TST-03 structurally cannot see.
 
 ---
 

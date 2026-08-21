@@ -130,8 +130,8 @@ inspection basis is recorded in the notes below.
 
 | ID | Pri | Design | Test | Status |
 |---|---|---|---|---|
-| SEC-01 | M | §4.2, §6 | TST-03 | **Verified** — the core invariant. No path from a failed proxy attempt to a direct send |
-| SEC-02 | M | §9.4 | TST-03 | **Verified** — three scenarios (proxy absent, `UDP ASSOCIATE` refused, shim unconfigured) × 10 send paths: zero datagrams reach the destination. A control run proves the client would otherwise get through |
+| SEC-01 | M | §4.2, §6 | TST-03, capture | **Verified** — the core invariant. No path from a failed proxy attempt to a direct send. Confirmed at the **wire** on 2026-08-20 by `tests/test_failclosed_capture.sh`: with the proxy absent, refusing `UDP ASSOCIATE`, or the shim unconfigured, tcpdump captured **zero** packets, against a positive control that captured 11. TST-03 watches the destination, which cannot see a datagram that leaves this host for the wrong address; this can |
+| SEC-02 | M | §9.4 | TST-03, capture | **Verified** — three scenarios (proxy absent, `UDP ASSOCIATE` refused, shim unconfigured) × 10 send paths: zero datagrams reach the destination, and zero appear on the wire. A control run proves the client would otherwise get through, at both observation points |
 | SEC-03 | M | §7.2 | inspection | **Verified** — `--password` is refused explicitly with a pointer to the file/environment route |
 | SEC-04 | S | §7.2 | unit-config | **Verified** — warns on a group- or world-writable config |
 | SEC-05 | M | §1, §4.1 | inspection | **Implemented** — the shim calls `socket()` only for the outbound TCP control connection and the post-`fork` replacement; there is no `listen()` or `accept()` anywhere in `src/` |
@@ -143,7 +143,7 @@ inspection basis is recorded in the notes below.
 |---|---|---|
 | TST-01 | M | **Verified** — 108 cells green: 36 send×receive combinations across {connected, unconnected} × {IPv4, IPv6} |
 | TST-02 | M | **Verified** — build gate; also asserts the readiness calls are absent, and checks pairwise send/receive symmetry |
-| TST-03 | M | **Verified** |
+| TST-03 | M | **Verified** — plus a wire-level companion, `tests/test_failclosed_capture.sh`, which is not part of `make test` because it needs `CAP_NET_RAW`. Its positive control aborts the run rather than reporting a pass from a capture that is silently seeing nothing |
 | TST-04 | M | **Verified** — the automated script runs against the **fixture** and reports 2 run, 3 skipped (`tftp` has no local server, `ntpdate` no reachable NTP server, `iperf3` not installed); a skip is not a pass, so the script alone never satisfied this. All five tools have now been run **by hand against the real `dtun` proxy** (2026-08-18/19): `nc -u`, TFTP 10 MB, `dig`, `iperf -u` rate sweep, `ntpdate -q`. See [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) for what each proves and the acceptance note below |
 | TST-05 | M | **Verified** — 76 assertions |
 | TST-06 | M | **Verified** — 26 assertions |
@@ -186,7 +186,13 @@ carried no traffic at all, and the cause was a genuine defect (D-14) that the in
 been forgiving. D-06's warning — that a green fixture suite is not evidence of interop — was
 correct, and the remaining items below are worth the same suspicion.
 
-1. **A successful end-to-end run against a genuinely REMOTE proxy.** First attempted 2026-08-19.
+1. **The both-ways-round leak check, against a REMOTE proxy.** `tests/test_failclosed_capture.sh`
+   proves at the wire that a failed proxy attempt sends nothing (SEC-01). What it cannot show with a
+   co-located proxy is a shim that sends a datagram *both* correctly to the relay and directly: the
+   proxy relays onward from the same interface, so a packet to the destination is expected and
+   indistinguishable from a leak. Run `REMOTE_PROXY=<host:port>` once a remote proxy is reachable.
+
+2. **A successful end-to-end run against a genuinely REMOTE proxy.** First attempted 2026-08-19.
    `proxy_is_local` was correctly false and the **D-05 R2 loopback guard fired end to end for the
    first time**, with the right message — that part is done. The run itself failed, and productively:
    it found D-16 (a loopback `BND.ADDR` taken literally) and, downstream of it, D-17 (a stranded
@@ -198,7 +204,7 @@ correct, and the remaining items below are worth the same suspicion.
    substituted address is correct and still unreachable, and its log records zero datagrams received.
    SOCKS5 `UDP ASSOCIATE` needs the relay port reachable from the client. Closing this row needs a
    proxy that binds a routable relay; the shim side is done.
-2. **A genuine IPv6 destination against `dtun`.** The v4-mapped half of D-14 was confirmed against
+3. **A genuine IPv6 destination against `dtun`.** The v4-mapped half of D-14 was confirmed against
    the real proxy on 2026-08-19 (`ATYP 0x01`, 10-byte header, from an `AF_INET6` socket), but this
    host has no global IPv6 address, so the 16-byte `ATYP 0x04` form is still exercised only against
    the fixture — the same position D-14 was in before it was found.
