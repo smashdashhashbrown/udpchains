@@ -494,8 +494,9 @@ int udpc_config_export(const struct udpc_config *cfg)
 		unsetenv("UDPCHAINS_DEBUG");
 	}
 
-	/* Credentials are passed through untouched; FR-P-09 is deferred, so
-	 * nothing consumes them yet (D-08). */
+	/* Credentials are passed through for the shim's RFC 1929 exchange
+	 * (FR-P-09, D-20).  Never via argv: SEC-03, because argv is visible in
+	 * ps(1).  The environment of a process is readable only by its owner. */
 	if (cfg->have_credentials) {
 		if (cfg->username[0] != '\0' &&
 		    setenv("UDPCHAINS_USERNAME", cfg->username, 1) != 0)

@@ -167,6 +167,14 @@ by marking rather than closing.
 On release the entry's generation is bumped before the state returns to `FREE`, so a subsequent
 socket receiving the same fd number cannot inherit stale state (FR-L-02).
 
+Release depends on interposing `close()`, and not every program's closes reach it — `dig` closes
+through libuv, and 4 of its 64 `close` syscalls arrive at the hook. Those entries are stranded
+`ACTIVE` for descriptors the kernel has already freed. Because every caller of `udpc_fd_claim`
+passes a descriptor the kernel has *just* allocated, and the kernel never hands out a live
+descriptor number, a non-`FREE` entry at claim time is proof of staleness rather than evidence of a
+conflict: the slot is released and re-claimed rather than refused (D-17). Refusing it produced a
+spurious `EMFILE` and leaked the stranded entry's control connection.
+
 ### 3.4 `fork`
 
 A `pthread_atfork` **child** handler bumps a single global generation counter and does nothing else.
@@ -197,11 +205,17 @@ Implemented from RFC 1928 §7 only. See D-01 — reference implementations must 
 On first use of an intercepted socket (FR-P-01):
 
 1. TCP connect to the configured proxy; set `FD_CLOEXEC` immediately (FR-L-05).
-2. Method negotiation offering `0x00` only (D-08 defers RFC 1929 auth; the negotiation code is
-   written so adding a method is local).
-3. `UDP ASSOCIATE` request.
-4. Take `BND.ADDR`/`BND.PORT` from the reply as the relay.
-5. `connect()` the application's fd to the relay, so the kernel filters datagrams from anything else
+2. Method negotiation offering `0x00`, plus `0x02` when credentials are configured. Offering `0x02`
+   unconditionally would push a proxy that accepts either into an authenticated exchange the user
+   did not ask for, so the offer is conditional (D-20).
+3. If the proxy selects `0x02`, the RFC 1929 sub-negotiation. Its version byte is `0x01` — the
+   sub-negotiation's own, not SOCKS5's `0x05`. A proxy selecting `0x02` when it was not offered is
+   an `EPROTO` protocol violation, not an authentication failure.
+4. `UDP ASSOCIATE` request.
+5. Take `BND.ADDR`/`BND.PORT` from the reply as the relay. A wildcard, or a loopback address from a
+   proxy that is not on this host, is replaced by the proxy's own address (D-16) — both mean "the
+   address you already reached me on", and taken literally both send datagrams nowhere.
+6. `connect()` the application's fd to the relay, so the kernel filters datagrams from anything else
    and the application's own `send`/`write` reach the relay (FR-I-07).
 
 The control connection stays open for the application socket's lifetime (FR-P-02). It is never read
@@ -364,8 +378,9 @@ only fail-closed option.
 directs where traffic goes.
 
 **Credentials (SEC-03):** readable from a file or environment variable only, never a command-line
-flag (visible in `ps`). Implemented in v1 even though FR-P-09 is deferred (D-08), so that adding auth
-later does not tempt anyone into a `--password` flag.
+flag, because `argv` is visible in `ps(1)`. The plumbing was built before the protocol exchange
+existed (D-08) precisely so that adding authentication later would not tempt anyone into a
+`--password` flag; RFC 1929 now consumes it (D-20).
 
 ### 7.3 Diagnostics (FR-C-05, FR-C-06, NFR-05)
 

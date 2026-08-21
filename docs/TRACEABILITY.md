@@ -16,10 +16,10 @@ verification) · `Deferred` (out of v1, D-08) · `Partial` (see note)
 | | Count | Verified | Implemented | Deferred |
 |---|---|---|---|---|
 | MUST | 49 | 47 | 2 | 0 |
-| SHOULD — in v1 | 9 | 9 | 0 | 0 |
-| SHOULD/COULD — deferred | 5 | — | — | 5 |
-| Added by decisions | 9 | 7 | 2 | 0 |
-| **v1 scope** | **67** | **63** | **4** | — |
+| SHOULD — in v1 | 10 | 10 | 0 | 0 |
+| SHOULD/COULD — deferred | 4 | — | — | 4 |
+| Added by decisions | 11 | 9 | 2 | 0 |
+| **v1 scope** | **70** | **66** | **4** | — |
 
 The two **M** requirements without automated verification are NFR-03 (async-signal-safety) and
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
