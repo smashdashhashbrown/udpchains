@@ -18,26 +18,13 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
   as payload. (a7ec506, D-21)
 - [x] **C3** — a failed `dup2`/`dup3` untracked a live socket; an untrackable duplicate was left
   open. (a7ec506, D-21)
+- [x] **C4** — glibc's resolver leaked every libc name lookup to the host's resolver, since its
+  internal calls bypass the hooks. Lookups are now answered locally or through the proxy, and fail
+  closed otherwise. (98e715e, D-22; follow-ups under *Verification still owed* below)
 
 ## Critical
 
-- [ ] **C4 — glibc's resolver leaks DNS.** *PoC.* With the proxy down, `getaddrinfo()` still
-  resolves: `strace` shows the raw query sent to `127.0.0.53`, and the shim logs no interception.
-  Since glibc 2.34 (the project's floor) the resolver is inside libc and uses internal aliases for
-  `socket`/`connect`/`sendmmsg`/`recvfrom`, so no hook fires. The README's "No DNS leak" and D-04 are
-  false for every program that resolves names through libc. `dig` passed interop only because it
-  carries its own resolver.
-  - **Decision (2026-09-23): option 2 — resolve through the proxy.** Design recorded as **D-22**
-    (DECISIONS.md) and **DESIGN.md §11**. The three open questions were settled:
-    - `dns` unset: **fail closed**, with `EAI_FAIL` and a diagnostic. There is no default
-      resolver.
-    - Transport: **UDP over `UDP ASSOCIATE`, falling back to TCP via SOCKS5 `CONNECT`** when an
-      answer is truncated.
-    - Search domains: **not applied**. `/etc/resolv.conf` is not read; `dns_search` opts in.
-  - **Implemented, awaiting commit.** Verified by `unit-dns`, `D-22-resolve` and a TST-03
-    scenario; clean under ASan, Valgrind and Helgrind. Tick this item with the commit hash. The
-    capture-script case is written but needs a root run, and interop against a real proxy is item
-    11 in INTEROP-CHECKLIST.md.
+None open.
 
 ## High
 
@@ -169,6 +156,13 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
   - The FR-L-02 generation guard (M8).
   - "fall back or fail" for GSO/GRO (M2).
   - "nothing breaks" for the D-17 fix (H1).
+
+## Verification still owed
+
+- [ ] **C4 wire check** — run the capture script's D-22 case, which needs root:
+  `sudo tests/test_failclosed_capture.sh`. Its client commands were checked without root.
+- [ ] **C4 interop** — name resolution against a real proxy and resolver, INTEROP-CHECKLIST.md §11,
+  including whether that proxy supports `CONNECT` for the TCP fallback.
 
 ## Residuals recorded in D-21 (no fix planned yet)
 
