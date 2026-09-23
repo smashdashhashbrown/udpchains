@@ -704,6 +704,52 @@ static void t_passthrough(void)
 	close(tcp);
 }
 
+/* A _FORTIFY_SOURCE build calls these instead of recvfrom/recv/read when the
+ * buffer's size is known and the length is not.  glibc's own implementations
+ * bypass the hooks and deliver the SOCKS header as payload.  Called directly
+ * here, so the test does not depend on how this file happens to be compiled. */
+ssize_t __recv_chk(int fd, void *buf, size_t len, size_t buflen, int flags);
+ssize_t __recvfrom_chk(int fd, void *buf, size_t len, size_t buflen, int flags,
+                       struct sockaddr *src, socklen_t *srclen);
+ssize_t __read_chk(int fd, void *buf, size_t len, size_t buflen);
+
+static void t_fortified(void)
+{
+	int fd = udp4();
+	char buf[64];
+	struct sockaddr_in from;
+	socklen_t flen = sizeof(from);
+	ssize_t n;
+
+	TAP_GROUP("FR-I-02: fortified receive entry points strip the header too");
+
+	sendto(fd, "chk1", 4, 0, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	memset(buf, 0, sizeof(buf));
+	memset(&from, 0, sizeof(from));
+	n = __recvfrom_chk(fd, buf, sizeof(buf), sizeof(buf), 0,
+	                   (struct sockaddr *)&from, &flen);
+	TAP_EQ_INT(n, 4, "__recvfrom_chk returns 4, not the wrapped 14");
+	TAP_EQ_MEM(buf, "chk1", 4, "__recvfrom_chk delivers the bare payload");
+	TAP_EQ_INT(ntohs(from.sin_port), ntohs(g_echo1.sin_port),
+	           "__recvfrom_chk reports the true source, not the relay");
+
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+
+	send(fd, "chk2", 4, 0);
+	memset(buf, 0, sizeof(buf));
+	n = __recv_chk(fd, buf, sizeof(buf), sizeof(buf), 0);
+	TAP_EQ_INT(n, 4, "__recv_chk returns 4, not the wrapped 14");
+	TAP_EQ_MEM(buf, "chk2", 4, "__recv_chk delivers the bare payload");
+
+	TAP_EQ_INT(write(fd, "chk3", 4), 4, "write sends the third probe");
+	memset(buf, 0, sizeof(buf));
+	n = __read_chk(fd, buf, sizeof(buf), sizeof(buf));
+	TAP_EQ_INT(n, 4, "__read_chk returns 4, not the wrapped 14");
+	TAP_EQ_MEM(buf, "chk3", 4, "__read_chk delivers the bare payload");
+
+	close(fd);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 4) {
@@ -744,6 +790,7 @@ int main(int argc, char **argv)
 	t_dualstack_to_ipv4();
 	t_unrepresentable();
 	t_passthrough();
+	t_fortified();
 
 	TAP_DONE();
 }

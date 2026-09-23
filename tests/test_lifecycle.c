@@ -165,6 +165,142 @@ static void t_dup2_replaces(void)
 	close(b);
 }
 
+static void t_fcntl_dup_shares(void)
+{
+	int fd, copy, before;
+
+	TAP_GROUP("FR-L-03: fcntl(F_DUPFD_CLOEXEC) shares the association like dup");
+
+	fd = udp4();
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_OK(roundtrip(fd, "before-fcntl"), "the original descriptor works");
+
+	before = count_tcp_sockets(NULL);
+	copy = fcntl(fd, F_DUPFD_CLOEXEC, 100);
+	TAP_OK(copy >= 100, "the minimum-descriptor argument is forwarded (%d)",
+	       copy);
+	TAP_EQ_INT(count_tcp_sockets(NULL), before,
+	           "the copy creates no second control connection");
+
+	/* An untracked copy would send the bare payload to the relay, which
+	 * drops it, so this round trip only succeeds if the copy is proxied. */
+	close(fd);
+	TAP_OK(roundtrip(copy, "via-fcntl-copy"),
+	       "the copy is proxied through the shared association");
+	close(copy);
+}
+
+static void t_dup2_failure_keeps_tracking(void)
+{
+	int fd;
+	struct sockaddr_in peer;
+	socklen_t plen = sizeof(peer);
+
+	TAP_GROUP("SEC-01: a failed dup2 leaves its target tracked");
+
+	fd = udp4();
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_OK(roundtrip(fd, "before-bad-dup2"), "the descriptor works");
+
+	errno = 0;
+	TAP_OK(dup2(-1, fd) < 0 && errno == EBADF,
+	       "dup2 from a bad descriptor fails with EBADF");
+	TAP_OK(roundtrip(fd, "after-bad-dup2"),
+	       "the target is still proxied, not released by the failed call");
+	memset(&peer, 0, sizeof(peer));
+	getpeername(fd, (struct sockaddr *)&peer, &plen);
+	TAP_EQ_INT(ntohs(peer.sin_port), ntohs(g_echo1.sin_port),
+	           "getpeername still reports the application's destination");
+	close(fd);
+}
+
+static void t_dup2_pipe_onto_udp(void)
+{
+	int fd, p[2];
+	char buf[8] = { 0 };
+
+	TAP_GROUP("FR-I-04: dup2 of a non-socket onto an intercepted descriptor");
+
+	fd = udp4();
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_OK(roundtrip(fd, "before-pipe"), "the descriptor works");
+	TAP_OK(pipe(p) == 0, "pipe created");
+
+	TAP_EQ_INT(dup2(p[1], fd), fd, "dup2(pipe, fd) returns fd");
+	TAP_EQ_INT(write(fd, "pipe", 4), 4,
+	           "a write to fd now reaches the pipe, not the proxy path");
+	TAP_EQ_INT(read(p[0], buf, sizeof(buf)), 4, "the pipe received it");
+	TAP_EQ_MEM(buf, "pipe", 4, "unaltered: no SOCKS header was added");
+
+	close(fd);
+	close(p[0]);
+	close(p[1]);
+}
+
+/* Sends fd across a unix socket pair to ourselves; returns what arrives. */
+static int pass_fd(int fd)
+{
+	int sv[2], got = -1;
+	char byte = 0;
+	union {
+		struct cmsghdr align;
+		char buf[CMSG_SPACE(sizeof(int))];
+	} ctl;
+	struct iovec v = { &byte, 1 };
+	struct msghdr m;
+	struct cmsghdr *c;
+
+	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0)
+		return -1;
+
+	/* Zeroed so the CMSG_SPACE padding the kernel copies is initialised. */
+	memset(&ctl, 0, sizeof(ctl));
+	memset(&m, 0, sizeof(m));
+	m.msg_iov = &v;
+	m.msg_iovlen = 1;
+	m.msg_control = ctl.buf;
+	m.msg_controllen = sizeof(ctl.buf);
+	c = CMSG_FIRSTHDR(&m);
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type = SCM_RIGHTS;
+	c->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(c), &fd, sizeof(int));
+
+	if (sendmsg(sv[0], &m, 0) == 1) {
+		m.msg_controllen = sizeof(ctl.buf);
+		if (recvmsg(sv[1], &m, 0) == 1 &&
+		    (c = CMSG_FIRSTHDR(&m)) != NULL && c->cmsg_type == SCM_RIGHTS)
+			memcpy(&got, CMSG_DATA(c), sizeof(int));
+	}
+	close(sv[0]);
+	close(sv[1]);
+	return got;
+}
+
+static void t_scm_rights_adopted(void)
+{
+	int fd, got, before;
+
+	TAP_GROUP("SEC-01: a UDP socket received over SCM_RIGHTS is adopted");
+
+	fd = udp4();
+	got = pass_fd(fd);
+	TAP_OK(got >= 0 && got != fd, "a new descriptor arrives (%d)", got);
+
+	/* The hand-off pattern: the sender keeps no copy. */
+	close(fd);
+
+	/* An unadopted socket would round-trip too -- directly.  A new control
+	 * connection is what shows the traffic took the proxy. */
+	before = count_tcp_sockets(NULL);
+	connect(got, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_OK(roundtrip(got, "via-scm-rights"),
+	       "the received socket round-trips");
+	TAP_EQ_INT(count_tcp_sockets(NULL), before + 1,
+	           "and it did so through its own association");
+	close(got);
+}
+
 static void t_fd_reuse(void)
 {
 	int fd, again;
@@ -303,6 +439,10 @@ int main(int argc, char **argv)
 	t_cloexec();
 	t_dup_shares();
 	t_dup2_replaces();
+	t_fcntl_dup_shares();
+	t_dup2_failure_keeps_tracking();
+	t_dup2_pipe_onto_udp();
+	t_scm_rights_adopted();
 	t_fd_reuse();
 	t_fork_isolation();
 	t_close_releases();

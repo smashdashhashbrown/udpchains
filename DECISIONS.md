@@ -754,3 +754,79 @@ direct send would be an SEC-01 violation wearing an authentication error as a di
 
 **Still not implemented:** GSSAPI (method `0x01`), and any method beyond `0x00` and `0x02`. A proxy
 selecting one is refused with a diagnostic naming what is supported.
+
+---
+
+## D-21
+### Every route by which a UDP socket enters the process is hooked, and an untrackable one is refused
+
+**Date:** 2026-09-23 · **Status:** Accepted · Found in a pre-release review, and reproduced before
+being fixed.
+
+**Context.** SEC-01's guarantee is only as good as the fd table's coverage. A UDP socket the table
+does not know about is not intercepted at all, so its traffic goes direct. The same is true of a
+receive path that is not hooked: it delivers the SOCKS header as payload. The table was populated
+from `socket()`, `dup`, `dup2`, `dup3` and the start-up scan. The receive path was entered through
+the twelve symbols FR-I-03 names. Both lists were complete against the requirements and incomplete
+against libc.
+
+**The gaps.** Four were found. Each reproduced with a test program, three of them with the proxy down:
+
+- **`fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC`** duplicates a descriptor exactly as `dup` does, and was
+  not hooked. With the proxy down, the original socket failed closed while the copy sent straight to
+  the destination. Python's `socket.dup()` and `os.dup()` duplicate this way, so this was not
+  exotic.
+- **`SCM_RIGHTS`.** A UDP socket received from another process arrives as a new descriptor that
+  never went through `socket()`, and so was untracked.
+- **A failed `dup2`/`dup3`.** The hook released the target's entry *before* the call, mirroring the
+  kernel's implicit close. When the call failed — `EBADF` on the source, say — the kernel closed
+  nothing, and the target was left open, still a UDP socket, and untracked. Its next send went
+  direct.
+- **Fortified receive calls.** A `_FORTIFY_SOURCE` build — the default for distribution packages —
+  calls `__recvfrom_chk`, `__recv_chk` and `__read_chk` when the buffer's size is known at compile
+  time and the length is not. glibc implements them by calling its own internal receive functions,
+  which a preload cannot interpose on. The application received the 10-byte SOCKS header followed by
+  the payload. That is the Proxando failure (baseline §0.3.2), arriving by a door the hook matrix
+  never opened. libtirpc, net-snmp and libnorm all import `__recvfrom_chk`.
+
+A fifth hole was related: the start-up scan of inherited descriptors gave up silently if
+`/proc/self/fd` could not be opened, and skipped any inherited UDP socket it could not claim.
+
+**Decision.**
+
+- `fcntl` and `fcntl64` are hooked. glibc exports one implementation under both names, and a
+  `_FILE_OFFSET_BITS=64` build calls the latter. Only `F_DUPFD` and `F_DUPFD_CLOEXEC` are acted on.
+- `recvmsg` and `recvmmsg` on a non-intercepted descriptor adopt any UDP socket found in
+  `SCM_RIGHTS` ancillary data before returning.
+- Every duplication route updates the table only **after** the call succeeds. If the source is
+  intercepted, the new descriptor shares its association (FR-L-03). Otherwise any stale entry at the
+  new number is released.
+- The three fortified variants are hooked. Each makes glibc's own bounds check and then calls the
+  ordinary hook, so there is still exactly one receive path.
+- Without `/proc`, the inherited-descriptor scan probes the table with `poll()`, a batch of numbers
+  per call.
+- **An intercepted socket the table cannot track is refused, on every route.** A duplicate is closed
+  and the call fails with `EMFILE`, as `socket()` already did. Previously a failed `dup` claim was
+  logged ("its traffic would be unproxied") and the descriptor left open. An inherited or received
+  socket is closed with a diagnostic.
+
+**Why the suite missed them.** Every test client created its sockets with `socket()` and duplicated
+them with `dup`, and was compiled from this repository's Makefile without calling the fortified
+variants. The TST-02 symbol gate checked the symbols the requirements named, which is the list that
+was wrong. The new assertions each fail against the 1.0.0 shim: the leak test sends through all three
+new descriptor routes, the fidelity test calls the fortified variants directly, and the lifecycle
+test proves the new descriptors are *proxied* by counting control connections. A round trip alone
+would not prove that, since an untracked socket round-trips directly.
+
+**Residual.**
+
+- Other glibc-internal paths still bypass the hooks: stdio (`fdopen` on a UDP socket), and glibc's
+  own DNS resolver, which since 2.34 lives inside libc and creates, connects and sends on its sockets
+  through internal aliases. The resolver case is a DNS leak and is recorded separately. The shim
+  cannot see `io_uring` or `sendfile`/`splice` either.
+- An adopted socket that another process also still holds is re-pointed at this process's relay
+  when first used, which also affects the other holder. That is the same shared-file-description
+  problem FR-L-04 solves for `fork`, and it is not solved here.
+
+**Revisit if:** another libc entry point is found that creates, duplicates or receives on a socket
+without going through a hooked symbol. The symbol gate should grow with each one.

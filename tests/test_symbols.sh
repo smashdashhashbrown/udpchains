@@ -52,8 +52,19 @@ want sendto sendmsg sendmmsg send write writev
 echo "# TST-02: FR-I-03 receive hooks"
 want recvfrom recvmsg recvmmsg recv read readv
 
+# A _FORTIFY_SOURCE build calls these in place of recv/recvfrom/read, and glibc
+# implements them with internal calls no preload can see.  Missing, they deliver
+# the SOCKS header as payload -- the FR-I-02 defect by another door.
+echo "# TST-02: FR-I-02 fortified receive entry points"
+want __recv_chk __recvfrom_chk __read_chk
+
 echo "# TST-02: FR-I-04 lifecycle hooks"
 want socket connect bind close dup dup2 dup3
+
+# fcntl(F_DUPFD) duplicates exactly as dup does; unhooked, the copy of an
+# intercepted socket is untracked and sends directly (SEC-01).
+echo "# TST-02: SEC-01 duplication by fcntl"
+want fcntl fcntl64
 
 # NFR-01a / D-09: close_range is conditionally compiled.  Assert the right set
 # for this build rather than failing spuriously on a deliberate omission.

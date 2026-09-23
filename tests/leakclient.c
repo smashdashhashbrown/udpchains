@@ -14,6 +14,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -59,6 +60,47 @@ static void record(const char *what, ssize_t n)
 		g_send_failed++;
 		printf("ok %s failed: %s\n", what, strerror(errno));
 	}
+}
+
+/* Sends fd across a unix socket pair to ourselves and returns the descriptor
+ * that arrives -- a new number, created without socket() or dup. */
+static int pass_fd(int fd)
+{
+	int sv[2], got = -1;
+	char byte = 0;
+	union {
+		struct cmsghdr align;
+		char buf[CMSG_SPACE(sizeof(int))];
+	} ctl;
+	struct iovec v = { &byte, 1 };
+	struct msghdr m;
+	struct cmsghdr *c;
+
+	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0)
+		return -1;
+
+	/* Zeroed so the CMSG_SPACE padding the kernel copies is initialised. */
+	memset(&ctl, 0, sizeof(ctl));
+	memset(&m, 0, sizeof(m));
+	m.msg_iov = &v;
+	m.msg_iovlen = 1;
+	m.msg_control = ctl.buf;
+	m.msg_controllen = sizeof(ctl.buf);
+	c = CMSG_FIRSTHDR(&m);
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type = SCM_RIGHTS;
+	c->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(c), &fd, sizeof(int));
+
+	if (sendmsg(sv[0], &m, 0) == 1) {
+		m.msg_controllen = sizeof(ctl.buf);
+		if (recvmsg(sv[1], &m, 0) == 1 &&
+		    (c = CMSG_FIRSTHDR(&m)) != NULL && c->cmsg_type == SCM_RIGHTS)
+			memcpy(&got, CMSG_DATA(c), sizeof(int));
+	}
+	close(sv[0]);
+	close(sv[1]);
+	return got;
 }
 
 int main(int argc, char **argv)
@@ -157,6 +199,38 @@ int main(int argc, char **argv)
 			record("sendto-after-bind",
 			       sendto(fd, g_payload, 4, 0, (struct sockaddr *)&g_dst,
 			              g_dstlen));
+			close(fd);
+		}
+	}
+
+	/* Descriptors that reach the application by a route other than socket()
+	 * or dup: an fcntl duplicate, a socket received over SCM_RIGHTS, and a
+	 * socket left open by a FAILED dup2 onto it.  Each was once untracked,
+	 * and each then sent directly with the proxy down. */
+	{
+		int fd = mksock(0);
+		if (fd >= 0) {
+			int copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+			int got = pass_fd(fd);
+
+			if (copy >= 0) {
+				record("sendto-via-fcntl-dup",
+				       sendto(copy, g_payload, 4, 0,
+				              (struct sockaddr *)&g_dst, g_dstlen));
+				close(copy);
+			}
+			if (got >= 0) {
+				record("sendto-via-SCM_RIGHTS",
+				       sendto(got, g_payload, 4, 0,
+				              (struct sockaddr *)&g_dst, g_dstlen));
+				close(got);
+			}
+			/* dup2 from a bad descriptor fails with EBADF and leaves
+			 * fd open and unchanged. */
+			if (dup2(-1, fd) < 0)
+				record("sendto-after-failed-dup2",
+				       sendto(fd, g_payload, 4, 0,
+				              (struct sockaddr *)&g_dst, g_dstlen));
 			close(fd);
 		}
 	}

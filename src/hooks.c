@@ -16,8 +16,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -32,14 +35,122 @@
 #include "real.h"
 #include "shim.h"
 
-/* --- initialisation -------------------------------------------------------- */
+/* --- helpers --------------------------------------------------------------- */
 
-/* A UDP socket inherited across exec was never seen by our socket() hook, so
- * nothing would intercept its traffic and it would go direct -- the silent leak
- * this project exists to prevent (SEC-01).  Adopting such descriptors at
- * start-up closes that hole.
+static bool is_intercepted_kind(int domain, int type)
+{
+	/* FR-I-06: only SOCK_DGRAM in AF_INET/AF_INET6.  SOCK_NONBLOCK and
+	 * SOCK_CLOEXEC ride in the type argument and must be masked off. */
+	int base = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+	if (base != SOCK_DGRAM)
+		return false;
+	return domain == AF_INET || domain == AF_INET6;
+}
+
+/* --- adoption of descriptors socket() never saw ---------------------------- */
+
+/* A UDP socket can enter this process without passing through the socket()
+ * hook or a dup: inherited across exec, or received from another process as
+ * SCM_RIGHTS ancillary data.  Nothing would intercept its traffic and it would
+ * go direct -- the silent leak this project exists to prevent (SEC-01).  Such
+ * descriptors are adopted into the table as they arrive.
  *
- * Runs once, off the datagram path, so the directory walk and its allocation
+ * Returns 0 if fd was adopted or is not a socket we intercept, and -1 if it is
+ * one but cannot be tracked. */
+static int adopt_fd(int fd, const char *how)
+{
+	int domain = 0, type = 0;
+	socklen_t len;
+	struct udpc_fdent *e;
+
+	len = sizeof(domain);
+	if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &len) != 0)
+		return 0;
+	len = sizeof(type);
+	if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0)
+		return 0;
+	if (!is_intercepted_kind(domain, type))
+		return 0;
+
+	e = udpc_fd_claim(fd, domain, type);
+	if (e == NULL)
+		return -1;
+	udpc_fd_publish(e);
+	udpc_debug("adopted %s UDP descriptor %d", how, fd);
+	return 0;
+}
+
+/* An untrackable UDP socket is closed rather than left in the application's
+ * hands, where it would send unproxied -- the same choice the socket() hook
+ * makes, and the only fail-closed one. */
+static void adopt_or_close(int fd, const char *how)
+{
+	if (adopt_fd(fd, how) == 0)
+		return;
+	udpc_err("cannot track %s UDP descriptor %d; closing it rather than "
+	         "leaving it unproxied",
+	         how, fd);
+	REAL_CLOSE(fd);
+}
+
+static void adopt_inherited(int fd)
+{
+	/* A socket created by a hook before this constructor ran -- from
+	 * another library's constructor, say -- is already tracked and must
+	 * keep its state. */
+	if (udpc_fd_lookup(fd) != NULL)
+		return;
+	adopt_or_close(fd, "inherited");
+}
+
+/* Without /proc (a minimal chroot or container) the descriptor table cannot be
+ * listed, and giving up would leave every inherited UDP socket unproxied.  So
+ * probe it instead: poll() with no events reports POLLNVAL for a number that is
+ * not open, which tests a batch of numbers per syscall.
+ *
+ * The scan covers the trackable range and anything below the hard
+ * RLIMIT_NOFILE.  A descriptor above both could only exist if the limit was
+ * lowered after it was opened; that residual is accepted. */
+static void adopt_inherited_by_probe(void)
+{
+	struct pollfd pfd[1024];
+	struct rlimit rl;
+	unsigned long limit = UDPC_FD_MAX, batch = 1024, base, i;
+
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+		if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max > limit)
+			limit = rl.rlim_max;
+		/* poll() refuses more entries than the soft limit. */
+		if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < batch)
+			batch = rl.rlim_cur;
+	}
+	if (limit > (unsigned long)INT_MAX + 1)
+		limit = (unsigned long)INT_MAX + 1;
+	if (batch == 0)
+		return;
+
+	for (base = 0; base < limit; base += batch) {
+		unsigned long n = (limit - base < batch) ? limit - base : batch;
+
+		for (i = 0; i < n; i++) {
+			pfd[i].fd = (int)(base + i);
+			pfd[i].events = 0;
+			pfd[i].revents = 0;
+		}
+		if (poll(pfd, (nfds_t)n, 0) < 0) {
+			udpc_err("cannot list or probe inherited descriptors (%s); "
+			         "an inherited UDP socket would be unproxied",
+			         strerror(errno));
+			return;
+		}
+		for (i = 0; i < n; i++)
+			if (!(pfd[i].revents & POLLNVAL))
+				adopt_inherited(pfd[i].fd);
+	}
+}
+
+/* Runs once, off the datagram path, so the directory walk and its allocation
  * are fine (NFR-02 concerns the per-datagram path only). */
 static void adopt_inherited_fds(void)
 {
@@ -48,14 +159,13 @@ static void adopt_inherited_fds(void)
 	int dfd;
 
 	d = opendir("/proc/self/fd");
-	if (d == NULL)
+	if (d == NULL) {
+		adopt_inherited_by_probe();
 		return;
+	}
 	dfd = dirfd(d);
 
 	while ((ent = readdir(d)) != NULL) {
-		int fd, domain = 0, type = 0;
-		socklen_t len;
-		struct udpc_fdent *e;
 		char *end = NULL;
 		long v;
 
@@ -64,31 +174,45 @@ static void adopt_inherited_fds(void)
 		v = strtol(ent->d_name, &end, 10);
 		if (end == ent->d_name || *end != '\0' || v < 0 || v > INT_MAX)
 			continue;
-		fd = (int)v;
-		if (fd == dfd)
+		if ((int)v == dfd)
 			continue;
-
-		len = sizeof(domain);
-		if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &len) != 0)
-			continue;
-		len = sizeof(type);
-		if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0)
-			continue;
-
-		if (type != SOCK_DGRAM)
-			continue;
-		if (domain != AF_INET && domain != AF_INET6)
-			continue;
-
-		e = udpc_fd_claim(fd, domain, type);
-		if (e == NULL)
-			continue;
-		udpc_fd_publish(e);
-		udpc_debug("adopted inherited UDP descriptor %d", fd);
+		adopt_inherited((int)v);
 	}
 
 	closedir(d);
 }
+
+/* Descriptors received as SCM_RIGHTS are new numbers in this process, exactly
+ * like the result of a dup, so a UDP socket among them is adopted before the
+ * application can send on it. */
+static void adopt_received_fds(const struct msghdr *msg)
+{
+	struct cmsghdr *c;
+	int saved = errno;
+
+	if (msg == NULL || msg->msg_control == NULL || msg->msg_controllen == 0 ||
+	    UDPC_IN_SHIM())
+		return;
+
+	for (c = CMSG_FIRSTHDR(msg); c != NULL;
+	     c = CMSG_NXTHDR((struct msghdr *)(uintptr_t)msg, c)) {
+		size_t i, n;
+
+		if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS ||
+		    c->cmsg_len < CMSG_LEN(0))
+			continue;
+		n = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+		for (i = 0; i < n; i++) {
+			int fd;
+
+			memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof(fd));
+			adopt_or_close(fd, "received");
+		}
+	}
+	errno = saved;
+}
+
+/* --- initialisation -------------------------------------------------------- */
 
 __attribute__((constructor)) static void udpc_ctor(void)
 {
@@ -104,19 +228,6 @@ __attribute__((constructor)) static void udpc_ctor(void)
 	(void)udpc_shim_config();
 
 	adopt_inherited_fds();
-}
-
-/* --- helpers --------------------------------------------------------------- */
-
-static bool is_intercepted_kind(int domain, int type)
-{
-	/* FR-I-06: only SOCK_DGRAM in AF_INET/AF_INET6.  SOCK_NONBLOCK and
-	 * SOCK_CLOEXEC ride in the type argument and must be masked off. */
-	int base = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
-
-	if (base != SOCK_DGRAM)
-		return false;
-	return domain == AF_INET || domain == AF_INET6;
 }
 
 /* --- lifecycle hooks (FR-I-04) --------------------------------------------- */
@@ -253,41 +364,90 @@ int close_range(unsigned first, unsigned last, int flags)
 }
 #endif
 
+/* Finishes a duplication the kernel has already made.  Returns newfd, or -1
+ * with EMFILE having closed it: a duplicate of an intercepted socket that the
+ * table cannot track would send directly (SEC-01). */
+static int track_dup(int oldfd, int newfd)
+{
+	if (udpc_fd_share(oldfd, newfd) == 0)
+		return newfd;
+	REAL_CLOSE(newfd);
+	errno = EMFILE;
+	return -1;
+}
+
 int dup(int oldfd)
 {
 	int newfd = REAL_DUP(oldfd);
 
-	if (newfd >= 0 && !UDPC_IN_SHIM())
-		udpc_fd_share(oldfd, newfd);
-	return newfd;
+	if (newfd < 0 || UDPC_IN_SHIM())
+		return newfd;
+	return track_dup(oldfd, newfd);
 }
 
+/* newfd's entry changes only once the kernel has actually replaced newfd.
+ * Releasing it beforehand, as dup2's implicit close suggests, left a FAILED
+ * dup2 -- EBADF on oldfd, say -- with newfd still open, still a UDP socket and
+ * no longer tracked, so its next send went direct.  udpc_fd_share replaces or
+ * releases the entry once the call has succeeded. */
 int dup2(int oldfd, int newfd)
 {
-	int rc;
+	int rc = REAL_DUP2(oldfd, newfd);
 
-	/* dup2 implicitly closes newfd, so its entry must be released first --
-	 * exactly as the kernel closes the descriptor. */
-	if (!UDPC_IN_SHIM() && oldfd != newfd)
-		udpc_fd_release(newfd);
-
-	rc = REAL_DUP2(oldfd, newfd);
-	if (rc >= 0 && !UDPC_IN_SHIM() && oldfd != newfd)
-		udpc_fd_share(oldfd, rc);
-	return rc;
+	if (rc < 0 || UDPC_IN_SHIM() || oldfd == newfd)
+		return rc;
+	return track_dup(oldfd, rc);
 }
 
 int dup3(int oldfd, int newfd, int flags)
 {
-	int rc;
+	int rc = REAL_DUP3(oldfd, newfd, flags);
 
-	if (!UDPC_IN_SHIM() && oldfd != newfd)
-		udpc_fd_release(newfd);
+	if (rc < 0 || UDPC_IN_SHIM() || oldfd == newfd)
+		return rc;
+	return track_dup(oldfd, rc);
+}
 
-	rc = REAL_DUP3(oldfd, newfd, flags);
-	if (rc >= 0 && !UDPC_IN_SHIM() && oldfd != newfd)
-		udpc_fd_share(oldfd, rc);
-	return rc;
+/* fcntl(F_DUPFD) and F_DUPFD_CLOEXEC duplicate a descriptor exactly as dup
+ * does, and are how several runtimes do it -- Python's socket.dup() and
+ * os.dup() among them.  Unhooked, the copy of an intercepted socket was
+ * untracked and sent directly.
+ *
+ * glibc exports one implementation as both fcntl and fcntl64, and a program
+ * built with _FILE_OFFSET_BITS=64 calls the latter, so both are hooked.
+ *
+ * The third argument is read as a pointer whether or not the command takes
+ * one, which is how glibc forwards it too: every command's argument is an int,
+ * a long or a pointer, and each travels in the slot a pointer occupies. */
+static int fcntl_common(udpc_fcntl_fn real, int fd, int cmd, void *arg)
+{
+	int rc = real(fd, cmd, arg);
+
+	if (rc < 0 || UDPC_IN_SHIM() || (cmd != F_DUPFD && cmd != F_DUPFD_CLOEXEC))
+		return rc;
+	return track_dup(fd, rc);
+}
+
+int fcntl(int fd, int cmd, ...)
+{
+	va_list ap;
+	void *arg;
+
+	va_start(ap, cmd);
+	arg = va_arg(ap, void *);
+	va_end(ap);
+	return fcntl_common(REAL_FCNTL, fd, cmd, arg);
+}
+
+int fcntl64(int fd, int cmd, ...)
+{
+	va_list ap;
+	void *arg;
+
+	va_start(ap, cmd);
+	arg = va_arg(ap, void *);
+	va_end(ap);
+	return fcntl_common(REAL_FCNTL64, fd, cmd, arg);
 }
 
 /* --- introspection (FR-I-05) ----------------------------------------------- */
@@ -504,6 +664,47 @@ ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 	return udpc_core_recv(fd, e, iov, iovcnt, NULL, NULL, 0, NULL);
 }
 
+/* --- fortified receive entry points (FR-I-02) ------------------------------ */
+
+/* A program built with _FORTIFY_SOURCE -- the default for distribution
+ * packages -- calls these instead of recv, recvfrom and read whenever the
+ * buffer's size is known at compile time and the length is not.  glibc
+ * implements them by calling its own internal receive functions, which no
+ * preloaded library can interpose on.  Left unhooked, they handed the
+ * application its datagram with the SOCKS header still attached: the Proxando
+ * failure (baseline §0.3.2), arriving by a door the matrix never opened.
+ *
+ * Each makes the same bounds check glibc's does, then funnels into the ordinary
+ * hook and so into the one receive path.  Declared here rather than taken from
+ * <bits/socket2.h>, which only declares them in a fortified build. */
+extern void __chk_fail(void) __attribute__((noreturn));
+ssize_t __recv_chk(int fd, void *buf, size_t len, size_t buflen, int flags);
+ssize_t __recvfrom_chk(int fd, void *buf, size_t len, size_t buflen, int flags,
+                       struct sockaddr *src, socklen_t *srclen);
+ssize_t __read_chk(int fd, void *buf, size_t len, size_t buflen);
+
+ssize_t __recv_chk(int fd, void *buf, size_t len, size_t buflen, int flags)
+{
+	if (len > buflen)
+		__chk_fail();
+	return recv(fd, buf, len, flags);
+}
+
+ssize_t __recvfrom_chk(int fd, void *buf, size_t len, size_t buflen, int flags,
+                       struct sockaddr *src, socklen_t *srclen)
+{
+	if (len > buflen)
+		__chk_fail();
+	return recvfrom(fd, buf, len, flags, src, srclen);
+}
+
+ssize_t __read_chk(int fd, void *buf, size_t len, size_t buflen)
+{
+	if (len > buflen)
+		__chk_fail();
+	return read(fd, buf, len);
+}
+
 ssize_t recvmsg(int fd, struct msghdr *msg, int flags)
 {
 	struct udpc_fdent *e = udpc_intercept(fd);
@@ -511,8 +712,14 @@ ssize_t recvmsg(int fd, struct msghdr *msg, int flags)
 	int msgflags = 0;
 	ssize_t n;
 
-	if (e == NULL)
-		return REAL_RECVMSG(fd, msg, flags);
+	if (e == NULL) {
+		/* Not ours -- but it may be a unix socket carrying descriptors,
+		 * and a UDP socket among them must be adopted. */
+		n = REAL_RECVMSG(fd, msg, flags);
+		if (n >= 0)
+			adopt_received_fds(msg);
+		return n;
+	}
 	if (msg == NULL) {
 		errno = EFAULT;
 		return -1;
@@ -547,8 +754,13 @@ int recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
 	struct timespec start;
 	bool have_deadline = (timeout != NULL);
 
-	if (e == NULL)
-		return REAL_RECVMMSG(fd, msgvec, vlen, flags, timeout);
+	if (e == NULL) {
+		int rc = REAL_RECVMMSG(fd, msgvec, vlen, flags, timeout);
+
+		for (i = 0; rc > 0 && i < (unsigned)rc; i++)
+			adopt_received_fds(&msgvec[i].msg_hdr);
+		return rc;
+	}
 	if (msgvec == NULL) {
 		errno = EFAULT;
 		return -1;

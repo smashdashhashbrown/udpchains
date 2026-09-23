@@ -9,6 +9,44 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) and mapped in
 [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
 
+## [Unreleased]
+
+### Fixed
+
+Four ways an intercepted socket could escape the shim, all found in review after 1.0.0 and each
+reproduced before being fixed. Two were SEC-01 violations — a datagram sent directly with the
+proxy down — and one was the FR-I-02 defect the project exists to prevent. See **D-21**.
+
+- **`fcntl(F_DUPFD)` duplicates sent directly.** `fcntl(F_DUPFD)` and `F_DUPFD_CLOEXEC` were not
+  hooked, so a copy made that way was untracked and sent straight to its destination. Python's
+  `socket.dup()` and `os.dup()` duplicate this way. `fcntl` and `fcntl64` are now hooked.
+- **UDP sockets received over `SCM_RIGHTS` sent directly.** A descriptor passed from another
+  process arrives as a new number that never went through `socket()`. `recvmsg` and `recvmmsg` now
+  adopt any UDP socket in `SCM_RIGHTS` ancillary data before returning it.
+- **A failed `dup2`/`dup3` untracked its target.** The target's entry was released before the call,
+  so a call that failed (for example with `EBADF`) left the target open, still a UDP socket, and no
+  longer tracked. The entry now changes only after the call succeeds. A duplicate that cannot be
+  tracked is now closed and the call fails with `EMFILE`, as `socket()` already did; previously it
+  was logged and left open.
+- **Fortified receive calls delivered the SOCKS header.** A program built with `_FORTIFY_SOURCE`,
+  the default for distribution packages, calls `__recvfrom_chk`, `__recv_chk` and `__read_chk`.
+  glibc implements these with internal calls that bypass any preload, so the application got the
+  10-byte SOCKS header as payload. They are now hooked and funnel into the one receive path.
+- **Inherited sockets without `/proc`.** Adopting inherited descriptors silently gave up when
+  `/proc/self/fd` could not be opened. The descriptor table is now probed instead. An inherited
+  UDP socket that cannot be tracked is closed rather than left to send directly.
+
+### Verification
+
+- New assertions: the leak test's client now also sends through an `fcntl` duplicate, an
+  `SCM_RIGHTS`-received socket, and a failed `dup2` target. Each of these reached the destination
+  on 1.0.0; with the fix, none does. The fidelity test covers the three fortified receive calls.
+  The lifecycle test checks that the new descriptors are actually *proxied* (by counting control
+  connections), not merely delivered, because an untracked socket also round-trips — directly.
+  The symbol gate now requires all five new hooks.
+- Every new assertion fails against the 1.0.0 shim and passes against this one. Clean under
+  ASan/UBSan, ThreadSanitizer, Valgrind memcheck and Helgrind.
+
 ## [1.0.0] — 2026-08-20
 
 First release.

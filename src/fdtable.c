@@ -163,23 +163,29 @@ void udpc_fd_release(int fd)
 	atomic_store_explicit(&e->state, UDPC_FD_FREE, memory_order_release);
 }
 
-void udpc_fd_share(int oldfd, int newfd)
+int udpc_fd_share(int oldfd, int newfd)
 {
 	struct udpc_fdent *src, *dst;
 	struct udpc_assoc *a;
 
 	src = udpc_fd_lookup(oldfd);
-	if (src == NULL)
-		return;
+	if (src == NULL) {
+		/* newfd now refers to something we do not intercept.  Any entry
+		 * at its number is stale -- dup2 closed what was there, or the
+		 * kernel has just allocated the number (D-17) -- and must not
+		 * make this descriptor look like a UDP socket. */
+		udpc_fd_release(newfd);
+		return 0;
+	}
 
 	dst = udpc_fd_claim(newfd,
 	                    atomic_load_explicit(&src->family, memory_order_relaxed),
 	                    atomic_load_explicit(&src->type, memory_order_relaxed));
 	if (dst == NULL) {
-		udpc_err("cannot track duplicated descriptor %d; its traffic "
-		         "would be unproxied",
+		udpc_err("cannot track duplicated descriptor %d; refusing it "
+		         "rather than leaving it unproxied",
 		         newfd);
-		return;
+		return -1;
 	}
 
 	/* FR-L-03: both descriptors share one association, which survives until
@@ -206,4 +212,5 @@ void udpc_fd_share(int oldfd, int newfd)
 	                      memory_order_relaxed);
 
 	udpc_fd_publish(dst);
+	return 0;
 }

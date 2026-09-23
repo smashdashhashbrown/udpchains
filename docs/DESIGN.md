@@ -89,8 +89,21 @@ Required by FR-I-03/04/05, gated at build time by TST-02 (`nm -D`).
 |---|---|
 | Send | `sendto`, `sendmsg`, `sendmmsg`, `send`, `write`, `writev` |
 | Receive | `recvfrom`, `recvmsg`, `recvmmsg`, `recv`, `read`, `readv` |
-| Lifecycle | `socket`, `connect`, `bind`, `close`, `close_range`, `dup`, `dup2`, `dup3` |
+| Receive, fortified | `__recvfrom_chk`, `__recv_chk`, `__read_chk` (D-21) |
+| Lifecycle | `socket`, `connect`, `bind`, `close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl`, `fcntl64` (D-21) |
 | Introspection | `getpeername`, `getsockname` |
+
+The fortified variants are what a `_FORTIFY_SOURCE` build calls in place of `recvfrom`, `recv` and
+`read`. glibc implements them with internal calls that no preload can see, so they are hooked
+separately and funnel into the same receive path. `fcntl` is hooked only for `F_DUPFD` and
+`F_DUPFD_CLOEXEC`, which duplicate a descriptor exactly as `dup` does; every other command passes
+through.
+
+A UDP socket can also enter the process without passing through any of these hooks: it can be
+inherited across `exec`, or received as `SCM_RIGHTS` ancillary data. Inherited sockets are adopted at
+start-up, from `/proc/self/fd` or, without `/proc`, by probing the descriptor table. Received
+sockets are adopted by the `recvmsg`/`recvmmsg` hooks before the call returns. A socket that cannot
+be tracked is closed, never left to send directly (D-21).
 
 **FR-I-02 is structural, not a checklist item.** Send and receive hooks are implemented in pairs, and
 the internal implementation funnels every send variant into one `do_send(fd, iov, iovlen, dst,
@@ -158,8 +171,13 @@ It owns **no data socket** — the application's fd is the data socket (FR-I-07)
 (FR-L-03). `close` decrements; the association is torn down — control connection closed, which the
 proxy takes as the signal to release the association (§0.5) — when the count reaches zero.
 
-`dup2`/`dup3` onto an fd that already has an `ACTIVE` entry must first release that entry, exactly as
-the kernel implicitly closes the target descriptor.
+`dup2`/`dup3` onto an fd that already has an `ACTIVE` entry replace or release that entry, as the
+kernel implicitly closes the target descriptor — but only **after** the call succeeds. Releasing it
+first meant a failed call left the target open, still a UDP socket, and untracked (D-21). The same
+rule covers every duplication route (`dup`, `dup2`, `dup3`, `fcntl(F_DUPFD)`): if the source is
+intercepted, the new descriptor shares its association. Otherwise any stale entry at the new number
+is released. A duplicate of an intercepted socket that the table cannot track is closed, and the
+call fails with `EMFILE`.
 
 `close_range` iterates the requested range and releases each entry, honouring `CLOSE_RANGE_CLOEXEC`
 by marking rather than closing.

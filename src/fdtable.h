@@ -93,7 +93,14 @@ void udpc_fd_publish(struct udpc_fdent *e);
  * later socket landing on the same fd number inherits nothing (FR-L-02). */
 void udpc_fd_release(int fd);
 
-/* Points newfd at oldfd's association, sharing it by refcount (FR-L-03). */
-void udpc_fd_share(int oldfd, int newfd);
+/* Called after the kernel has made newfd a duplicate of oldfd, by any route
+ * (dup, dup2, dup3, fcntl F_DUPFD).  If oldfd is intercepted, points newfd at
+ * its association, sharing it by refcount (FR-L-03); otherwise releases any
+ * stale entry left at newfd's number.
+ *
+ * Returns 0, or -1 if oldfd is intercepted but newfd cannot be tracked.  The
+ * caller must then close newfd and fail the call: an untracked duplicate of an
+ * intercepted socket sends directly (SEC-01). */
+int udpc_fd_share(int oldfd, int newfd);
 
 #endif /* UDPCHAINS_FDTABLE_H */
