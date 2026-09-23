@@ -463,3 +463,73 @@ painful to retrofit. ASan/UBSan/TSan variants for the test suite (TST-08).
 
 The build fails with a clear message on an unsupported glibc rather than producing a shim with a
 silently missing hook (NFR-01a).
+
+---
+
+## 11. Name resolution (D-22)
+
+**Status:** design agreed, not yet implemented. The policy — what is answered where, and why — is
+D-22. This section covers how it fits the existing code.
+
+### 11.1 Where it lives
+
+| Module | Role |
+|---|---|
+| `src/dnshooks.c` | The exported symbols: `getaddrinfo`, `getnameinfo`, `gethostby*`, the `res_*` family and `getaddrinfo_a` (which fails closed). Thin wrappers, in the same spirit as `hooks.c`: every lookup funnels into one function in `resolve.c`. |
+| `src/resolve.c` | The lookup order of D-22 (numeric, `localhost`, `/etc/hosts`, DNS), the `/etc/hosts` parser, the association pool, and the UDP and TCP transports. |
+| `src/dns.c` | The DNS message codec: builds A, AAAA and PTR queries with an EDNS0 OPT record, and parses answers. Name decompression goes through libc's `dn_expand`/`dn_skipname`. No dependency on `libresolv`. |
+| `src/socks5.c` | Gains `CONNECT` (CMD `0x01`) for the TCP fallback, sharing the existing method negotiation and RFC 1929 code with `UDP ASSOCIATE`. |
+| `src/config.c` | Gains `dns`, `dns_timeout` and `dns_search`, with their `UDPCHAINS_*` variables and export. The wrapper validates `dns` as numeric before `exec` (FR-C-03). |
+
+### 11.2 One lookup
+
+```
+getaddrinfo(name, service, hints)
+  └─ dnshooks: in the shim (guard held)?   → real getaddrinfo, untouched
+     └─ resolve: numeric?                   → real getaddrinfo + AI_NUMERICHOST
+        ├─ localhost / *.localhost?         → loopback
+        ├─ /etc/hosts match?                → those addresses
+        ├─ dns unset?                       → EAI_FAIL + one diagnostic
+        └─ take a pooled association        (create if none free, below the cap)
+           ├─ send A + AAAA, SOCKS-wrapped, to dns via the relay
+           ├─ wait for replies matching ID + question + source, or timeout
+           ├─ TC set?                       → SOCKS5 CONNECT to dns, DNS over TCP
+           └─ return the association to the pool
+     └─ for each address: real getaddrinfo(ip, service, hints | AI_NUMERICHOST); chain
+```
+
+### 11.3 The association pool
+
+- Entries are created lazily, up to a small cap (4). A lookup that finds none free waits on a
+  condition variable. The resolver path may lock and allocate: `getaddrinfo` is not
+  async-signal-safe anyway (D-22).
+- Each entry holds its own control connection and UDP socket. Both are the shim's own descriptors,
+  created under the re-entry guard with `SOCK_CLOEXEC`. Their placement in the descriptor space
+  should follow whatever review item H4 settles for control connections.
+- An entry idle long enough to have been expired is re-checked before use, as FR-P-08 does for
+  application sockets.
+- After `fork`, entries from the parent's generation are discarded on first use. Closing their
+  descriptors in the child is safe for the same reason as §3.4: the parent holds its own references.
+
+### 11.4 Replies
+
+Datagrams arriving on a pool socket go through the existing SOCKS header decoder
+(`udpc_socks_decode`). A reply is accepted only if all of the following hold:
+
+- `FRAG` is 0;
+- the SOCKS source is the configured resolver;
+- the DNS ID matches the outstanding query;
+- the question section echoes the query.
+
+Anything else is discarded, and the wait continues until the deadline. A truncated answer (TC set)
+is never used: the whole query is repeated over TCP.
+
+### 11.5 Tests
+
+- A DNS fixture, `tests/fixtures/dnsd.c`, answering A, AAAA, CNAME, PTR, NXDOMAIN and truncated
+  responses.
+- `CONNECT` support in `socks5d`.
+- `tests/test_dns.c`: unit tests for the codec against hostile input.
+- `tests/test_resolve.c`: integration tests of every hooked function under the shim.
+- A new leak-test scenario: with the proxy down, every lookup fails and nothing reaches the host's
+  resolver.

@@ -27,15 +27,14 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
   `socket`/`connect`/`sendmmsg`/`recvfrom`, so no hook fires. The README's "No DNS leak" and D-04 are
   false for every program that resolves names through libc. `dig` passed interop only because it
   carries its own resolver.
-  - **Decision (2026-09-23): option 2 — resolve through the proxy.** Add a `dns = <resolver-ip>`
-    setting, hook the resolver API (`getaddrinfo`, `gethostbyname*`, `gethostbyaddr*`,
-    `getnameinfo`, `res_*`), and have the shim send the queries itself over a UDP association.
-    Numeric addresses and `/etc/hosts` are answered locally.
-  - Not started. Needs its own decision record, a leak-test case (resolution with the proxy down
-    must fail and put nothing on the wire), and corrections to the README and D-04.
-  - Open design questions: behaviour when `dns` is unset (fail closed, or a default resolver?),
-    TCP fallback for truncated answers, and whether `nscd`/`nss-resolve` users need anything
-    beyond the API-level hooks.
+  - **Decision (2026-09-23): option 2 — resolve through the proxy.** Design recorded as **D-22**
+    (DECISIONS.md) and **DESIGN.md §11**. The three open questions were settled:
+    - `dns` unset: **fail closed**, with `EAI_FAIL` and a diagnostic. There is no default
+      resolver.
+    - Transport: **UDP over `UDP ASSOCIATE`, falling back to TCP via SOCKS5 `CONNECT`** when an
+      answer is truncated.
+    - Search domains: **not applied**. `/etc/resolv.conf` is not read; `dns_search` opts in.
+  - Implementation not started.
 
 ## High
 

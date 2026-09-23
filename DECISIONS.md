@@ -120,6 +120,13 @@ exemption, no `getaddrinfo` hook, no shared association for resolver sockets.
 association pooled across resolver sockets, which was considered and rejected for v1 as a second
 association model to get right alongside the per-fd one (D-13).
 
+**Outcome.** The premise was false for every supported glibc. Since 2.34 — this project's floor —
+the resolver lives inside libc and creates, connects and sends on its sockets through internal
+aliases, so no hook fires. With the proxy down, `getaddrinfo()` still resolved, and the raw query
+went to `127.0.0.53`. "No DNS leak by construction" did not hold for any program that resolves
+names through libc; `dig` passed interop only because it carries its own resolver. Superseded by
+**D-22**.
+
 ---
 
 ## D-05
@@ -830,3 +837,107 @@ would not prove that, since an untracked socket round-trips directly.
 
 **Revisit if:** another libc entry point is found that creates, duplicates or receives on a socket
 without going through a hooked symbol. The symbol gate should grow with each one.
+
+---
+
+## D-22
+### Name resolution is done by the shim, through the proxy, and never by the host
+
+**Date:** 2026-09-23 · **Status:** Accepted — **not yet implemented** · Supersedes D-04.
+
+**Context.** D-04 assumed glibc's resolver sends through the hooked socket calls. It does not, and
+on no supported glibc: since 2.34 the resolver is part of libc, and its `socket`, `connect`,
+`sendmmsg` and `recvfrom` calls are internal aliases no preload can interpose on. The NSS modules
+ahead of it in a typical `hosts:` line (`mdns4_minimal`, `resolve`) are no better: each hands the
+name to a local daemon over a unix socket, and the daemon resolves it unproxied. Found in the
+pre-release review; reproduced with the proxy down, where `getaddrinfo()` resolved successfully and
+`strace` showed the raw query sent to `127.0.0.53`.
+
+A shim that fails closed for every datagram but resolves every name directly still tells the local
+network, and the resolver's operator, where the program is going. For many users that is the
+information they were trying to protect.
+
+**Decision.** The shim answers name lookups itself, **before NSS runs**. Each lookup is answered
+locally or by a DNS query sent through the proxy. The host's resolver is never consulted, and if
+the proxy route fails, the lookup fails.
+
+*Hooked:* `getaddrinfo`; `getnameinfo`; `gethostbyname`, `gethostbyname2` and `gethostbyaddr` with
+their `_r` forms; and the `res_*` query API — `res_query`, `res_search`, `res_querydomain`,
+`res_send` and their `res_n*` forms — under both the plain and the `__res_*` names, since libc
+exports both. `getaddrinfo_a` **fails closed** with a diagnostic; asynchronous support is later
+work.
+
+*Not hooked, deliberately:* `freeaddrinfo` (results are built by glibc itself, below); `gethostent`
+(files only); `getnetby*` (`networks:` is `files` on common configurations — revisit if a user
+configures `dns` there); `rcmd`/`rexec` (TCP, out of scope).
+
+*Lookup order:*
+
+1. A numeric address goes to the real `getaddrinfo` with `AI_NUMERICHOST` forced, which cannot
+   touch the network.
+2. `localhost` and `*.localhost` answer with loopback (RFC 6761).
+3. `/etc/hosts`, read by the shim's own parser.
+4. DNS through the proxy.
+
+A non-numeric name with `AI_NUMERICHOST` set fails with `EAI_NONAME`, as in glibc.
+
+*Configuration.* `dns = <ip>[:port]` (env `UDPCHAINS_DNS`), numeric only: a named resolver would
+need resolving first. **There is no default resolver.** With `dns` unset, a lookup that reaches
+step 4 fails with `EAI_FAIL` and one diagnostic naming the setting — the same reasoning as D-10's
+refusal to pick a proxy. Numeric addresses and `/etc/hosts` still work. `dns_timeout` (ms, default
+5000, spread over 2 attempts). `dns_search = <domain> ...` opts in to a search list.
+
+*Search domains are not applied by default.* Names are looked up as given, and `/etc/resolv.conf`
+is not read at all. Local search domains (`localdomain`, a corporate suffix) are usually
+meaningless to a remote resolver, and appending them sends internal names to it. The cost:
+single-label names such as `printer` fail unless `dns_search` is set.
+
+*Transport.* UDP over `UDP ASSOCIATE`, through associations the shim owns, kept in a small pool
+with one lookup per association at a time. A pool, not one shared association, because a proxy
+pins an association to a single local socket (§0.5), so concurrent lookups could share one only
+through a reply demultiplexer. A and AAAA are queried together. A reply is accepted only if its
+ID, question and SOCKS-header source all match; IDs are random. An EDNS0 buffer of 1232 bytes makes
+truncation rare. **On a truncated answer, the query is retried over TCP, using SOCKS5 `CONNECT` to
+the resolver through the proxy**; if the proxy refuses `CONNECT`, the lookup fails. This also
+retires D-04's "resolver TCP fallback is not proxied" for libc lookups.
+
+*Results.* For each resolved address, the real `getaddrinfo(ip, service, hints | AI_NUMERICHOST)`
+is called and the results chained. glibc then handles service names, socket-type expansion and
+`AI_V4MAPPED`/`AI_ALL`, and glibc's own `freeaddrinfo` frees the list — which is why it needs no
+hook. `AI_CANONNAME` reports the end of the CNAME chain. `res_send` carries the caller's message
+unchanged.
+
+**Consequences.**
+
+- Address ordering is no longer glibc's RFC 6724 sort. The shim honours `AI_ADDRCONFIG`, and puts
+  IPv6 first only when the host has a global IPv6 address.
+- Every NSS source for `hosts` other than `files` is bypassed: `.local` mDNS names stop resolving,
+  and the host's own name resolves only if it is in `/etc/hosts`.
+- Non-ASCII names (`AI_IDN`) are not converted; they fail with `EAI_IDN_ENCODE`.
+- `_res` options (`RES_USEVC`, `RES_ROTATE` and others) are ignored.
+- Programs with their own resolvers — `dig`, c-ares (curl), Node, the BIND libraries — are
+  unaffected. They already send DNS over ordinary intercepted UDP, and their queries to
+  `127.0.0.53` are resolved at the proxy host (D-05 R2). Redirecting loopback port 53 to `dns` is a
+  possible later option, not part of this decision.
+- The resolver path takes locks — for the pool — and allocates. NFR-03 does not apply:
+  `getaddrinfo` is not async-signal-safe in POSIX either.
+- Inside the shim, with the re-entry guard held, the hooks pass straight through to libc, so the
+  shim's own lookup of a *named* proxy stays direct. That is already documented, and M5 (export the
+  resolved proxy address) removes it from exec'd descendants.
+- DNS answers inherit the relay leg's lack of authentication (review item D3): an attacker able to
+  spoof the relay's address must also guess a 16-bit query ID.
+
+**Testing.**
+
+- A DNS fixture, `tests/fixtures/dnsd.c`, answering A, AAAA, CNAME, PTR, NXDOMAIN and truncated
+  responses.
+- `CONNECT` support in `socks5d`, for the TCP fallback.
+- Unit tests for the decoder against hostile input: compression loops, truncated messages, answers
+  to a different question.
+- Integration tests for each hooked function.
+- A leak-test case: with the proxy down, every lookup fails and nothing reaches the host's
+  resolver. The wire-level capture script gains the same case.
+
+**Revisit if:** a program is found that needs `getaddrinfo_a`, IDN, or glibc's address sorting; or a
+proxy commonly paired with this tool lacks `CONNECT`, which would make the truncation fallback
+unreliable.
