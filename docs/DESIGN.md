@@ -468,8 +468,8 @@ silently missing hook (NFR-01a).
 
 ## 11. Name resolution (D-22)
 
-**Status:** design agreed, not yet implemented. The policy — what is answered where, and why — is
-D-22. This section covers how it fits the existing code.
+**Status:** implemented. The policy — what is answered where, and why — is D-22, including the
+implementation notes at its end. This section covers how it fits the existing code.
 
 ### 11.1 Where it lives
 
@@ -479,7 +479,7 @@ D-22. This section covers how it fits the existing code.
 | `src/resolve.c` | The lookup order of D-22 (numeric, `localhost`, `/etc/hosts`, DNS), the `/etc/hosts` parser, the association pool, and the UDP and TCP transports. |
 | `src/dns.c` | The DNS message codec: builds A, AAAA and PTR queries with an EDNS0 OPT record, and parses answers. Name decompression goes through libc's `dn_expand`/`dn_skipname`. No dependency on `libresolv`. |
 | `src/socks5.c` | Gains `CONNECT` (CMD `0x01`) for the TCP fallback, sharing the existing method negotiation and RFC 1929 code with `UDP ASSOCIATE`. |
-| `src/config.c` | Gains `dns`, `dns_timeout` and `dns_search`, with their `UDPCHAINS_*` variables and export. The wrapper validates `dns` as numeric before `exec` (FR-C-03). |
+| `src/config.c` | Gains `dns`, `dns_timeout`, `dns_search` and `hosts_file`, with their `UDPCHAINS_*` variables and export. The wrapper validates `dns` as numeric before `exec` (FR-C-03). |
 
 ### 11.2 One lookup
 
@@ -530,6 +530,9 @@ is never used: the whole query is repeated over TCP.
   responses.
 - `CONNECT` support in `socks5d`.
 - `tests/test_dns.c`: unit tests for the codec against hostile input.
-- `tests/test_resolve.c`: integration tests of every hooked function under the shim.
+- `tests/test_resolve.c`, driven by `tests/test_resolve.sh`: integration tests of every hooked
+  function under the shim, in four modes: working, no `dns` set, proxy down, and a proxy that
+  refuses `CONNECT`. The script counts what reached the fixture resolver, and uses `strace`, when
+  installed, to check the process never addressed a resolver directly.
 - A new leak-test scenario: with the proxy down, every lookup fails and nothing reaches the host's
   resolver.

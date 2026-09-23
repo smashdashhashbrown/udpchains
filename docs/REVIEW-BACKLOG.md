@@ -34,7 +34,10 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
     - Transport: **UDP over `UDP ASSOCIATE`, falling back to TCP via SOCKS5 `CONNECT`** when an
       answer is truncated.
     - Search domains: **not applied**. `/etc/resolv.conf` is not read; `dns_search` opts in.
-  - Implementation not started.
+  - **Implemented, awaiting commit.** Verified by `unit-dns`, `D-22-resolve` and a TST-03
+    scenario; clean under ASan, Valgrind and Helgrind. Tick this item with the commit hash. The
+    capture-script case is written but needs a root run, and interop against a real proxy is item
+    11 in INTEROP-CHECKLIST.md.
 
 ## High
 
@@ -137,7 +140,7 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
     claim any source.
   - The password is propagated through the environment (H3).
   - UDP servers that only receive don't work through a proxy.
-  - The README's "No DNS leak" claim is false (C4).
+  - ~~The README's "No DNS leak" claim is false (C4).~~ Corrected with the D-22 implementation.
 - [ ] **D4** — the configuration reference is incomplete:
   - The README's environment table omits `UDPCHAINS_PASSWORD`, `_QUIET`, `_DEBUG` and `_LIB`.
   - Config-file keys are listed nowhere.

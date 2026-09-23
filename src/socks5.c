@@ -16,6 +16,7 @@
 #define METHOD_NONE 0x00
 #define METHOD_USERPASS 0x02
 #define METHOD_UNACCEPTABLE 0xff
+#define CMD_CONNECT 0x01
 #define CMD_UDP_ASSOCIATE 0x03
 /* RFC 1929's sub-negotiation carries its OWN version byte, 0x01, not SOCKS5's
  * 0x05.  Confusing the two is the classic implementation bug here. */
@@ -448,23 +449,19 @@ void udpc_socks_fixup_relay(struct sockaddr_storage *relay,
 	udpc_sa_set_port((struct sockaddr *)relay, port);
 }
 
-int udpc_socks_associate(const struct udpc_config *cfg,
-                         const struct sockaddr *bind_addr,
-                         struct udpc_socks_conn *conn, int *out_errno)
+/* Opens the TCP connection to the proxy and completes method negotiation,
+ * including RFC 1929 authentication when the proxy selects it.  Shared by UDP
+ * ASSOCIATE and CONNECT, so both authenticate identically.  Returns the
+ * connected descriptor, or -1 with errno set and nothing left open. */
+static int open_negotiated(const struct udpc_config *cfg)
 {
-	uint8_t buf[UDPC_SOCKS_HDR_MAX];
-	struct udpc_socks_hdr hdr;
+	uint8_t buf[2 + 2];
 	socklen_t plen;
-	ssize_t hlen;
-	int fd = -1;
-	int saved;
-
-	memset(conn, 0, sizeof(*conn));
-	conn->control_fd = -1;
+	int fd, saved;
 
 	plen = udpc_sa_len((const struct sockaddr *)&cfg->proxy);
 	if (plen == 0) {
-		*out_errno = EAFNOSUPPORT;
+		errno = EAFNOSUPPORT;
 		return -1;
 	}
 
@@ -472,10 +469,8 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 	 * which a concurrent exec could inherit this descriptor (FR-L-05). */
 	fd = socket(cfg->proxy.ss_family, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
 	            IPPROTO_TCP);
-	if (fd < 0) {
-		*out_errno = errno;
+	if (fd < 0)
 		return -1;
-	}
 
 	if (connect_with_timeout(fd, (const struct sockaddr *)&cfg->proxy, plen,
 	                         cfg->connect_timeout_ms) != 0)
@@ -526,7 +521,7 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 	}
 	if (buf[1] == METHOD_USERPASS) {
 		/* FR-P-09 / RFC 1929.  A separate buffer: the request can reach
-		 * 513 bytes, twice the datagram header maximum that sizes buf. */
+		 * 513 bytes. */
 		uint8_t authbuf[3 + 255 + 255];
 		ssize_t alen;
 
@@ -586,49 +581,63 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 		errno = EACCES;
 		goto fail;
 	}
+	return fd;
 
-	/* UDP ASSOCIATE request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT.
-	 *
-	 * FR-P-05: declare 0.0.0.0:0 unless the application bound a concrete
-	 * address.  Proxies pin the association to a declared address, so
-	 * declaring one we will not send from breaks the association. */
+fail:
+	saved = errno;
+	close(fd);
+	errno = saved ? saved : ECONNREFUSED;
+	return -1;
+}
+
+/* Sends a request -- VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT -- and reads the
+ * reply, decoding BND.ADDR/BND.PORT into *bnd.  A NULL addr is sent as the
+ * unspecified address with port 0, in the family of the control connection.
+ * Returns 0, or -1 with errno set from the reply code (FR-F-07). */
+static int request(int fd, const struct udpc_config *cfg, uint8_t cmd,
+                   const struct sockaddr *addr, struct udpc_socks_hdr *bnd)
+{
+	uint8_t buf[UDPC_SOCKS_HDR_MAX];
+	ssize_t hlen;
+	size_t replylen;
+
 	buf[0] = SOCKS_VER;
-	buf[1] = CMD_UDP_ASSOCIATE;
+	buf[1] = cmd;
 	buf[2] = 0;
 
-	if (bind_addr != NULL && udpc_sa_len(bind_addr) != 0) {
+	if (addr != NULL && udpc_sa_len(addr) != 0) {
 		/* Same ATYP+addr+port encoding as a datagram header, including
-		 * the v4-mapped normalisation. */
-		hlen = encode_addr(buf + 3, sizeof(buf) - 3, bind_addr);
+		 * the v4-mapped normalisation (D-14). */
+		hlen = encode_addr(buf + 3, sizeof(buf) - 3, addr);
 		if (hlen < 0)
-			goto fail;
+			return -1;
+	} else if (cfg->proxy.ss_family == AF_INET6) {
+		buf[3] = UDPC_ATYP_IPV6;
+		memset(buf + 4, 0, 16 + 2); /* :: port 0 */
+		hlen = 1 + 16 + 2;
 	} else {
-		if (cfg->proxy.ss_family == AF_INET6) {
-			buf[3] = UDPC_ATYP_IPV6;
-			memset(buf + 4, 0, 16 + 2); /* :: port 0 */
-			hlen = 1 + 16 + 2;
-		} else {
-			buf[3] = UDPC_ATYP_IPV4;
-			memset(buf + 4, 0, 4 + 2); /* 0.0.0.0 port 0 */
-			hlen = 1 + 4 + 2;
-		}
+		buf[3] = UDPC_ATYP_IPV4;
+		memset(buf + 4, 0, 4 + 2); /* 0.0.0.0 port 0 */
+		hlen = 1 + 4 + 2;
 	}
 
 	if (write_all(fd, buf, 3 + (size_t)hlen, cfg->connect_timeout_ms) != 0)
-		goto fail;
+		return -1;
 
 	/* Reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT.  Read the fixed part,
 	 * then exactly as much as the declared ATYP requires -- never a fixed
-	 * slurp, which would either block or steal bytes. */
+	 * slurp, which would either block waiting for bytes the proxy will not
+	 * send or steal bytes that are not ours.  After a CONNECT the bytes
+	 * that follow are the tunnelled stream. */
 	if (read_all(fd, buf, 4, cfg->connect_timeout_ms) != 0)
-		goto fail;
+		return -1;
 	if (buf[0] != SOCKS_VER) {
 		errno = EPROTO;
-		goto fail;
+		return -1;
 	}
 	if (buf[1] != REP_SUCCEEDED) {
-		udpc_debug("proxy refused UDP ASSOCIATE with reply code 0x%02x",
-		           buf[1]);
+		udpc_debug("proxy refused %s with reply code 0x%02x",
+		           cmd == CMD_CONNECT ? "CONNECT" : "UDP ASSOCIATE", buf[1]);
 		/* RFC 1928 §6 reply codes, mapped to the closest errno so the
 		 * application sees something it can act on (FR-F-07). */
 		switch (buf[1]) {
@@ -641,57 +650,71 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 		case 0x08: errno = EAFNOSUPPORT; break; /* address type */
 		default: errno = ECONNREFUSED; break;   /* general failure */
 		}
-		goto fail;
+		return -1;
 	}
 
-	/* Read exactly what the declared ATYP requires -- never a fixed-size
-	 * slurp, which would either block waiting for bytes the proxy will not
-	 * send or steal bytes that are not ours.  replylen tracks how much of
-	 * buf is actually valid, so nothing downstream reads past it. */
+	switch (buf[3]) {
+	case UDPC_ATYP_IPV4:
+		if (read_all(fd, buf + 4, 4 + 2, cfg->connect_timeout_ms) != 0)
+			return -1;
+		replylen = 4 + 4 + 2;
+		break;
+	case UDPC_ATYP_IPV6:
+		if (read_all(fd, buf + 4, 16 + 2, cfg->connect_timeout_ms) != 0)
+			return -1;
+		replylen = 4 + 16 + 2;
+		break;
+	case UDPC_ATYP_DOMAIN: {
+		size_t dlen;
+		if (read_all(fd, buf + 4, 1, cfg->connect_timeout_ms) != 0)
+			return -1;
+		dlen = buf[4];
+		if (read_all(fd, buf + 5, dlen + 2, cfg->connect_timeout_ms) != 0)
+			return -1;
+		replylen = 5 + dlen + 2;
+		break;
+	}
+	default:
+		errno = EPROTO;
+		return -1;
+	}
+
+	/* The reply's ATYP..PORT tail has the same shape as a UDP header's,
+	 * minus the RSV+FRAG prefix.  Rebuild that prefix so the one decoder
+	 * covers both, rather than duplicating the address parsing. */
 	{
-		size_t replylen;
+		uint8_t tmp[UDPC_SOCKS_HDR_MAX];
+		size_t taillen = replylen - 3; /* ATYP..PORT, plus a byte */
 
-		switch (buf[3]) {
-		case UDPC_ATYP_IPV4:
-			if (read_all(fd, buf + 4, 4 + 2, cfg->connect_timeout_ms) != 0)
-				goto fail;
-			replylen = 4 + 4 + 2;
-			break;
-		case UDPC_ATYP_IPV6:
-			if (read_all(fd, buf + 4, 16 + 2, cfg->connect_timeout_ms) != 0)
-				goto fail;
-			replylen = 4 + 16 + 2;
-			break;
-		case UDPC_ATYP_DOMAIN: {
-			size_t dlen;
-			if (read_all(fd, buf + 4, 1, cfg->connect_timeout_ms) != 0)
-				goto fail;
-			dlen = buf[4];
-			if (read_all(fd, buf + 5, dlen + 2,
-			             cfg->connect_timeout_ms) != 0)
-				goto fail;
-			replylen = 5 + dlen + 2;
-			break;
-		}
-		default:
-			errno = EPROTO;
-			goto fail;
-		}
-
-		/* The reply's ATYP..PORT tail has the same shape as a UDP
-		 * header's, minus the RSV+FRAG prefix.  Rebuild that prefix so
-		 * the one decoder covers both, rather than duplicating the
-		 * address parsing. */
-		{
-			uint8_t tmp[UDPC_SOCKS_HDR_MAX];
-			size_t taillen = replylen - 3; /* ATYP..PORT, plus a byte */
-
-			memset(tmp, 0, 3);
-			memcpy(tmp + 3, buf + 3, taillen);
-			if (udpc_socks_decode(tmp, 3 + taillen, &hdr) < 0)
-				goto fail;
-		}
+		memset(tmp, 0, 3);
+		memcpy(tmp + 3, buf + 3, taillen);
+		if (udpc_socks_decode(tmp, 3 + taillen, bnd) < 0)
+			return -1;
 	}
+	return 0;
+}
+
+int udpc_socks_associate(const struct udpc_config *cfg,
+                         const struct sockaddr *bind_addr,
+                         struct udpc_socks_conn *conn, int *out_errno)
+{
+	struct udpc_socks_hdr hdr;
+	int fd, saved;
+
+	memset(conn, 0, sizeof(*conn));
+	conn->control_fd = -1;
+
+	fd = open_negotiated(cfg);
+	if (fd < 0) {
+		*out_errno = errno;
+		return -1;
+	}
+
+	/* FR-P-05: declare 0.0.0.0:0 unless the application bound a concrete
+	 * address.  Proxies pin the association to a declared address, so
+	 * declaring one we will not send from breaks the association. */
+	if (request(fd, cfg, CMD_UDP_ASSOCIATE, bind_addr, &hdr) != 0)
+		goto fail;
 
 	if (!hdr.addr_valid) {
 		/* A named relay would need a lookup we cannot do honestly here. */
@@ -702,19 +725,43 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 	}
 
 	conn->relay = hdr.addr;
-
 	udpc_socks_fixup_relay(&conn->relay, cfg);
-
 	conn->control_fd = fd;
 	return 0;
 
 fail:
 	saved = errno;
-	if (fd >= 0)
-		close(fd);
-	conn->control_fd = -1;
+	close(fd);
 	*out_errno = saved ? saved : ECONNREFUSED;
 	return -1;
+}
+
+int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst,
+                       int *out_errno)
+{
+	struct udpc_socks_hdr hdr;
+	int fd, saved;
+
+	if (dst == NULL || udpc_sa_len(dst) == 0) {
+		*out_errno = EAFNOSUPPORT;
+		return -1;
+	}
+
+	fd = open_negotiated(cfg);
+	if (fd < 0) {
+		*out_errno = errno;
+		return -1;
+	}
+
+	/* BND.ADDR is the proxy's outbound address for the tunnel.  The
+	 * caller has no use for it, and a domain-form one is legal here. */
+	if (request(fd, cfg, CMD_CONNECT, dst, &hdr) != 0) {
+		saved = errno;
+		close(fd);
+		*out_errno = saved ? saved : ECONNREFUSED;
+		return -1;
+	}
+	return fd;
 }
 
 void udpc_socks_disconnect(struct udpc_socks_conn *conn)

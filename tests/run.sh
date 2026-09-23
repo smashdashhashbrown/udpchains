@@ -89,6 +89,7 @@ run_test unit-addr    "$BUILD/test_addr"
 run_test unit-config  "$BUILD/test_config"
 run_test unit-socks5  "$BUILD/test_socks5"
 run_test unit-fdtable "$BUILD/test_fdtable_mt"
+run_test unit-dns     "$BUILD/test_dns"
 
 # --- integration tests, under the shim ---------------------------------------
 
@@ -111,6 +112,10 @@ run_test TST-07-thread \
 
 run_test FR-P-09-auth "$ROOT/tests/test_auth.sh" "$BUILD/socks5d" \
 	"$BUILD/udpecho" "$WRAPPER"
+
+# D-22: name resolution through the proxy, never by the host's resolver.
+run_test D-22-resolve "$ROOT/tests/test_resolve.sh" "$BUILD/socks5d" \
+	"$BUILD/dnsd" "$WRAPPER" "$BUILD/test_resolve"
 
 run_test wrapper-loadable "$ROOT/tests/test_wrapper.sh" "$WRAPPER" \
 	"$ROOT/libudpchains.so"

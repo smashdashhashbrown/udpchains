@@ -11,6 +11,34 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ## [Unreleased]
 
+### Security
+
+- **Name lookups went directly to the host's resolver (D-22).** glibc's resolver has lived
+  inside libc since 2.34 — this project's minimum — and makes its socket calls through internal
+  functions no preload can intercept. With the proxy down, `getaddrinfo()` still resolved, and the
+  query went straight to `127.0.0.53`. The README's "No DNS leak" claim was false for every
+  program resolving names through libc. The shim now answers `getaddrinfo`, `getnameinfo`,
+  `gethostby*` and the `res_*` query API itself: from numeric input, `localhost`, the hosts file,
+  or a DNS query **sent through the proxy** — over UDP, and over TCP with SOCKS5 `CONNECT` when
+  an answer is truncated. The host's resolver is never consulted; if the proxy route fails, the
+  lookup fails.
+
+### Added
+
+- `dns` / `UDPCHAINS_DNS`: the resolver to query through the proxy, numeric only. **No default:**
+  without it, a lookup needing DNS fails with `EAI_FAIL` and one diagnostic. Also
+  `dns_timeout`, `dns_search` (search domains, opt-in — `/etc/resolv.conf` is not read) and
+  `hosts_file`.
+- SOCKS5 `CONNECT`, used only for the resolver's TCP fallback. Application TCP is still not
+  proxied.
+
+### Changed
+
+- Name services other than the hosts file and DNS (mDNS, `systemd-resolved`, `myhostname`) are no
+  longer consulted by proxied programs, since each resolves through a local daemon. Address order
+  no longer follows glibc's RFC 6724 sort. Non-ASCII names and `getaddrinfo_a` are refused.
+  See the README's *Name resolution* section.
+
 ### Fixed
 
 Four ways an intercepted socket could escape the shim, all found in review after 1.0.0 and each
@@ -46,6 +74,16 @@ proxy down — and one was the FR-I-02 defect the project exists to prevent. See
   The symbol gate now requires all five new hooks.
 - Every new assertion fails against the 1.0.0 shim and passes against this one. Clean under
   ASan/UBSan, ThreadSanitizer, Valgrind memcheck and Helgrind.
+- D-22: a DNS fixture (`tests/fixtures/dnsd.c`) with a truncating answer and a CNAME loop; `CONNECT`
+  and `--no-connect` in the proxy fixture; codec unit tests against hostile input (compression
+  loops, out-of-range pointers, overlong records, forged answers); an integration test of every
+  hooked resolver entry point; and a leak-test scenario. Independent of the shim's own account,
+  the tests count what reached the fixture resolver and check with `strace` that the process never
+  addressed a resolver directly — against the previous shim, that check finds 10–13 direct
+  port-53 sends. The resolver is clean under ASan/UBSan (codec), Valgrind memcheck and Helgrind
+  (the association pool). The wire-level capture script gains a DNS case, **not yet run**: it
+  needs root.
+- Suite: 563 assertions across 17 groups.
 
 ## [1.0.0] — 2026-08-20
 

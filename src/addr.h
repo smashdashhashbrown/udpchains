@@ -46,6 +46,12 @@ bool udpc_addr_is_local(const struct sockaddr *sa);
 int udpc_addr_parse(const char *spec, uint16_t default_port,
                     struct sockaddr_storage *ss, const char **err);
 
+/* As udpc_addr_parse, but accepts only a numeric address, so it can never
+ * cause a name lookup.  Used for the DNS resolver address (D-22), which would
+ * otherwise need resolving before resolution works. */
+int udpc_addr_parse_numeric(const char *spec, uint16_t default_port,
+                            struct sockaddr_storage *ss, const char **err);
+
 /* Compares two addresses for equality including port. */
 bool udpc_addr_equal(const struct sockaddr *a, const struct sockaddr *b);
 

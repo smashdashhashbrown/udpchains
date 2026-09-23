@@ -843,7 +843,7 @@ without going through a hooked symbol. The symbol gate should grow with each one
 ## D-22
 ### Name resolution is done by the shim, through the proxy, and never by the host
 
-**Date:** 2026-09-23 · **Status:** Accepted — **not yet implemented** · Supersedes D-04.
+**Date:** 2026-09-23 · **Status:** Accepted, implemented · Supersedes D-04.
 
 **Context.** D-04 assumed glibc's resolver sends through the hooked socket calls. It does not, and
 on no supported glibc: since 2.34 the resolver is part of libc, and its `socket`, `connect`,
@@ -937,6 +937,20 @@ unchanged.
 - Integration tests for each hooked function.
 - A leak-test case: with the proxy down, every lookup fails and nothing reaches the host's
   resolver. The wire-level capture script gains the same case.
+
+**Implementation notes.** Where the implementation settled something this record left open:
+
+- `hosts_file` (env `UDPCHAINS_HOSTS_FILE`) was added. The tests need a controlled hosts file, and a
+  container may keep its own; a documented setting was preferred to an undocumented test hook.
+- Addresses per answer are capped at 256, and at 512 per lookup. glibc has no fixed cap. The first
+  cap tried, 32, silently dropped addresses from a 100-record answer, which the integration test
+  caught.
+- Replies are accepted only if the SOCKS source is the resolver, `FRAG` is 0, and the ID, opcode,
+  name, type and class all match the query. Name decompression is libc's `dn_expand`; CNAME chains
+  are followed for at most 16 hops.
+- `getnameinfo` ignores `NI_NOFQDN`, and the `gethostby*` functions return no aliases.
+- The resolver's associations log one `resolver association up` line each at default verbosity,
+  as FR-C-06 asks of every association.
 
 **Revisit if:** a program is found that needs `getaddrinfo_a`, IDN, or glibc's address sorting; or a
 proxy commonly paired with this tool lacks `CONNECT`, which would make the truncation fallback

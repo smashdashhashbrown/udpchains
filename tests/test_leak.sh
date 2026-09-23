@@ -129,6 +129,29 @@ check "every send fails when the shim is unconfigured" "${SENT_OK:-x}" "0"
 sleep 0.3
 check "ZERO datagrams reached the destination" "$(received unconfigured)" "0"
 
+echo "# TST-03 scenario 4: name lookups with the proxy down (D-22)"
+# glibc's resolver makes its socket calls through internal aliases, so before
+# D-22 every getaddrinfo went straight to the host's resolver whatever the proxy
+# was doing.  Now a lookup that needs DNS must fail, and the resolver the shim
+# was told to use must see nothing.
+: > "$TMP/dnsd.out"
+"$BUILD/dnsd" --port 0 > "$TMP/dnsd.out" 2> "$TMP/dnsd.log" &
+PIDS+=($!)
+DPORT=""
+for ((i = 0; i < 100; i++)); do
+	DPORT=$(awk '/^PORT/{print $2; exit}' "$TMP/dnsd.out" 2>/dev/null)
+	[ -n "$DPORT" ] && break
+	sleep 0.05
+done
+printf '127.0.0.1\tlocalhost\n203.0.113.5\thostsonly.test\n' > "$TMP/hosts"
+OUT=$(UDPCHAINS_PROXY="$DEAD_PROXY" UDPCHAINS_QUIET=1 UDPCHAINS_DNS="127.0.0.1:$DPORT" \
+	UDPCHAINS_HOSTS_FILE="$TMP/hosts" UDPCHAINS_DNS_TIMEOUT=2000 \
+	timeout 60 "$WRAPPER" "$BUILD/test_resolve" down 2>&1)
+RC=$?
+echo "$OUT" | sed 's/^/#   /'
+check "every lookup that needs DNS fails with the proxy down" "$RC" "0"
+check "ZERO queries reached the resolver" "$(grep -c '^QUERY' "$TMP/dnsd.log")" "0"
+
 echo "# TST-03 control: the same client DOES reach the destination unproxied"
 # Without this, the test could pass because the client is broken rather than
 # because the shim is working.

@@ -50,6 +50,15 @@ Configuration is read from, in precedence order: command line, environment, conf
 no built-in default proxy** — if none is configured, `udpchains` prints a diagnostic and refuses to
 run the program rather than running it unproxied.
 
+**Set a DNS resolver too, if the program looks up names.** Name lookups go through the proxy to the
+resolver named by `dns` (`UDPCHAINS_DNS`), and there is no default. Without one, the program still
+runs, but any lookup that needs DNS fails. See [Name resolution](#name-resolution).
+
+```sh
+udpchains -p 127.0.0.1:1080 dig @9.9.9.9 example.com              # no dns needed: dig asks 9.9.9.9 itself
+UDPCHAINS_DNS=9.9.9.9 udpchains -p 127.0.0.1:1080 nc -u example.com 53
+```
+
 | Environment | Meaning |
 |---|---|
 | `UDPCHAINS_PROXY` | `host:port` of the SOCKS5 proxy |
@@ -58,12 +67,17 @@ run the program rather than running it unproxied.
 | `UDPCHAINS_STRICT_LOOPBACK` | make the loopback warning below an error |
 | `UDPCHAINS_CONNECT_TIMEOUT` | proxy connect timeout in ms |
 | `UDPCHAINS_USERNAME`, `UDPCHAINS_PASSWORD_FILE` | credentials (see below) |
+| `UDPCHAINS_DNS` | resolver for name lookups, as a numeric `ip[:port]` — see [Name resolution](#name-resolution) |
+| `UDPCHAINS_DNS_TIMEOUT` | whole-lookup timeout in ms, default 5000 |
+| `UDPCHAINS_DNS_SEARCH` | search domains for single-label names; none by default |
+| `UDPCHAINS_HOSTS_FILE` | hosts file consulted before DNS, default `/etc/hosts` |
 
 Config file:
 
 ```ini
 # ~/.udpchains.conf
 proxy = 127.0.0.1:1080
+dns = 9.9.9.9
 max_datagram = 8192
 strict_loopback = no
 ```
@@ -80,6 +94,54 @@ RFC 1929 username/password authentication is supported. Method `0x02` is offered
 credentials are configured, so a proxy that accepts either is not pushed into an authenticated
 exchange you did not ask for. If authentication fails, the send fails — there is no fallback to an
 unauthenticated or direct send.
+
+## Name resolution
+
+`udpchains` resolves names itself, through the proxy. glibc's own resolver cannot be intercepted —
+since glibc 2.34 it makes its socket calls through internal functions no preload can see — so a
+program resolving a name through `getaddrinfo`, `gethostbyname`, `getnameinfo` or `res_query` would
+otherwise send that lookup straight to the host's resolver, however carefully every datagram was
+proxied. The shim answers these calls before glibc's resolver runs (D-22):
+
+1. a numeric address answers itself;
+2. `localhost` and `*.localhost` are loopback;
+3. the hosts file (`/etc/hosts`);
+4. a DNS query to the resolver named by `dns`, **sent through the proxy** — over UDP, and repeated
+   over TCP with SOCKS5 `CONNECT` if the answer is too large for a datagram.
+
+**Configure a resolver.** There is no default, for the same reason there is no default proxy: the
+tool does not choose where your traffic goes. Without `dns`, any lookup that needs DNS fails with
+`EAI_FAIL` and one diagnostic. Numeric addresses and the hosts file still work.
+
+```sh
+udpchains -p proxy.example:1080 ...        # with dns = 9.9.9.9 in the config file, or
+UDPCHAINS_DNS=9.9.9.9 udpchains -p ...     # in the environment
+```
+
+The resolver must be given as a numeric address; a name would need resolving first. It sees
+queries arriving from the proxy, not from this host. If the proxy is unreachable, or the resolver
+does not answer, lookups fail with `EAI_AGAIN` — they are never retried directly.
+
+**Search domains are not applied** unless you ask: `/etc/resolv.conf` is not read at all. Its
+`search` line usually names a local domain (`localdomain`, a corporate suffix) that means nothing to
+a remote resolver, and appending it sends internal names there. Set `dns_search = example.com` to
+have single-label names tried with those suffixes.
+
+What this changes, compared with running unproxied:
+
+- **Only `files` and DNS.** The other sources on your `hosts:` line in `/etc/nsswitch.conf` —
+  mDNS (`.local` names), `systemd-resolved`, `myhostname` — are skipped, because each resolves
+  through a local daemon the shim cannot proxy. Your own hostname resolves only if it is in
+  `/etc/hosts`.
+- **Address order** is simpler than glibc's RFC 6724 sort: IPv6 first only when this host has a
+  usable IPv6 address.
+- **Not supported, and refused rather than resolved directly:** non-ASCII names (`AI_IDN`) fail with
+  `EAI_IDN_ENCODE`, and `getaddrinfo_a` fails with `EAI_SYSTEM`.
+- **Programs with their own resolver** — `dig`, `host`, curl built with c-ares, Node — do not use
+  these calls. Their queries are ordinary UDP to the nameserver in `/etc/resolv.conf`, which the
+  shim proxies like any other datagram; on a `systemd-resolved` host that is `127.0.0.53`, which is
+  resolved *at the proxy host* (see the loopback caveat below). Give such tools a resolver address
+  explicitly (`dig @9.9.9.9 ...`).
 
 ## What does not work
 
@@ -132,11 +194,9 @@ Consequences you will actually notice:
 
 ### Behaviour that is deliberately approximate
 
-- **DNS is proxied as ordinary UDP**, with no special case: glibc's resolver uses UDP through libc,
-  so it is intercepted like anything else. No DNS leak. Two consequences: each resolution burst
-  creates its own association, and **resolver TCP fallback is not proxied** — when an answer is too
-  large for UDP and glibc retries over TCP, that traffic is outside this project's scope. Compose
-  with `proxychains-ng` if you need both.
+- **Name lookups go through the proxy, but only as far as libc's API.** See
+  [Name resolution](#name-resolution). A program with its own resolver sends ordinary UDP, which
+  is proxied, but its TCP fallback for large answers is TCP and is not.
 
 - **The proxy's own hostname is resolved directly** if you configure it by name rather than by
   address. Configure a numeric address if that matters to you.

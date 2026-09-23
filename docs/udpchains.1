@@ -29,6 +29,13 @@ There is no built\-in default proxy. If none is configured,
 .B udpchains
 prints a diagnostic and refuses to run the program rather than running it
 unproxied.
+.PP
+There is no default DNS resolver either.
+Name lookups are sent through the proxy to the resolver named by
+.BR UDPCHAINS_DNS ;
+without one the program still runs, but any lookup that needs DNS fails.
+See
+.BR "NAME RESOLUTION" .
 .SH OPTIONS
 .TP
 .BI \-f " file"
@@ -68,6 +75,28 @@ Promote the loopback\-destination warning to an error.
 .B UDPCHAINS_CONNECT_TIMEOUT
 Proxy connect timeout in milliseconds.
 .TP
+.B UDPCHAINS_DNS
+Resolver for name lookups, as a numeric \fIip\fR, \fIip:port\fR or
+\fI[v6]:port\fR (default port 53).
+Queries to it are sent through the proxy.
+There is no default; see
+.BR "NAME RESOLUTION" .
+.TP
+.B UDPCHAINS_DNS_TIMEOUT
+Timeout for a whole name lookup, in milliseconds.
+Default 5000.
+.TP
+.B UDPCHAINS_DNS_SEARCH
+Search domains, separated by spaces or commas, tried for a name with no dot.
+None by default:
+.I /etc/resolv.conf
+is not read.
+.TP
+.B UDPCHAINS_HOSTS_FILE
+Hosts file consulted before DNS.
+Default
+.IR /etc/hosts .
+.TP
 .B UDPCHAINS_LIB
 Explicit path to \fIlibudpchains.so\fR.
 .TP
@@ -86,6 +115,49 @@ is offered only when credentials are configured. GSSAPI is not implemented.
 .TQ
 .I /etc/udpchains.conf
 Configuration, as \fIkey = value\fR lines.
+The name-resolution keys are
+.BR dns ,
+.BR dns_timeout ,
+.B dns_search
+and
+.BR hosts_file .
+.SH NAME RESOLUTION
+glibc's resolver makes its socket calls through internal functions that no
+preloaded library can see, so
+.B udpchains
+answers
+.BR getaddrinfo (3),
+.BR getnameinfo (3),
+.BR gethostbyname (3)
+and the
+.BR res_query (3)
+family itself.
+A numeric address answers itself;
+.I localhost
+and names under it are loopback; then the hosts file; then a DNS query to the
+.B UDPCHAINS_DNS
+resolver, sent through the proxy.
+An answer too large for UDP is repeated over TCP with SOCKS5 CONNECT.
+.PP
+The host's resolver is never used.
+Without a configured resolver a lookup that needs DNS fails with
+.BR EAI_FAIL ;
+with an unreachable proxy it fails with
+.BR EAI_AGAIN .
+Other name services in
+.BR nsswitch.conf (5),
+such as mDNS and
+.BR systemd-resolved (8),
+are skipped.
+Non-ASCII names and
+.BR getaddrinfo_a (3)
+are refused.
+.PP
+Programs with their own resolver, such as
+.BR dig (1),
+send ordinary UDP to the nameserver in
+.IR /etc/resolv.conf ,
+which is proxied like any other datagram.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -123,11 +195,24 @@ Ancillary data
 is returned empty.
 .SH EXAMPLES
 .PP
-Resolve a name through the proxy:
+Resolve a name through the proxy.
+.BR dig (1)
+queries the resolver it is given itself, so no
+.B UDPCHAINS_DNS
+is needed:
 .PP
 .RS
 .EX
 udpchains \-p 127.0.0.1:1080 dig @9.9.9.9 example.com
+.EE
+.RE
+.PP
+Run a program that looks up a name through libc, with the lookup also sent
+through the proxy:
+.PP
+.RS
+.EX
+UDPCHAINS_DNS=9.9.9.9 udpchains \-p 127.0.0.1:1080 nc \-u example.com 53
 .EE
 .RE
 .PP

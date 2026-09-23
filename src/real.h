@@ -49,6 +49,9 @@ enum udpc_real_slot {
 	/* introspection */
 	R_GETPEERNAME,
 	R_GETSOCKNAME,
+	/* name resolution (D-22) */
+	R_GETADDRINFO,
+	R_GETNAMEINFO,
 	R_SLOT_COUNT
 };
 
@@ -87,6 +90,12 @@ typedef int (*udpc_fcntl_fn)(int, int, ...);
 typedef int (*udpc_getpeername_fn)(int, struct sockaddr *, socklen_t *);
 typedef int (*udpc_getsockname_fn)(int, struct sockaddr *, socklen_t *);
 
+struct addrinfo;
+typedef int (*udpc_getaddrinfo_fn)(const char *, const char *,
+                                   const struct addrinfo *, struct addrinfo **);
+typedef int (*udpc_getnameinfo_fn)(const struct sockaddr *, socklen_t, char *,
+                                   socklen_t, char *, socklen_t, int);
+
 #define REAL_SENDTO ((udpc_sendto_fn)udpc_real(R_SENDTO, "sendto"))
 #define REAL_SENDMSG ((udpc_sendmsg_fn)udpc_real(R_SENDMSG, "sendmsg"))
 #define REAL_SENDMMSG ((udpc_sendmmsg_fn)udpc_real(R_SENDMMSG, "sendmmsg"))
@@ -117,5 +126,10 @@ typedef int (*udpc_getsockname_fn)(int, struct sockaddr *, socklen_t *);
 	((udpc_getpeername_fn)udpc_real(R_GETPEERNAME, "getpeername"))
 #define REAL_GETSOCKNAME \
 	((udpc_getsockname_fn)udpc_real(R_GETSOCKNAME, "getsockname"))
+
+#define REAL_GETADDRINFO \
+	((udpc_getaddrinfo_fn)udpc_real(R_GETADDRINFO, "getaddrinfo"))
+#define REAL_GETNAMEINFO \
+	((udpc_getnameinfo_fn)udpc_real(R_GETNAMEINFO, "getnameinfo"))
 
 #endif /* UDPCHAINS_REAL_H */

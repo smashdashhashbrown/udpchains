@@ -29,6 +29,9 @@
 #define UDPC_DEFAULT_MAX_DATAGRAM 8192  /* D-12: matches the reference proxy */
 #define UDPC_DEFAULT_PROXY_PORT 1080
 #define UDPC_DEFAULT_CONNECT_TIMEOUT_MS 5000
+#define UDPC_DEFAULT_DNS_PORT 53
+#define UDPC_DEFAULT_DNS_TIMEOUT_MS 5000 /* D-22: the whole lookup, all attempts */
+#define UDPC_DEFAULT_HOSTS_FILE "/etc/hosts"
 #define UDPC_MAX_DATAGRAM_CEILING 65507 /* largest a UDP payload can ever be */
 
 /* Which keys a layer set explicitly. */
@@ -40,6 +43,10 @@
 #define UDPC_SET_PASSWORD (1u << 5)
 #define UDPC_SET_VERBOSITY (1u << 6)
 #define UDPC_SET_CONFIG_PATH (1u << 7)
+#define UDPC_SET_DNS (1u << 8)
+#define UDPC_SET_DNS_TIMEOUT (1u << 9)
+#define UDPC_SET_DNS_SEARCH (1u << 10)
+#define UDPC_SET_HOSTS_FILE (1u << 11)
 
 struct udpc_config {
 	uint32_t set_mask; /* UDPC_SET_* explicitly set in this layer */
@@ -54,9 +61,18 @@ struct udpc_config {
 	bool strict_loopback;           /* D-05 R2: promote warning to error */
 	int connect_timeout_ms;
 
+	/* D-22: the resolver the shim queries through the proxy.  Numeric
+	 * only, since a named resolver would need resolving first.  There is
+	 * no default: with dns_set false, a lookup that needs DNS fails. */
+	bool dns_set;
+	char dns_spec[128];
+	struct sockaddr_storage dns;    /* resolved by udpc_config_finalize */
+	int dns_timeout_ms;
+	char dns_search[512];           /* space- or comma-separated; opt-in */
+	char hosts_file[1024];
+
 	/* SEC-03: credentials come from a file or the environment, never from
-	 * the command line.  Stored for FR-P-09, which is deferred (D-08); the
-	 * plumbing exists so that adding auth later needs no new input path. */
+	 * the command line (FR-P-09, D-20). */
 	bool have_credentials;
 	char username[256];
 	char password[256];

@@ -163,6 +163,7 @@ inspection basis is recorded in the notes below.
 | ADD-07 | D-04 | — | manual | **Verified** — README documents unproxied resolver TCP fallback |
 | ADD-08 | D-01 | — | inspection | **Implemented** — stated in README and DECISIONS; no contribution process exists yet to enforce it |
 | ADD-09 | D-14 | §4.3, §5.2 | unit-socks5, TST-05 | **Verified** — v4-mapped destinations encode as ATYP 0x01; the fixture now rejects the wrong form rather than forgiving it |
+| ADD-10 | D-22 | §11 | unit-dns, D-22-resolve, TST-03 | **Verified** — name lookups made through libc are answered locally or through the proxy, never by the host's resolver. With `dns` unset they fail `EAI_FAIL`; with the proxy down, `EAI_AGAIN`. Zero queries reach the resolver in either case, and `strace` shows no direct port-53 send in any mode. Truncated answers are repeated over SOCKS5 `CONNECT`. Supersedes D-04's "no DNS leak by construction", which was false on every supported glibc. The wire-level capture case is written but not yet run (it needs root) |
 
 ---
 

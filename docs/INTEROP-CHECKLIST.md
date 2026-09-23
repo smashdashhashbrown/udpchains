@@ -415,6 +415,35 @@ libc, so the shim cannot see it at all.
 
 ---
 
+## 11. Name resolution through a real proxy (D-22)
+
+The shim now answers libc lookups itself, sending DNS through the proxy. That path has run only
+against the fixture resolver and fixture proxy, on one host.
+
+```sh
+# a random name, so no cache along the way answers it
+N=udpc-$RANDOM.example.org
+
+./udpchains -v -p $P env UDPCHAINS_DNS=9.9.9.9 getent ahosts example.org
+UDPCHAINS_DNS=9.9.9.9 ./udpchains -v -p $P getent ahosts $N    # NXDOMAIN, through the proxy
+```
+
+Meanwhile, on this host:
+
+```sh
+sudo tcpdump -ni any port 53
+```
+
+**Pass:** `example.org` resolves; `-v` shows a `resolver association up` line naming the relay; and
+tcpdump shows **no** packet to port 53 from this host. Every query leaves inside a SOCKS datagram
+to the relay. The capture script's D-22 case (`sudo tests/test_failclosed_capture.sh`) automates the
+leak half of this.
+
+**Also worth running:** a lookup whose answer exceeds 1232 bytes, which exercises the TCP fallback
+through the proxy's `CONNECT`. `dig +short TXT` of a large SPF record from outside the shim will
+find one. Then `getent ahosts` of a name with many A records. Record whether the proxy supports
+`CONNECT` at all: D-22 fails such lookups when it does not.
+
 ## Reporting a failure
 
 Capture, in this order:

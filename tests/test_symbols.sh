@@ -38,7 +38,7 @@ want() {
 reject() {
 	for sym in "$@"; do
 		if printf '%s\n' "$SYMS" | grep -qx "$sym"; then
-			echo "not ok - $sym is hooked, but FR-I-07 says it must not be" >&2
+			echo "not ok - $sym is hooked, but must not be (see the comment above its check)" >&2
 			fail=1
 		else
 			echo "ok - $sym is correctly not hooked"
@@ -74,6 +74,19 @@ else
 	echo "# close_range hook omitted deliberately (GLIBC_NO_CLOSE_RANGE)"
 	reject close_range
 fi
+
+# D-22: glibc's resolver bypasses every socket hook, so name resolution is
+# hooked at the API.  freeaddrinfo must NOT be: results are built by glibc and
+# freed by glibc's own freeaddrinfo.
+echo "# TST-02: D-22 name resolution"
+want getaddrinfo getnameinfo getaddrinfo_a \
+	gethostbyname gethostbyname2 gethostbyname_r gethostbyname2_r \
+	gethostbyaddr gethostbyaddr_r \
+	res_query res_search res_querydomain res_send \
+	res_nquery res_nsearch res_nquerydomain res_nsend \
+	__res_query __res_search __res_querydomain __res_send \
+	__res_nquery __res_nsearch __res_nquerydomain __res_nsend
+reject freeaddrinfo
 
 echo "# TST-02: FR-I-05 introspection hooks"
 want getpeername getsockname

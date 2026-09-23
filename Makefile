@@ -63,13 +63,14 @@ WRAPPER := udpchains
 
 # Test fixtures (D-06) and test programs.  Test-only: never linked into the
 # shipped shim.
-FIXTURES := $(OBJDIR)/socks5d $(OBJDIR)/udpecho
+FIXTURES := $(OBJDIR)/socks5d $(OBJDIR)/udpecho $(OBJDIR)/dnsd
 TESTS    := $(OBJDIR)/test_config $(OBJDIR)/test_socks5 $(OBJDIR)/test_addr \
             $(OBJDIR)/test_matrix $(OBJDIR)/test_fidelity \
             $(OBJDIR)/test_lifecycle $(OBJDIR)/test_thread \
             $(OBJDIR)/leakclient $(OBJDIR)/test_faults \
             $(OBJDIR)/test_fdtable_mt $(OBJDIR)/test_portswitch \
-            $(OBJDIR)/bench_latency
+            $(OBJDIR)/bench_latency $(OBJDIR)/test_dns \
+            $(OBJDIR)/test_resolve
 
 .PHONY: all clean test check install uninstall fixtures tests
 
@@ -103,6 +104,9 @@ $(OBJDIR)/socks5d: $(TESTDIR)/fixtures/socks5d.c | $(OBJDIR)
 $(OBJDIR)/udpecho: $(TESTDIR)/fixtures/udpecho.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+$(OBJDIR)/dnsd: $(TESTDIR)/fixtures/dnsd.c | $(OBJDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # Unit tests link the shim's own objects directly rather than preloading it, so
 # they can call internal functions.
 UNIT_OBJS := $(OBJDIR)/config.o $(OBJDIR)/log.o $(OBJDIR)/addr.o \
@@ -117,7 +121,14 @@ $(OBJDIR)/test_socks5: $(TESTDIR)/test_socks5.c $(UNIT_OBJS) | $(OBJDIR)
 $(OBJDIR)/test_addr: $(TESTDIR)/test_addr.c $(UNIT_OBJS) | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS)
 
+# The DNS codec is pure, so its unit test links it alone (D-22).
+$(OBJDIR)/test_dns: $(TESTDIR)/test_dns.c $(OBJDIR)/dns.o | $(OBJDIR)
+	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS)
+
 # Integration tests run as ordinary programs under the preloaded shim.
+$(OBJDIR)/test_resolve: $(TESTDIR)/test_resolve.c | $(OBJDIR)
+	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $< $(LDFLAGS) -lresolv -lpthread
+
 $(OBJDIR)/test_matrix: $(TESTDIR)/test_matrix.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $< $(LDFLAGS)
 

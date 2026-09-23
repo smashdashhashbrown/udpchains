@@ -98,6 +98,16 @@ int udpc_socks_associate(const struct udpc_config *cfg,
                          const struct sockaddr *bind_addr,
                          struct udpc_socks_conn *conn, int *out_errno);
 
+/* Opens a TCP tunnel to dst through the proxy with SOCKS5 CONNECT (CMD 0x01),
+ * negotiating and authenticating exactly as udpc_socks_associate does.
+ * Returns a connected, non-blocking, close-on-exec descriptor whose byte stream
+ * is now dst's, or -1 with *out_errno set.
+ *
+ * Used only for the resolver's TCP fallback when a DNS answer is truncated
+ * (D-22).  Application TCP is not proxied; that remains a non-goal. */
+int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst,
+                       int *out_errno);
+
 /* Closes the control connection, which is what tells the proxy to release the
  * association (baseline §0.5). */
 /* Rewrites a BND.ADDR that cannot be taken literally.

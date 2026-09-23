@@ -21,6 +21,7 @@
  *   --frag-inject       set FRAG=1 on datagrams sent to the client
  *   --no-peer-lock      accept client datagrams from any source address
  *   --reject-atyp N     reject requests carrying this ATYP
+ *   --no-connect        refuse CONNECT (the shim's DNS-over-TCP fallback, D-22)
  *   --quiet             suppress the per-datagram log
  *
  * Prints "PORT <n>" on stdout once listening, so tests can use an ephemeral
@@ -49,6 +50,7 @@
 #define METHOD_NONE 0x00
 #define METHOD_USERPASS 0x02
 #define METHOD_UNACCEPTABLE 0xff
+#define CMD_CONNECT 0x01
 #define CMD_UDP_ASSOCIATE 0x03
 
 #define ATYP_IPV4 0x01
@@ -73,8 +75,9 @@ static struct {
 	bool dead_relay;
 	const char *auth_user;
 	const char *auth_pass;
+	bool no_connect;
 } opt = { 0, false, false, 0, 0, 0, 8192, false, true, -1, false, false,
-          "testuser", "testpass" };
+          "testuser", "testpass", false };
 
 static void logf_(const char *fmt, ...)
 	__attribute__((format(printf, 1, 2)));
@@ -307,6 +310,69 @@ static size_t encode_hdr(uint8_t *buf, const struct sockaddr *src, uint8_t frag)
 	}
 }
 
+/* CONNECT (CMD 0x01): open a TCP connection to the requested address and
+ * splice the two streams until either side closes.  Exists for the shim's
+ * DNS-over-TCP fallback (D-22); the shim proxies no application TCP. */
+static void serve_connect(int cfd, const uint8_t *req, uint8_t atyp)
+{
+	struct sockaddr_storage dst;
+	uint8_t frag, a, hdr[HDR_MAX], out[10], io[16384];
+	int up = -1;
+	char abuf[128];
+
+	/* The request tail has the shape of a UDP header less RSV+FRAG, so the
+	 * same decoder serves both. */
+	memset(hdr, 0, 3);
+	hdr[3] = atyp;
+	memcpy(hdr + 4, req + 4, atyp == ATYP_IPV4 ? 6 : atyp == ATYP_IPV6 ? 18
+	                                                  : (size_t)req[4] + 3);
+	if (decode_hdr(hdr, sizeof(hdr), &frag, &a, &dst) < 0) {
+		logf_("CONNECT: undecodable destination");
+		return;
+	}
+
+	up = socket(dst.ss_family, SOCK_STREAM, 0);
+	memset(out, 0, sizeof(out));
+	out[0] = SOCKS_VER;
+	out[3] = ATYP_IPV4;
+	if (up < 0 || connect(up, (struct sockaddr *)&dst,
+	                      sa_len((struct sockaddr *)&dst)) != 0) {
+		logf_("CONNECT %s failed: %s",
+		      sa_str((struct sockaddr *)&dst, abuf, sizeof(abuf)),
+		      strerror(errno));
+		out[1] = 0x05; /* connection refused */
+		(void)write_all(cfd, out, 10);
+		if (up >= 0)
+			close(up);
+		return;
+	}
+	logf_("CONNECT %s", sa_str((struct sockaddr *)&dst, abuf, sizeof(abuf)));
+	out[1] = 0x00;
+	if (write_all(cfd, out, 10) != 0) {
+		close(up);
+		return;
+	}
+
+	for (;;) {
+		struct pollfd pfd[2] = { { cfd, POLLIN, 0 }, { up, POLLIN, 0 } };
+		ssize_t n;
+
+		if (poll(pfd, 2, -1) < 0 && errno != EINTR)
+			break;
+		if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+			n = read(cfd, io, sizeof(io));
+			if (n <= 0 || write_all(up, io, (size_t)n) != 0)
+				break;
+		}
+		if (pfd[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+			n = read(up, io, sizeof(io));
+			if (n <= 0 || write_all(cfd, io, (size_t)n) != 0)
+				break;
+		}
+	}
+	close(up);
+}
+
 struct client {
 	int control_fd;
 	int family;
@@ -412,6 +478,8 @@ static void *client_thread(void *arg)
 		uint8_t cmd = buf[1], atyp = buf[3];
 		size_t rest;
 
+		size_t at = 4;
+
 		if (atyp == ATYP_IPV4)
 			rest = 6;
 		else if (atyp == ATYP_IPV6)
@@ -420,11 +488,16 @@ static void *client_thread(void *arg)
 			if (read_all(cfd, buf + 4, 1) != 0)
 				goto done;
 			rest = (size_t)buf[4] + 2;
+			at = 5;
 		} else
 			goto done;
-		if (read_all(cfd, buf + 8, rest) != 0)
+		if (read_all(cfd, buf + at, rest) != 0)
 			goto done;
 
+		if (cmd == CMD_CONNECT && !opt.no_connect) {
+			serve_connect(cfd, buf, atyp);
+			goto done;
+		}
 		if (cmd != CMD_UDP_ASSOCIATE) {
 			out[0] = SOCKS_VER;
 			out[1] = 0x07; /* command not supported */
@@ -731,6 +804,8 @@ int main(int argc, char **argv)
 			opt.auth_user = argv[++i];
 		else if (strcmp(a, "--auth-pass") == 0 && i + 1 < argc)
 			opt.auth_pass = argv[++i];
+		else if (strcmp(a, "--no-connect") == 0)
+			opt.no_connect = true;
 		else {
 			fprintf(stderr, "socks5d: unknown option %s\n", a);
 			return 1;

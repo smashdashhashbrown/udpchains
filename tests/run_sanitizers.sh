@@ -104,6 +104,9 @@ start_fixtures() {
 	PIDS+=($!)
 	"$BUILD/udpecho" --port 0 -6 --quiet > "$TMP/e6.out" 2>&1 &
 	PIDS+=($!)
+	# The D-22 resolver's test zone.
+	"$BUILD/dnsd" --port 0 --quiet > "$TMP/dns.out" 2>&1 &
+	PIDS+=($!)
 
 	local i
 	for ((i = 0; i < 200; i++)); do
@@ -111,8 +114,9 @@ start_fixtures() {
 		ECHO1=$(awk '/^PORT/{print $2; exit}' "$TMP/e1.out" 2>/dev/null)
 		ECHO2=$(awk '/^PORT/{print $2; exit}' "$TMP/e2.out" 2>/dev/null)
 		ECHO6=$(awk '/^PORT/{print $2; exit}' "$TMP/e6.out" 2>/dev/null)
+		DNS=$(awk '/^PORT/{print $2; exit}' "$TMP/dns.out" 2>/dev/null)
 		[ -n "$PROXY" ] && [ -n "$ECHO1" ] && [ -n "$ECHO2" ] &&
-			[ -n "$ECHO6" ] && return 0
+			[ -n "$ECHO6" ] && [ -n "$DNS" ] && return 0
 		sleep 0.05
 	done
 	echo "FATAL: fixtures did not start" >&2
@@ -159,7 +163,7 @@ run_asan() {
 	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0:exitcode=99"
 
 	local t rc
-	for t in test_addr test_config test_socks5; do
+	for t in test_addr test_config test_socks5 test_dns; do
 		echo "--- $t"
 		"$BUILD/$t" > "$TMP/$t.out" 2>&1
 		rc=$?
@@ -237,6 +241,18 @@ run_valgrind() {
 		"$BUILD/test_lifecycle" "$ECHO1" "$ECHO2" > "$TMP/vg_life.out" 2>&1
 	rc=$?
 	report lifecycle "$TMP/vg_life.out" "$rc"
+
+	# D-22: the resolver -- its pool, both transports and every hook --
+	# under the real preloaded shim.  The timeout is raised because
+	# Valgrind runs everything an order of magnitude slower.
+	echo "--- resolve"
+	printf '127.0.0.1\tlocalhost\n203.0.113.5\thostsonly.test\n' > "$TMP/hosts"
+	UDPCHAINS_DNS="127.0.0.1:$DNS" UDPCHAINS_DNS_SEARCH=search.test \
+	UDPCHAINS_DNS_TIMEOUT=20000 UDPCHAINS_HOSTS_FILE="$TMP/hosts" \
+	LD_PRELOAD="$ROOT/libudpchains.so" "${VG[@]}" \
+		"$BUILD/test_resolve" main > "$TMP/vg_resolve.out" 2>&1
+	rc=$?
+	report resolve "$TMP/vg_resolve.out" "$rc"
 
 	stop_fixtures
 	unset UDPCHAINS_PROXY UDPCHAINS_QUIET

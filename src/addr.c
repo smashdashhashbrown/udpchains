@@ -234,8 +234,25 @@ int udpc_addr_for_family(const struct sockaddr *in, int family,
 	return -1;
 }
 
+static int addr_parse(const char *spec, uint16_t default_port,
+                      struct sockaddr_storage *ss, const char **err,
+                      int gai_flags);
+
 int udpc_addr_parse(const char *spec, uint16_t default_port,
                     struct sockaddr_storage *ss, const char **err)
+{
+	return addr_parse(spec, default_port, ss, err, 0);
+}
+
+int udpc_addr_parse_numeric(const char *spec, uint16_t default_port,
+                            struct sockaddr_storage *ss, const char **err)
+{
+	return addr_parse(spec, default_port, ss, err, AI_NUMERICHOST);
+}
+
+static int addr_parse(const char *spec, uint16_t default_port,
+                      struct sockaddr_storage *ss, const char **err,
+                      int gai_flags)
 {
 	char hostbuf[256];
 	char portbuf[16];
@@ -318,9 +335,11 @@ int udpc_addr_parse(const char *spec, uint16_t default_port,
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM; /* the control connection is TCP */
+	hints.ai_flags = gai_flags;
 	if (getaddrinfo(host, port, &hints, &res) != 0 || res == NULL) {
 		if (err)
-			*err = "cannot resolve host";
+			*err = (gai_flags & AI_NUMERICHOST) ? "not a numeric address"
+			                                    : "cannot resolve host";
 		return -1;
 	}
 

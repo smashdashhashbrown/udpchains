@@ -209,6 +209,81 @@ else
 	notok "working proxy: nothing reached the destination at all; the relay path is broken"
 fi
 
+# --- 5. name lookups (D-22) ---------------------------------------------------
+#
+# glibc's resolver makes its socket calls through internal aliases, so before
+# D-22 a lookup went to the host's resolver whatever the proxy was doing.  The
+# datagram cases above cannot see that: the leak is to port 53, not to DEST.
+#
+# Captures on loopback as well as $IFACE, because a host running
+# systemd-resolved sends every libc lookup to 127.0.0.53 first, and echoes how
+# many packets to port 53 either saw.
+dns_capture_run() {
+	local tag=$1; shift
+	local ifs="lo" f i c total=0
+	local -a tpids=()
+
+	[ "$IFACE" != "lo" ] && [ "$IFACE" != "any" ] && ifs="lo $IFACE"
+	for f in $ifs; do
+		tcpdump -i "$f" -n -p -U --immediate-mode -w "$TMP/$tag.$f.pcap" \
+			udp or tcp > "$TMP/$tag.$f.tcpdump" 2>&1 &
+		tpids+=($!)
+		PIDS+=($!)
+	done
+	for f in $ifs; do
+		for ((i = 0; i < 100; i++)); do
+			grep -q "listening on" "$TMP/$tag.$f.tcpdump" 2>/dev/null && break
+			sleep 0.05
+		done
+	done
+
+	sleep 0.5
+	"$@" > "$TMP/$tag.client" 2>&1
+	sleep 2
+
+	for f in "${tpids[@]}"; do
+		kill -INT "$f" 2>/dev/null
+		wait "$f" 2>/dev/null
+	done
+	for f in $ifs; do
+		c=$(tcpdump -r "$TMP/$tag.$f.pcap" "dst port 53" 2>/dev/null | grep -c . || true)
+		total=$((total + ${c:-0}))
+	done
+	echo "$total"
+}
+
+# A fresh name each run, so no cache along the way can answer it silently.
+dns_name() { echo "udpc-$$-$RANDOM.example.org"; }
+# getent prints one line per address it resolved, and nothing on failure.
+resolved() { grep -cE '^[0-9a-fA-F:.]+[[:space:]]' "$TMP/$1.client" || true; }
+
+if command -v getent > /dev/null 2>&1; then
+	got=$(dns_capture_run dnscontrol env -u LD_PRELOAD getent ahosts "$(dns_name)")
+	if [ "${got:-0}" -gt 0 ]; then
+		ok "DNS POSITIVE CONTROL: an unproxied lookup IS captured ($got packets to port 53)"
+
+		got=$(dns_capture_run dnsdown env UDPCHAINS_PROXY=127.0.0.1:9 \
+			UDPCHAINS_DNS=192.0.2.53 UDPCHAINS_QUIET=1 \
+			"$WRAPPER" getent ahosts "$(dns_name)")
+		[ "$(resolved dnsdown)" = "0" ] && ok "lookup with the proxy down: fails" \
+			|| notok "lookup with the proxy down: it RESOLVED"
+		[ "${got:-1}" -eq 0 ] && ok "lookup with the proxy down: ZERO packets to port 53" \
+			|| notok "LEAK: $got packets to port 53 with the proxy down"
+
+		got=$(dns_capture_run dnsunset env -u UDPCHAINS_DNS \
+			"UDPCHAINS_PROXY=127.0.0.1:$LPORT" UDPCHAINS_QUIET=1 \
+			"$WRAPPER" getent ahosts "$(dns_name)")
+		[ "$(resolved dnsunset)" = "0" ] && ok "lookup with no dns configured: fails" \
+			|| notok "lookup with no dns configured: it RESOLVED"
+		[ "${got:-1}" -eq 0 ] && ok "lookup with no dns configured: ZERO packets to port 53" \
+			|| notok "LEAK: $got packets to port 53 with no resolver configured"
+	else
+		notok "DNS POSITIVE CONTROL FAILED: an unproxied lookup put nothing on the wire, so the D-22 cases would prove nothing. nscd, or no resolver at all? See KEEP_TMP=1"
+	fi
+else
+	echo "# SKIP D-22 lookups -- getent not installed"
+fi
+
 echo "#"
 echo "# NOTE: the both-ways-round check needs a proxy on another host, where any"
 echo "# packet to the destination leaving THIS host is unambiguously a leak."

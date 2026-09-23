@@ -22,6 +22,9 @@ void udpc_config_defaults(struct udpc_config *cfg)
 	udpc_config_init(cfg);
 	cfg->max_datagram = UDPC_DEFAULT_MAX_DATAGRAM;
 	cfg->connect_timeout_ms = UDPC_DEFAULT_CONNECT_TIMEOUT_MS;
+	cfg->dns_timeout_ms = UDPC_DEFAULT_DNS_TIMEOUT_MS;
+	snprintf(cfg->hosts_file, sizeof(cfg->hosts_file), "%s",
+	         UDPC_DEFAULT_HOSTS_FILE);
 	cfg->strict_loopback = false;
 	cfg->verbosity = UDPC_NORMAL;
 	/* proxy deliberately left unset: D-10. */
@@ -53,6 +56,16 @@ void udpc_config_merge(struct udpc_config *dst, const struct udpc_config *src)
 		dst->verbosity = src->verbosity;
 	if (m & UDPC_SET_CONFIG_PATH)
 		memcpy(dst->config_path, src->config_path, sizeof(dst->config_path));
+	if (m & UDPC_SET_DNS) {
+		memcpy(dst->dns_spec, src->dns_spec, sizeof(dst->dns_spec));
+		dst->dns_set = src->dns_set;
+	}
+	if (m & UDPC_SET_DNS_TIMEOUT)
+		dst->dns_timeout_ms = src->dns_timeout_ms;
+	if (m & UDPC_SET_DNS_SEARCH)
+		memcpy(dst->dns_search, src->dns_search, sizeof(dst->dns_search));
+	if (m & UDPC_SET_HOSTS_FILE)
+		memcpy(dst->hosts_file, src->hosts_file, sizeof(dst->hosts_file));
 
 	dst->set_mask |= m;
 }
@@ -155,6 +168,43 @@ int udpc_config_set(struct udpc_config *cfg, const char *key, const char *value,
 		}
 		cfg->connect_timeout_ms = (int)n;
 		cfg->set_mask |= UDPC_SET_CONNECT_TIMEOUT;
+		return 0;
+	}
+	if (strcmp(key, "dns") == 0) {
+		if (strlen(value) >= sizeof(cfg->dns_spec)) {
+			*err = "dns address too long";
+			return -1;
+		}
+		snprintf(cfg->dns_spec, sizeof(cfg->dns_spec), "%s", value);
+		cfg->dns_set = true;
+		cfg->set_mask |= UDPC_SET_DNS;
+		return 0;
+	}
+	if (strcmp(key, "dns_timeout") == 0) {
+		if (parse_long(value, 100, 600000, &n) != 0) {
+			*err = "dns_timeout must be 100..600000 ms";
+			return -1;
+		}
+		cfg->dns_timeout_ms = (int)n;
+		cfg->set_mask |= UDPC_SET_DNS_TIMEOUT;
+		return 0;
+	}
+	if (strcmp(key, "dns_search") == 0) {
+		if (strlen(value) >= sizeof(cfg->dns_search)) {
+			*err = "dns_search too long";
+			return -1;
+		}
+		snprintf(cfg->dns_search, sizeof(cfg->dns_search), "%s", value);
+		cfg->set_mask |= UDPC_SET_DNS_SEARCH;
+		return 0;
+	}
+	if (strcmp(key, "hosts_file") == 0) {
+		if (value[0] == '\0' || strlen(value) >= sizeof(cfg->hosts_file)) {
+			*err = "hosts_file must be a path";
+			return -1;
+		}
+		snprintf(cfg->hosts_file, sizeof(cfg->hosts_file), "%s", value);
+		cfg->set_mask |= UDPC_SET_HOSTS_FILE;
 		return 0;
 	}
 	if (strcmp(key, "username") == 0) {
@@ -319,6 +369,10 @@ static const struct env_key g_env_keys[] = {
 	{ "UDPCHAINS_CONNECT_TIMEOUT", "connect_timeout" },
 	{ "UDPCHAINS_USERNAME", "username" },
 	{ "UDPCHAINS_PASSWORD_FILE", "password_file" },
+	{ "UDPCHAINS_DNS", "dns" },
+	{ "UDPCHAINS_DNS_TIMEOUT", "dns_timeout" },
+	{ "UDPCHAINS_DNS_SEARCH", "dns_search" },
+	{ "UDPCHAINS_HOSTS_FILE", "hosts_file" },
 };
 
 int udpc_config_from_env(struct udpc_config *cfg, const char **err)
@@ -385,6 +439,20 @@ int udpc_config_finalize(struct udpc_config *cfg, const char **err)
 
 	if (cfg->max_datagram == 0)
 		cfg->max_datagram = UDPC_DEFAULT_MAX_DATAGRAM;
+
+	/* D-22: a resolver named by hostname would need a lookup before
+	 * lookups work, and that lookup could only go direct.  Refused here,
+	 * so the wrapper reports it before exec (FR-C-03). */
+	if (cfg->dns_set && cfg->dns_spec[0] != '\0') {
+		if (udpc_addr_parse_numeric(cfg->dns_spec, UDPC_DEFAULT_DNS_PORT,
+		                            &cfg->dns, &perr) != 0) {
+			*err = "dns must be a numeric address, as ip or ip:port "
+			       "or [v6]:port";
+			return -1;
+		}
+	} else {
+		cfg->dns_set = false;
+	}
 
 	return 0;
 }
@@ -477,6 +545,26 @@ int udpc_config_export(const struct udpc_config *cfg)
 
 	if (setenv("UDPCHAINS_STRICT_LOOPBACK", cfg->strict_loopback ? "1" : "0",
 	           1) != 0)
+		return -1;
+
+	/* D-22 resolver settings.  An unset dns is exported as unset, never as
+	 * a default: the shim must fail lookups rather than pick a resolver. */
+	if (cfg->dns_set) {
+		if (setenv("UDPCHAINS_DNS", cfg->dns_spec, 1) != 0)
+			return -1;
+	} else {
+		unsetenv("UDPCHAINS_DNS");
+	}
+	snprintf(buf, sizeof(buf), "%d", cfg->dns_timeout_ms);
+	if (setenv("UDPCHAINS_DNS_TIMEOUT", buf, 1) != 0)
+		return -1;
+	if (cfg->dns_search[0] != '\0') {
+		if (setenv("UDPCHAINS_DNS_SEARCH", cfg->dns_search, 1) != 0)
+			return -1;
+	} else {
+		unsetenv("UDPCHAINS_DNS_SEARCH");
+	}
+	if (setenv("UDPCHAINS_HOSTS_FILE", cfg->hosts_file, 1) != 0)
 		return -1;
 
 	/* Verbosity is exported as the resolved level so the shim does not have
