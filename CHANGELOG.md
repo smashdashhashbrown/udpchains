@@ -133,6 +133,10 @@ Documented in full in the README's *Security considerations* and *What does not 
   the proxy's relay are neither authenticated nor encrypted.
 - **Raw sockets are not intercepted** (D-18). A program using `SOCK_RAW` reaches the network
   directly, with no diagnostic. Raw sockets require `CAP_NET_RAW`. Refusing them is the v2 change.
+- **Some sends bypass the shim** (D-21): `io_uring`, `sendfile` and `splice` onto a UDP socket,
+  and stdio on one (`fdopen`), send directly, with no diagnostic, on a socket not yet used
+  through the shim. A socket copied from another process with `pidfd_getfd` is never tracked, so
+  every send on it goes directly.
 - **LSM denials may still leak** (D-19). The pre-`exec` loadability probe runs in the wrapper's
   security domain; if the target transitions to a confined domain on `exec`, the probe can pass
   while the target is denied and runs unproxied.

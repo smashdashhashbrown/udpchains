@@ -258,6 +258,19 @@ reaches the network directly. See
 .I DECISIONS.md
 D\-18.
 .PP
+.B Some sends bypass the shim.
+.BR io_uring ,
+.BR sendfile (2)
+and
+.BR splice (2)
+onto a UDP socket, and stdio on one
+.RB ( fdopen (3)),
+never reach an interposed function: on a socket not yet used through the
+shim, each sends directly, with no diagnostic.
+A socket copied from another process with
+.BR pidfd_getfd (2)
+is never tracked, so every send on it goes directly.
+.PP
 TCP is not proxied. Multicast and broadcast fail with
 .BR ENETUNREACH .
 A loopback destination is resolved at the proxy, so with a remote proxy it

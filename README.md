@@ -16,7 +16,9 @@ through the proxy" is wrong for UDP.
 
 `udpchains` carries UDP, and **fails closed**: if a datagram cannot be proxied, the call fails with
 an appropriate `errno`. It never falls back to sending directly. There is a test for exactly this —
-with the proxy stopped, zero packets reach the destination by any path.
+with the proxy stopped, zero packets reach the destination by any of the send paths it exercises.
+A few routes the shim cannot see are listed under
+[Traffic it deliberately refuses](#traffic-it-deliberately-refuses).
 
 ## Build and install
 
@@ -195,7 +197,8 @@ private.
   address is known only to `udpchains`, and most proxies accept inbound datagrams only from hosts
   the program has already sent to. This fails closed — nothing arrives directly either — but a
   server that only receives looks healthy while receiving nothing.
-- **Raw sockets are not covered.** See below.
+- **A few routes bypass the shim:** raw sockets, `io_uring`, `sendfile`/`splice`, stdio on a UDP
+  socket, and sockets taken from another process with `pidfd_getfd`. See below.
 
 To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
@@ -220,8 +223,8 @@ This section is the honest part. Read it before deciding whether this tool suits
 makes the leak test meaningful — a bypass rule set would need its own list of expected direct
 traffic, and that list is exactly where a leak hides.
 
-> **The one exception, and it is a real one: raw sockets.** The shim intercepts `SOCK_DGRAM` in
-> `AF_INET`/`AF_INET6` and nothing else. A program that opens a `SOCK_RAW` socket gets unproxied
+> **Exceptions, and they are real ones.** The first is **raw sockets.** The shim intercepts
+> `SOCK_DGRAM` in `AF_INET`/`AF_INET6` and nothing else. A program that opens a `SOCK_RAW` socket gets unproxied
 > network access, with no diagnostic and nothing in the logs — the shim never sees it. SOCKS5 cannot
 > express a raw IP packet, so there is no honest way to proxy it, but "cannot proxy" should mean
 > "refuse", and today it means "pass through". Raw sockets need `CAP_NET_RAW`, so this is not
@@ -229,6 +232,23 @@ traffic, and that list is exactly where a leak hides.
 > that a **privileged** process cannot reach the network directly, it does not. Deferred rather than
 > dropped; refusing raw socket creation the way multicast and broadcast sends already fail is the
 > obvious v2 change.
+>
+> The others are routes by which a program can send on a UDP socket without calling any function
+> the shim interposes on. On a socket not yet used through the shim, each sends **directly**, with
+> no diagnostic; on one already pointed at the relay, the data arrives there without a header and
+> is lost (D-21):
+>
+> - **`io_uring`.** Sends submitted through an `io_uring` ring go straight to the kernel. Event
+>   loops increasingly use it.
+> - **`sendfile` and `splice`** onto a UDP socket.
+> - **stdio on a UDP socket** (`fdopen`, then `fwrite`): glibc writes through internal calls.
+>   Reading that way (`fread`) returns the SOCKS header as data.
+> - **`pidfd_getfd`**, which copies a socket out of another process. The copy is never tracked,
+>   so even ordinary sends on it go directly.
+>
+> None of these needs root (`pidfd_getfd` needs permission to trace the other process). They are
+> unusual for UDP, but if you rely on this tool to guarantee that a program cannot reach the
+> network directly, check that it uses none of them.
 
 Consequences you will actually notice:
 
