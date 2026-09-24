@@ -45,6 +45,20 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
   D-30)
 - [x] **M9 (ii)** — forked children kept the parent's control connections. (dba3c76, D-31)
 - [x] **M10** — the signal-safety claim is corrected; NFR-03 is marked partial. (dba3c76)
+- [x] **L1** — `connect()` and `sendto()` read past a short address; now `EINVAL`, or
+  `EAFNOSUPPORT` for another family. (8eb4c80)
+- [x] **L2** — a `NULL` `msg_iov` crashed, `msg_iovlen` was truncated to `int`, and `IOV_MAX`
+  buffers overflowed the kernel limit. Now `EFAULT`, `EMSGSIZE`, and working. A non-`NULL` invalid
+  pointer still faults; documented in the README. (8eb4c80)
+- [x] **L4** — per-datagram warnings are rate-limited, nothing is written unless fd 2 is still the
+  original stderr, and `-q` means errors only. (8eb4c80, D-33)
+- [x] **L5** — password-file limit and `\r\n`, the readable-config warning, a boolean
+  `UDPCHAINS_QUIET`, and indented overlong lines; the password-file warning is given once.
+  (8eb4c80, D-33)
+- [x] **L6** — a forked child binds its private socket again, and stops declaring an address it
+  cannot bind. (8eb4c80, D-34)
+- [x] **L7** — only hooks are exported, and the library is hardened; first-address-only is
+  documented, not fixed. (8eb4c80, D-35)
 
 ## Critical
 
@@ -60,38 +74,7 @@ None open.
 
 ## Low
 
-- [ ] **L1** — `connect()` and `sendto()` copy the family's full address size regardless of the
-  `addrlen` passed (`src/hooks.c` connect hook, `src/core.c:234`), so they can read past a short
-  buffer. The kernel would return `EINVAL`.
-  - **Fixed, awaiting commit.** Too short for the family is `EINVAL`; other families are
-    `EAFNOSUPPORT`.
-- [ ] **L2** — a bad `msg_iov` pointer segfaults instead of returning `EFAULT`; `msg_iovlen` is
-  truncated to `int`; 1024 iovecs plus the header iovec exceeds `UIO_MAXIOV`.
-  - **Fixed, awaiting commit.** `NULL` is `EFAULT`, over `IOV_MAX` is `EMSGSIZE`, and exactly
-    `IOV_MAX` works. Residual, documented in the README: a non-`NULL` invalid pointer still
-    faults inside the shim.
-- [ ] **L4** — per-datagram warnings (oversized inbound, multicast) are not rate-limited. Logs are
-  written to fd 2 even if the app has reused it for a file or socket.
-  - **Fixed (D-33), awaiting commit.** Rate-limited to one a second per kind; nothing is
-    written unless fd 2 is still the original stderr. `-q` now also means errors only.
-- [ ] **L5** — config and password-file handling:
-  - A password file is silently truncated at 255 bytes, and a Windows line ending (`\r\n`) is not
-    stripped.
-  - There is no warning when a config file containing `password =` is readable by others.
-  - Any value of `UDPCHAINS_QUIET`, including `0`, enables quiet mode.
-  - Overlong-line detection misses lines with leading whitespace (`src/config.c:253`).
-  - **Fixed, awaiting commit.** All four; the password-file permission warning is also given
-    once rather than twice (D-33).
-- [ ] **L6** — post-fork `reprivatize_socket` ignores a failed `bind()` and loses a
-  wildcard-with-port binding (`src/assoc.c:249`).
-  - **Fixed (D-34), awaiting commit.** Option (b): bind again, and on failure stop declaring
-    the address and warn once.
-- [ ] **L7** — build and address resolution:
-  - Internal `udpc_*` symbols are exported (no `-fvisibility=hidden`).
-  - There are no hardening flags (`-fstack-protector-strong`, `-z relro -z now`).
-  - `udpc_addr_parse` uses only the first `getaddrinfo` result.
-  - **Symbols and hardening fixed (D-35); first-address-only documented, not fixed. Awaiting
-    commit.**
+None open.
 
 ## Documentation
 
@@ -146,8 +129,11 @@ None open.
 
 ## Verification still owed
 
-- [ ] **C4 wire check** — run the capture script's D-22 case, which needs root:
-  `sudo tests/test_failclosed_capture.sh`. Its client commands were checked without root.
+- [x] **C4 wire check** — run the capture script's D-22 case, which needs root:
+  `sudo tests/test_failclosed_capture.sh`. Run on 2026-09-24; all 14 checks pass. A first run
+  failed the two DNS leak checks on other programs' lookups, since the check counted every port-53
+  packet on the host. `strace` showed the proxied process made no port-53 call, and the check now
+  counts only packets carrying its own lookup name.
 - [ ] **C4 interop** — name resolution against a real proxy and resolver, INTEROP-CHECKLIST.md §11,
   including whether that proxy supports `CONNECT` for the TCP fallback.
 

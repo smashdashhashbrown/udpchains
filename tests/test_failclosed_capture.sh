@@ -216,11 +216,16 @@ fi
 # datagram cases above cannot see that: the leak is to port 53, not to DEST.
 #
 # Captures on loopback as well as $IFACE, because a host running
-# systemd-resolved sends every libc lookup to 127.0.0.53 first, and echoes how
-# many packets to port 53 either saw.
+# systemd-resolved sends every libc lookup to 127.0.0.53 first.
+#
+# Every process on the host shares that resolver, so a lookup by anything else
+# during the window -- NetworkManager, snapd, a browser -- also puts packets on
+# port 53.  Counting those failed the leak cases at random.  Each case looks up
+# a name of its own, and only packets carrying that name count; the rest are
+# reported and ignored.  Echoes "<carrying the name> <unrelated>".
 dns_capture_run() {
-	local tag=$1; shift
-	local ifs="lo" f i c total=0
+	local tag=$1 name=$2; shift 2
+	local ifs="lo" f i c u mine=0 other=0
 	local -a tpids=()
 
 	[ "$IFACE" != "lo" ] && [ "$IFACE" != "any" ] && ifs="lo $IFACE"
@@ -245,11 +250,23 @@ dns_capture_run() {
 		kill -INT "$f" 2>/dev/null
 		wait "$f" 2>/dev/null
 	done
+	# -i: a resolver may randomise the case of a query name (DNS 0x20).
 	for f in $ifs; do
-		c=$(tcpdump -r "$TMP/$tag.$f.pcap" "dst port 53" 2>/dev/null | grep -c . || true)
-		total=$((total + ${c:-0}))
+		tcpdump -n -r "$TMP/$tag.$f.pcap" "dst port 53" 2>/dev/null \
+			> "$TMP/$tag.$f.dns"
+		c=$(grep -ciF -- "$name" "$TMP/$tag.$f.dns" || true)
+		u=$(grep -viF -- "$name" "$TMP/$tag.$f.dns" | grep -c . || true)
+		mine=$((mine + ${c:-0}))
+		other=$((other + ${u:-0}))
 	done
-	echo "$total"
+	echo "$mine $other"
+}
+
+# One line naming the packets ignored, if any.
+dns_note_other() {
+	[ "$1" -gt 0 ] &&
+		echo "# ($1 unrelated port-53 packets from other processes ignored)"
+	return 0
 }
 
 # A fresh name each run, so no cache along the way can answer it silently.
@@ -258,27 +275,36 @@ dns_name() { echo "udpc-$$-$RANDOM.example.org"; }
 resolved() { grep -cE '^[0-9a-fA-F:.]+[[:space:]]' "$TMP/$1.client" || true; }
 
 if command -v getent > /dev/null 2>&1; then
-	got=$(dns_capture_run dnscontrol env -u LD_PRELOAD getent ahosts "$(dns_name)")
+	name=$(dns_name)
+	read -r got other < <(dns_capture_run dnscontrol "$name" \
+		env -u LD_PRELOAD getent ahosts "$name")
 	if [ "${got:-0}" -gt 0 ]; then
-		ok "DNS POSITIVE CONTROL: an unproxied lookup IS captured ($got packets to port 53)"
+		ok "DNS POSITIVE CONTROL: an unproxied lookup IS captured ($got packets to port 53 asking for its name)"
+		dns_note_other "${other:-0}"
 
-		got=$(dns_capture_run dnsdown env UDPCHAINS_PROXY=127.0.0.1:9 \
+		name=$(dns_name)
+		read -r got other < <(dns_capture_run dnsdown "$name" \
+			env UDPCHAINS_PROXY=127.0.0.1:9 \
 			UDPCHAINS_DNS=192.0.2.53 UDPCHAINS_QUIET=1 \
-			"$WRAPPER" getent ahosts "$(dns_name)")
+			"$WRAPPER" getent ahosts "$name")
 		[ "$(resolved dnsdown)" = "0" ] && ok "lookup with the proxy down: fails" \
 			|| notok "lookup with the proxy down: it RESOLVED"
-		[ "${got:-1}" -eq 0 ] && ok "lookup with the proxy down: ZERO packets to port 53" \
-			|| notok "LEAK: $got packets to port 53 with the proxy down"
+		[ "${got:-1}" -eq 0 ] && ok "lookup with the proxy down: ZERO packets to port 53 asking for its name" \
+			|| notok "LEAK: $got packets to port 53 asking for $name with the proxy down"
+		dns_note_other "${other:-0}"
 
-		got=$(dns_capture_run dnsunset env -u UDPCHAINS_DNS \
+		name=$(dns_name)
+		read -r got other < <(dns_capture_run dnsunset "$name" \
+			env -u UDPCHAINS_DNS \
 			"UDPCHAINS_PROXY=127.0.0.1:$LPORT" UDPCHAINS_QUIET=1 \
-			"$WRAPPER" getent ahosts "$(dns_name)")
+			"$WRAPPER" getent ahosts "$name")
 		[ "$(resolved dnsunset)" = "0" ] && ok "lookup with no dns configured: fails" \
 			|| notok "lookup with no dns configured: it RESOLVED"
-		[ "${got:-1}" -eq 0 ] && ok "lookup with no dns configured: ZERO packets to port 53" \
-			|| notok "LEAK: $got packets to port 53 with no resolver configured"
+		[ "${got:-1}" -eq 0 ] && ok "lookup with no dns configured: ZERO packets to port 53 asking for its name" \
+			|| notok "LEAK: $got packets to port 53 asking for $name with no resolver configured"
+		dns_note_other "${other:-0}"
 	else
-		notok "DNS POSITIVE CONTROL FAILED: an unproxied lookup put nothing on the wire, so the D-22 cases would prove nothing. nscd, or no resolver at all? See KEEP_TMP=1"
+		notok "DNS POSITIVE CONTROL FAILED: no packet to port 53 asked for the looked-up name, so the D-22 cases would prove nothing. nscd, or no resolver at all? See KEEP_TMP=1"
 	fi
 else
 	echo "# SKIP D-22 lookups -- getent not installed"

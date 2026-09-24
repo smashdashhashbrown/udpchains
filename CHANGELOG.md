@@ -158,8 +158,10 @@ proxy down — and one was the FR-I-02 defect the project exists to prevent. See
   the tests count what reached the fixture resolver and check with `strace` that the process never
   addressed a resolver directly — against the previous shim, that check finds 10–13 direct
   port-53 sends. The resolver is clean under ASan/UBSan (codec), Valgrind memcheck and Helgrind
-  (the association pool). The wire-level capture script gains a DNS case, **not yet run**: it
-  needs root.
+  (the association pool). The wire-level capture script gains a DNS case. Run as root on 2026-09-24:
+  no packet asked for the looked-up name with the proxy down, or with no `dns` set. An earlier run
+  failed both cases because it counted every port-53 packet on the host, including other programs'
+  lookups; the check now counts only packets carrying its own name.
 - H1–H4 (D-23–D-26). Each new test fails, or hangs, against the previous shim:
   - The lifecycle test covers a stale entry reused by a TCP socket, which hung; `syscall(SYS_close)`
     and `closefrom()` releasing at once; and a close-all loop, `close_range`, `close()` and `dup2()`
