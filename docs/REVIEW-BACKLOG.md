@@ -21,6 +21,19 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
 - [x] **C4** — glibc's resolver leaked every libc name lookup to the host's resolver, since its
   internal calls bypass the hooks. Lookups are now answered locally or through the proxy, and fail
   closed otherwise. (98e715e, D-22; follow-ups under *Verification still owed* below)
+- [x] **H1** — a stale fd-table entry took over whatever the kernel next put at its number: a TCP
+  socket's `connect()` was swallowed, a Unix socket's `write()` failed. Every intercepted call now
+  confirms the socket's kernel cookie; `closefrom()` and the lifecycle calls of `syscall()` are
+  hooked. (da42f4e, D-23)
+- [x] **H2** — a use-after-free when threads share a socket and one sees the association expire.
+  Associations are type-stable and read through one counted reference per datagram. (da42f4e,
+  D-24)
+- [x] **H3** — the wrapper exported the password itself into the target's environment. It now
+  exports only where the password is. (da42f4e, D-25)
+- [x] **H4** — the program could close the shim's own descriptors, after which the shim closed the
+  program's. Shim descriptors now live at 768 and up and are protected. (da42f4e, D-26)
+- [x] **L3** — `close_range(3, ~0U)` walked a million table entries; it now visits only allocated
+  blocks. (da42f4e, with D-26)
 
 ## Critical
 
@@ -28,30 +41,7 @@ None open.
 
 ## High
 
-- [ ] **H1 — stale fd-table entries take over unrelated descriptors.** *PoC.* D-17 recycles a stale
-  entry only when a UDP `socket()` or a dup lands on its number. `open`, `pipe`, `accept`,
-  `socketpair` and non-UDP `socket()` do not, so after a close that bypasses the hook (libuv's raw
-  `close` syscall), a TCP socket, pipe or file on that number is treated as UDP. Demonstrated: a
-  unix stream socket's `write()` failed with `EAGAIN`. A connected TCP socket would get SOCKS headers
-  injected into its stream, and its reads would silently lose bytes. a7ec506 fixed the dup routes
-  only.
-  - **Implemented (D-23), awaiting commit.**
-- [ ] **H2 — use-after-free when one socket is used from several threads.** *Inspection.*
-  `udpc_assoc_relay`, `_touch`, `_revalidate` and `_ensure` read `e->assoc` and dereference it
-  without taking a reference. `udpc_assoc_invalidate` on another thread can free it at the same
-  time, for example when idle expiry is detected. See `src/assoc.c:70-150` and
-  `src/core.c:140,266,281,356`. TST-07 never combines multiple threads with expiry.
-  - **Implemented (D-24), awaiting commit.**
-- [ ] **H3 — the password is exported in plaintext to the target and all its descendants.**
-  `udpc_config_export` (`src/config.c:500`) turns `password_file` into
-  `UDPCHAINS_PASSWORD=<secret>`. This defeats the reason for using a file.
-  - **Implemented (D-25), awaiting commit.**
-- [ ] **H4 — control-connection descriptors are unprotected in the app's descriptor space.** If
-  the app closes one (close-all loops, `close_range`, `dup2` onto that number), the association
-  keeps the stale number. `udpc_socks_disconnect` (`src/socks5.c:726`) later closes whatever the
-  app has there, and the liveness probe polls the wrong descriptor. Usual fix: `F_DUPFD_CLOEXEC`
-  to a high number.
-  - **Implemented (D-26), awaiting commit.**
+None open.
 
 ## Medium
 
@@ -97,9 +87,6 @@ None open.
   buffer. The kernel would return `EINVAL`.
 - [ ] **L2** — a bad `msg_iov` pointer segfaults instead of returning `EFAULT`; `msg_iovlen` is
   truncated to `int`; 1024 iovecs plus the header iovec exceeds `UIO_MAXIOV`.
-- [ ] **L3** — `close_range(3, ~0U)` walks up to 1,048,576 entries. Iterate only allocated blocks.
-  - **Fixed alongside H4 (D-26), awaiting commit:** the range release now visits only allocated
-    blocks.
 - [ ] **L4** — per-datagram warnings (oversized inbound, multicast) are not rate-limited. Logs are
   written to fd 2 even if the app has reused it for a file or socket.
 - [ ] **L5** — config and password-file handling:
