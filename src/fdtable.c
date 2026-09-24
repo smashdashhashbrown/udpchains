@@ -153,6 +153,7 @@ struct udpc_fdent *udpc_fd_claim(int fd, int family, int type)
 	atomic_store_explicit(&e->assoc, NULL, memory_order_relaxed);
 	atomic_store_explicit(&e->connected, false, memory_order_relaxed);
 	atomic_store_explicit(&e->bound_set, false, memory_order_relaxed);
+	atomic_store_explicit(&e->rebind, false, memory_order_relaxed);
 	memset(&e->app_dst, 0, sizeof(e->app_dst));
 	memset(&e->bound, 0, sizeof(e->bound));
 	atomic_store_explicit(&e->cookie, socket_cookie(fd), memory_order_relaxed);
@@ -283,6 +284,7 @@ void udpc_fd_release(int fd)
 
 	atomic_store_explicit(&e->connected, false, memory_order_relaxed);
 	atomic_store_explicit(&e->bound_set, false, memory_order_relaxed);
+	atomic_store_explicit(&e->rebind, false, memory_order_relaxed);
 
 	/* A thread that looked this entry up before the release, and is still
 	 * using it, is racing the application's own close -- which the kernel
@@ -503,6 +505,9 @@ int udpc_fd_share(int oldfd, int newfd)
 	atomic_store_explicit(&dst->bound_set,
 	                      atomic_load_explicit(&src->bound_set,
 	                                           memory_order_acquire),
+	                      memory_order_relaxed);
+	atomic_store_explicit(&dst->rebind,
+	                      atomic_load_explicit(&src->rebind, memory_order_acquire),
 	                      memory_order_relaxed);
 
 	udpc_fd_publish(dst);

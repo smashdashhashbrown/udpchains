@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -704,6 +705,74 @@ static void t_passthrough(void)
 	close(tcp);
 }
 
+/* L1, L2: arguments the shim reads itself are checked the way the kernel would
+ * check them, rather than read past or crashed on. */
+static void t_argument_checks(void)
+{
+	static char bytes[IOV_MAX];
+	char rb[2 * IOV_MAX];
+	struct iovec *v;
+	struct msghdr m;
+	int fd = udp4(), f6, i;
+
+	TAP_GROUP("L1/L2: arguments are checked as the kernel checks them");
+
+	errno = 0;
+	TAP_OK(connect(fd, (struct sockaddr *)&g_echo1, 8) == -1 && errno == EINVAL,
+	       "connect() with an address too short for AF_INET is EINVAL");
+	errno = 0;
+	TAP_OK(sendto(fd, "x", 1, 0, (struct sockaddr *)&g_echo1, 8) == -1 &&
+	           errno == EINVAL,
+	       "so is sendto()");
+
+	f6 = socket(AF_INET6, SOCK_DGRAM, 0);
+	{
+		struct timeval tv = { 3, 0 };
+		setsockopt(f6, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	}
+	TAP_EQ_INT(sendto(f6, "v6", 2, 0, (struct sockaddr *)&g_echo6, 24), 2,
+	           "a 24-byte AF_INET6 address, without the scope field, is "
+	           "accepted as the kernel accepts it");
+	TAP_EQ_INT(recv(f6, rb, sizeof(rb), 0), 2, "and round-trips");
+	close(f6);
+
+	memset(&m, 0, sizeof(m));
+	m.msg_name = &g_echo1;
+	m.msg_namelen = sizeof(g_echo1);
+	m.msg_iov = NULL;
+	m.msg_iovlen = 1;
+	errno = 0;
+	TAP_OK(sendmsg(fd, &m, 0) == -1 && errno == EFAULT,
+	       "sendmsg() with a NULL iovec array is EFAULT, not a crash");
+
+	v = calloc((size_t)IOV_MAX + 1, sizeof(*v));
+	m.msg_iov = v;
+	m.msg_iovlen = (size_t)IOV_MAX + 1;
+	errno = 0;
+	TAP_OK(sendmsg(fd, &m, 0) == -1 && errno == EMSGSIZE,
+	       "msg_iovlen above IOV_MAX is EMSGSIZE");
+	m.msg_iovlen = ((size_t)1 << 32) | 1;
+	errno = 0;
+	TAP_OK(sendmsg(fd, &m, 0) == -1 && errno == EMSGSIZE,
+	       "and one that would wrap to 1 as an int is caught before the cast");
+
+	/* The shim's header needs an iovec of its own; with every one the
+	 * kernel allows already used, it must not be the reason a send that
+	 * would work unhooked fails. */
+	for (i = 0; i < IOV_MAX; i++) {
+		bytes[i] = (char)('a' + i % 26);
+		v[i].iov_base = &bytes[i];
+		v[i].iov_len = 1;
+	}
+	m.msg_iovlen = IOV_MAX;
+	TAP_EQ_INT(sendmsg(fd, &m, 0), IOV_MAX,
+	           "a send of exactly IOV_MAX iovecs succeeds, as it does unhooked");
+	TAP_EQ_INT(recv(fd, rb, sizeof(rb), 0), IOV_MAX, "and arrives whole");
+	TAP_EQ_MEM(rb, bytes, IOV_MAX, "byte for byte");
+	free(v);
+	close(fd);
+}
+
 /* D-29: a datagram socket that is not UDP carries something SOCKS5 cannot relay,
  * so it is refused -- neither sent directly nor wrapped as UDP. */
 static void t_non_udp_refused(void)
@@ -823,6 +892,7 @@ int main(int argc, char **argv)
 	t_passthrough();
 	t_fortified();
 	t_non_udp_refused();
+	t_argument_checks();
 
 	TAP_DONE();
 }

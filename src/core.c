@@ -1,6 +1,7 @@
 #include "core.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,13 +26,19 @@ struct udpc_fdent *udpc_intercept(int fd)
 	return udpc_fd_lookup_verified(fd);
 }
 
+/* Saturates rather than wrapping: lengths summing past SIZE_MAX would
+ * otherwise come out small, pass the max_datagram check, and reach a copy
+ * sized by the individual entries (L2). */
 static size_t iov_total(const struct iovec *iov, int iovcnt)
 {
 	size_t total = 0;
 	int i;
 
-	for (i = 0; i < iovcnt; i++)
+	for (i = 0; i < iovcnt; i++) {
+		if (iov[i].iov_len > SIZE_MAX - total)
+			return SIZE_MAX;
 		total += iov[i].iov_len;
+	}
 	return total;
 }
 
@@ -58,23 +65,33 @@ static size_t copy_to_iov(const uint8_t *src, size_t len, const struct iovec *io
 /* D-05 R1: SOCKS5 cannot express multicast or broadcast, so these fail --
  * with a specific reason rather than a generic error the user has to guess at.
  * There is no bypass in v1 (D-05), so failing is the only honest outcome. */
+/* D-33: these fire per datagram, so a program retrying a multicast send in a
+ * loop -- or a remote peer sending oversized replies -- would otherwise fill
+ * stderr.  One report per second, with a count of the rest. */
+static struct udpc_ratelimit g_rl_multicast, g_rl_broadcast, g_rl_oversize;
+
 static int reject_unrepresentable(const struct sockaddr *dst)
 {
-	char abuf[UDPC_ADDRSTRLEN];
+	char abuf[UDPC_ADDRSTRLEN], note[80];
+	unsigned n;
 
 	if (udpc_addr_is_multicast(dst)) {
-		udpc_warn("cannot send to multicast %s: SOCKS5 has no way to "
-		          "express a multicast destination, and udpchains does "
-		          "not send anything directly",
-		          udpc_addr_str(dst, abuf, sizeof(abuf)));
+		if ((n = udpc_ratelimit(&g_rl_multicast)) != 0)
+			udpc_warn("cannot send to multicast %s: SOCKS5 has no way "
+			          "to express a multicast destination, and "
+			          "udpchains does not send anything directly%s",
+			          udpc_addr_str(dst, abuf, sizeof(abuf)),
+			          udpc_ratelimit_note(n, note, sizeof(note)));
 		errno = ENETUNREACH;
 		return -1;
 	}
 	if (udpc_addr_is_broadcast(dst)) {
-		udpc_warn("cannot send to broadcast %s: SOCKS5 has no way to "
-		          "express a broadcast destination, and udpchains does "
-		          "not send anything directly",
-		          udpc_addr_str(dst, abuf, sizeof(abuf)));
+		if ((n = udpc_ratelimit(&g_rl_broadcast)) != 0)
+			udpc_warn("cannot send to broadcast %s: SOCKS5 has no way "
+			          "to express a broadcast destination, and "
+			          "udpchains does not send anything directly%s",
+			          udpc_addr_str(dst, abuf, sizeof(abuf)),
+			          udpc_ratelimit_note(n, note, sizeof(note)));
 		errno = ENETUNREACH;
 		return -1;
 	}
@@ -160,18 +177,39 @@ static ssize_t send_via(int fd, struct udpc_fdent *e, struct udpc_assoc *a,
 		return -1;
 	}
 
-	/* D-11: the header is the first iovec entry and the application's own
-	 * buffers follow.  The payload is never copied. */
-	tls->iov[0].iov_base = tls->hdr;
-	tls->iov[0].iov_len = (size_t)hlen;
-	for (i = 0; i < iovcnt; i++)
-		tls->iov[i + 1] = iov[i];
-
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_name = &relay;
 	msg.msg_namelen = udpc_sa_len((const struct sockaddr *)&relay);
 	msg.msg_iov = tls->iov;
-	msg.msg_iovlen = (size_t)iovcnt + 1;
+
+	if (iovcnt < IOV_MAX) {
+		/* D-11: the header is the first iovec entry and the
+		 * application's own buffers follow.  The payload is never
+		 * copied. */
+		tls->iov[0].iov_base = tls->hdr;
+		tls->iov[0].iov_len = (size_t)hlen;
+		for (i = 0; i < iovcnt; i++)
+			tls->iov[i + 1] = iov[i];
+		msg.msg_iovlen = (size_t)iovcnt + 1;
+	} else {
+		/* L2: the application already used every iovec the kernel
+		 * allows, so a separate header entry would make the send fail
+		 * with EMSGSIZE where the unhooked call succeeds.  The header
+		 * and the first buffer are joined in the receive scratch
+		 * instead -- one copy, of at most max_datagram bytes, and only
+		 * for this rare shape of call. */
+		if (iov[0].iov_len > tls->buflen - (size_t)hlen) {
+			*out_errno = EMSGSIZE;
+			return -1;
+		}
+		memcpy(tls->buf, tls->hdr, (size_t)hlen);
+		memcpy(tls->buf + hlen, iov[0].iov_base, iov[0].iov_len);
+		tls->iov[0].iov_base = tls->buf;
+		tls->iov[0].iov_len = (size_t)hlen + iov[0].iov_len;
+		for (i = 1; i < iovcnt; i++)
+			tls->iov[i] = iov[i];
+		msg.msg_iovlen = (size_t)iovcnt;
+	}
 
 	n = REAL_SENDMSG(fd, &msg, flags);
 	if (n < 0) {
@@ -260,11 +298,20 @@ ssize_t udpc_core_send(int fd, struct udpc_fdent *e, const struct iovec *iov,
 		errno = EMSGSIZE;
 		return -1;
 	}
+	/* L2: what the kernel says, rather than a crash in iov_total. */
+	if (iovcnt > 0 && iov == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
 
 	/* Destination: the explicit one if given, else the one recorded by
-	 * connect() (FR-F-08). */
-	if (dst != NULL && dstlen > 0 && udpc_sa_len(dst) != 0) {
-		target = dst;
+	 * connect() (FR-F-08).  An explicit one is checked against its length
+	 * as the kernel would (L1): too short is EINVAL, never a read past the
+	 * caller's buffer. */
+	if (dst != NULL && dstlen > 0) {
+		if (udpc_sa_copy(dst, dstlen, &dstbuf) != 0)
+			return -1;
+		target = (const struct sockaddr *)&dstbuf;
 	} else if (atomic_load_explicit(&e->connected, memory_order_acquire)) {
 		memcpy(&dstbuf, &e->app_dst, sizeof(dstbuf));
 		target = (const struct sockaddr *)&dstbuf;
@@ -339,6 +386,10 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 		errno = EMSGSIZE;
 		return -1;
 	}
+	if (iovcnt > 0 && iov == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
 
 	/* A receive is a use of the socket, so it establishes the association
 	 * if there is not one yet (FR-P-01): without a relay there is nothing
@@ -399,9 +450,14 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 		}
 
 		if ((size_t)n > tls->buflen) {
-			udpc_warn("dropping a %zd-byte relayed datagram: larger "
-			          "than max_datagram %zu plus header",
-			          n, cfg->max_datagram);
+			char note[80];
+			unsigned k = udpc_ratelimit(&g_rl_oversize);
+
+			if (k != 0)
+				udpc_warn("dropping a %zd-byte relayed datagram: "
+				          "larger than max_datagram %zu plus header%s",
+				          n, cfg->max_datagram,
+				          udpc_ratelimit_note(k, note, sizeof(note)));
 			discard = true;
 		} else {
 			hlen = udpc_socks_decode(tls->buf, (size_t)n, &hdr);

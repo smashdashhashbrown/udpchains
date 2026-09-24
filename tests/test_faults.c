@@ -13,6 +13,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static struct sockaddr_in g_echo;
@@ -136,6 +138,89 @@ int main(int argc, char **argv)
 			TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), -1,
 			           "but the proxy drops it, so no reply arrives");
 		}
+		close(fd);
+	} else if (strcmp(mode, "mcast-burst") == 0) {
+		/* D-33: a warning that fires per datagram.  The script counts
+		 * how many reach stderr. */
+		struct sockaddr_in mc;
+		int i, refused = 0;
+
+		memset(&mc, 0, sizeof(mc));
+		mc.sin_family = AF_INET;
+		mc.sin_port = htons(5000);
+		inet_pton(AF_INET, "239.1.2.3", &mc.sin_addr);
+		fd = udp4(1);
+		for (i = 0; i < 50; i++)
+			if (sendto(fd, "m", 1, 0, (struct sockaddr *)&mc, sizeof(mc)) == -1 &&
+			    errno == ENETUNREACH)
+				refused++;
+		TAP_EQ_INT(refused, 50, "all 50 multicast sends are refused");
+		close(fd);
+	} else if (strcmp(mode, "stderr-reused") == 0) {
+		/* D-33: a daemon closes stderr, and the next descriptor it opens
+		 * -- its log file -- is given number 2.  A warning from the shim
+		 * must not end up inside that file. */
+		struct sockaddr_in mc;
+		char buf[512];
+		ssize_t n;
+		int f;
+
+		memset(&mc, 0, sizeof(mc));
+		mc.sin_family = AF_INET;
+		mc.sin_port = htons(5000);
+		inet_pton(AF_INET, "239.1.2.3", &mc.sin_addr);
+		fd = udp4(1);
+
+		close(2);
+		f = open(argv[3], O_RDWR | O_CREAT | O_TRUNC, 0600);
+		TAP_EQ_INT(f, 2, "the program's own file is given descriptor 2");
+		TAP_OK(sendto(fd, "m", 1, 0, (struct sockaddr *)&mc, sizeof(mc)) == -1,
+		       "a multicast send, which the shim warns about, is refused");
+		lseek(f, 0, SEEK_SET);
+		n = read(f, buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		TAP_OK(strstr(buf, "udpchains") == NULL,
+		       "and the warning is not written into the program's file");
+		close(fd);
+	} else if (strcmp(mode, "forkbind") == 0) {
+		/* D-34, against a proxy that pins each association to the
+		 * address it declares (--pin-declared).  The parent binds a
+		 * concrete address and port, so its association declares them.
+		 * A forked child cannot bind that port again -- the parent
+		 * still holds it -- so its private socket sends from another.
+		 * Declaring the parent's address anyway, as the shim once did,
+		 * gets every one of the child's datagrams dropped. */
+		struct sockaddr_in b;
+		socklen_t bl = sizeof(b);
+		int probe, status = 0;
+		pid_t pid;
+
+		memset(&b, 0, sizeof(b));
+		b.sin_family = AF_INET;
+		b.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		probe = socket(AF_INET, SOCK_DGRAM, 0);
+		bind(probe, (struct sockaddr *)&b, sizeof(b));
+		getsockname(probe, (struct sockaddr *)&b, &bl);
+		close(probe);
+
+		fd = udp4(3);
+		TAP_EQ_INT(bind(fd, (struct sockaddr *)&b, sizeof(b)), 0,
+		           "the parent binds 127.0.0.1:%u", ntohs(b.sin_port));
+		connect(fd, (struct sockaddr *)&g_echo, sizeof(g_echo));
+		TAP_OK(roundtrip(fd, "parent-bound"),
+		       "its association declares that address, and works against "
+		       "a proxy that enforces it");
+
+		pid = fork();
+		if (pid == 0)
+			_exit(roundtrip(fd, "child-bound") ? 0 : 1);
+		waitpid(pid, &status, 0);
+		TAP_OK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		       "a forked child, unable to bind that port again, still "
+		       "round-trips: it stops declaring an address it cannot "
+		       "send from");
+		TAP_OK(roundtrip(fd, "parent-after"),
+		       "and the parent's association is untouched");
 		close(fd);
 	} else {
 		fprintf(stderr, "unknown mode %s\n", mode);

@@ -103,32 +103,63 @@ static int parse_long(const char *v, long min, long max, long *out)
 	return 0;
 }
 
+/* The shim's permission warnings are the wrapper's to give: launched by the
+ * wrapper, a shim reading the same files again would print each warning a
+ * second time, once per process (D-33). */
+static bool g_quiet_permissions;
+
 /* SEC-03: reads a password from a file, so it never appears in argv or in
- * `ps` output.  Strips exactly one trailing newline. */
+ * `ps` output.  Strips one trailing newline, CR included.
+ *
+ * L5: a password longer than RFC 1929's 255 bytes is an error, not a silent
+ * truncation -- the truncated password would fail at the proxy with nothing
+ * to say why. */
 static int read_password_file(const char *path, char *out, size_t outlen,
                               const char **err)
 {
-	int fd;
-	ssize_t n;
+	char buf[UDPC_PASSWORD_MAX + 3]; /* the maximum, a CR LF, and one over */
+	size_t len = 0;
 	struct stat st;
+	int fd;
 
 	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		*err = "cannot open password file";
 		return -1;
 	}
-	if (fstat(fd, &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO)) != 0)
+	if (!g_quiet_permissions && fstat(fd, &st) == 0 &&
+	    (st.st_mode & (S_IRWXG | S_IRWXO)) != 0)
 		udpc_warn("password file %s is group- or world-accessible", path);
 
-	n = read(fd, out, outlen - 1);
+	while (len < sizeof(buf)) {
+		ssize_t n = read(fd, buf + len, sizeof(buf) - len);
+		if (n == 0)
+			break;
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			close(fd);
+			explicit_bzero(buf, sizeof(buf));
+			*err = "cannot read password file";
+			return -1;
+		}
+		len += (size_t)n;
+	}
 	close(fd);
-	if (n < 0) {
-		*err = "cannot read password file";
+
+	if (len > 0 && buf[len - 1] == '\n')
+		len--;
+	if (len > 0 && buf[len - 1] == '\r')
+		len--;
+	if (len > UDPC_PASSWORD_MAX || len >= outlen) {
+		explicit_bzero(buf, sizeof(buf));
+		*err = "password file holds more than 255 bytes, the RFC 1929 "
+		       "limit";
 		return -1;
 	}
-	out[n] = '\0';
-	if (n > 0 && out[n - 1] == '\n')
-		out[n - 1] = '\0';
+	memcpy(out, buf, len);
+	out[len] = '\0';
+	explicit_bzero(buf, sizeof(buf));
 	return 0;
 }
 
@@ -294,6 +325,7 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 	char line[1024];
 	int lineno = 0;
 	struct stat st;
+	bool have_st;
 
 	*err = NULL;
 	*errline = 0;
@@ -306,7 +338,8 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 
 	/* SEC-04: this file directs where traffic goes.  If anyone else can
 	 * write it, they can redirect the traffic. */
-	if (fstat(fileno(f), &st) == 0 && (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+	have_st = fstat(fileno(f), &st) == 0;
+	if (!g_quiet_permissions && have_st && (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
 		udpc_warn("config file %s is group- or world-writable; "
 		          "it controls where your traffic goes",
 		          path);
@@ -315,16 +348,23 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 		char *p = line, *key, *value, *eq, *end;
 		lineno++;
 
-		p += strspn(p, " \t");
-		end = strchr(p, '\n');
-		if (end != NULL)
+		/* L5: a line that filled the buffer without a newline is too
+		 * long -- unless the file ends exactly there.  Measured before
+		 * leading whitespace is skipped, which once hid it. */
+		end = strchr(line, '\n');
+		if (end != NULL) {
 			*end = '\0';
-		else if (strlen(p) == sizeof(line) - 1) {
-			*err = "line too long";
-			*errline = lineno;
-			fclose(f);
-			return -1;
+		} else if (strlen(line) == sizeof(line) - 1) {
+			int c = fgetc(f);
+
+			if (c != EOF) {
+				*err = "line too long";
+				*errline = lineno;
+				fclose(f);
+				return -1;
+			}
 		}
+		p += strspn(p, " \t");
 
 		if (*p == '\0' || *p == '#' || *p == ';')
 			continue;
@@ -378,6 +418,15 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 	 * the file, never by copying the value into the environment. */
 	if ((cfg->set_mask & UDPC_SET_PASSWORD) && cfg->password_file[0] == '\0') {
 		char *abs = realpath(path, NULL);
+
+		/* L5: SEC-04 warns about a writable config file because it
+		 * directs traffic; one holding a password also matters when
+		 * others can merely READ it. */
+		if (!g_quiet_permissions && have_st &&
+		    (st.st_mode & (S_IRGRP | S_IROTH)) != 0)
+			udpc_warn("config file %s holds a password and is readable "
+			          "by other users",
+			          path);
 
 		snprintf(cfg->password_config, sizeof(cfg->password_config), "%s",
 		         abs != NULL ? abs : path);
@@ -458,13 +507,38 @@ int udpc_config_from_env(struct udpc_config *cfg, const char **err)
 			return -1;
 	}
 
-	if (getenv("UDPCHAINS_QUIET") != NULL) {
-		cfg->verbosity = UDPC_QUIET;
-		cfg->set_mask |= UDPC_SET_VERBOSITY;
-	}
-	if (getenv("UDPCHAINS_DEBUG") != NULL) {
-		cfg->verbosity = UDPC_DEBUG;
-		cfg->set_mask |= UDPC_SET_VERBOSITY;
+	/* L5: booleans, like every other switch -- UDPCHAINS_QUIET=0 used to
+	 * turn quiet mode ON, because only presence was tested.  An empty
+	 * value counts as unset, as it does for the other variables. */
+	{
+		static const struct {
+			const char *env;
+			int level;
+			const char *err;
+		} sw[] = {
+			{ "UDPCHAINS_QUIET", UDPC_QUIET,
+			  "UDPCHAINS_QUIET must be a boolean (1/0, yes/no, "
+			  "true/false, on/off)" },
+			{ "UDPCHAINS_DEBUG", UDPC_DEBUG,
+			  "UDPCHAINS_DEBUG must be a boolean (1/0, yes/no, "
+			  "true/false, on/off)" },
+		};
+
+		for (i = 0; i < sizeof(sw) / sizeof(sw[0]); i++) {
+			bool on;
+
+			v = getenv(sw[i].env);
+			if (v == NULL || *v == '\0')
+				continue;
+			if (parse_bool(v, &on) != 0) {
+				*err = sw[i].err;
+				return -1;
+			}
+			if (on) {
+				cfg->verbosity = sw[i].level;
+				cfg->set_mask |= UDPC_SET_VERBOSITY;
+			}
+		}
 	}
 
 	return 0;
@@ -707,6 +781,9 @@ int udpc_config_load_shim(struct udpc_config *cfg, const char **err)
 	udpc_config_defaults(cfg);
 
 	if (getenv("UDPCHAINS_RESOLVED") != NULL) {
+		/* The wrapper has already warned about any file's permissions;
+		 * each process under it saying so again is noise (D-33). */
+		g_quiet_permissions = true;
 		/* D-27: the wrapper exported a complete, resolved configuration,
 		 * and it is the whole of it.  Consulting the default config files
 		 * as well, as this once did, let ~/.udpchains.conf supply

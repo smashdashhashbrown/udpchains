@@ -83,9 +83,13 @@ struct udpc_fdent {
 	struct sockaddr_storage app_dst;
 	_Atomic bool connected;
 
-	/* Concrete address the application bound, for FR-P-05 and FR-I-05. */
+	/* The address the application bound.  bound_set: it is concrete, so it
+	 * is declared in UDP ASSOCIATE (FR-P-05) and reported by getsockname
+	 * (FR-I-05).  rebind: it names a concrete address OR a port, so the
+	 * private socket a forked child is given must bind it again (D-34). */
 	struct sockaddr_storage bound;
 	_Atomic bool bound_set;
+	_Atomic bool rebind;
 };
 
 /* Returns the entry for fd if it is being intercepted, else NULL.

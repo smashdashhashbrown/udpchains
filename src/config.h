@@ -33,6 +33,7 @@
 #define UDPC_DEFAULT_DNS_TIMEOUT_MS 5000 /* D-22: the whole lookup, all attempts */
 #define UDPC_DEFAULT_HOSTS_FILE "/etc/hosts"
 #define UDPC_MAX_DATAGRAM_CEILING 65507 /* largest a UDP payload can ever be */
+#define UDPC_PASSWORD_MAX 255 /* RFC 1929: PLEN is one byte */
 
 /* Which keys a layer set explicitly. */
 #define UDPC_SET_PROXY (1u << 0)

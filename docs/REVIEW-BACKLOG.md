@@ -34,6 +34,17 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
   program's. Shim descriptors now live at 768 and up and are protected. (da42f4e, D-26)
 - [x] **L3** — `close_range(3, ~0U)` walked a million table entries; it now visits only allocated
   blocks. (da42f4e, with D-26)
+- [x] **M1–M3, M9 (i)** — `strict_loopback` checked only at setup; `MSG_MORE`/`UDP_CORK`/GSO/GRO
+  corrupt data; the first send blocks during the handshake; a socket shared with another process
+  is re-pointed. Accepted for 1.0 and documented in the README. (dba3c76, D-32)
+- [x] **M4** — the shim re-read the default config files. (dba3c76, D-27)
+- [x] **M5** — the wrapper exported the proxy's hostname, not its address. (dba3c76, D-27)
+- [x] **M6** — the setuid check and the exec could look at different files. (dba3c76, D-28)
+- [x] **M7** — ICMP and UDP-Lite datagram sockets were treated as UDP; now refused. (dba3c76, D-29)
+- [x] **M8** — the never-checked generation counter and `redirected` flag are removed. (dba3c76,
+  D-30)
+- [x] **M9 (ii)** — forked children kept the parent's control connections. (dba3c76, D-31)
+- [x] **M10** — the signal-safety claim is corrected; NFR-03 is marked partial. (dba3c76)
 
 ## Critical
 
@@ -45,72 +56,42 @@ None open.
 
 ## Medium
 
-- [ ] **M1 — `strict_loopback` can be bypassed.** The guard runs only at association setup, and
-  only for connected sockets (`src/assoc.c:156`). An unconnected `sendto(127.0.0.1)`, a `connect()`
-  after association, or a re-connect is never checked. Check per send in `udpc_core_send` instead.
-  - **Documented, not fixed (D-32), awaiting commit.**
-- [ ] **M2 — `MSG_MORE` / `UDP_CORK` / GSO / GRO silently corrupt data.** *PoC.* Sending
-  `AAA` + `BBB` with `MSG_MORE` delivers `AAA` + a 10-byte header + `BBB`. The README says such
-  programs "fall back or fail". At minimum, reject `MSG_MORE` with `EOPNOTSUPP`.
-  - **Documented, not fixed (D-32), awaiting commit.**
-- [ ] **M3 — the proxy handshake blocks, even on non-blocking sockets.** The first send or receive
-  runs the full connect and handshake synchronously, with `connect_timeout` applied per step
-  rather than overall. With the proxy down, every failed send makes two full attempts
-  (`src/core.c:277`, where `ECONNREFUSED` counts as "looks dead").
-  - **Documented, not fixed (D-32), awaiting commit.**
-- [ ] **M4 — the shim re-reads the default config files.** `udpc_config_load_shim` still reads
-  `~/.udpchains.conf` and `/etc/udpchains.conf` (`src/config.c:414`), contradicting the comment at
-  `src/config.c:509`. With `-f a.conf`, the home file's credentials still get used, and a broken
-  home file breaks the target after the wrapper reported success.
-  - **Fixed (D-27), awaiting commit.**
-- [ ] **M5 — the wrapper exports the proxy's hostname, not its resolved address.** Every exec'd
-  descendant repeats the DNS lookup directly and may get a different address.
-  - **Fixed (D-27), awaiting commit.**
-- [ ] **M6 — the setuid/setgid check and the exec can look at different files.** The wrapper
-  checks the path `resolve_program()` found, then `execvp` searches `PATH` again
-  (`src/wrapper.c:463`). Use `execv(program, ...)`.
-  - **Fixed (D-28), awaiting commit.**
-- [ ] **M7 — interception ignores the protocol number.** ICMP ping sockets
-  (`SOCK_DGRAM`/`IPPROTO_ICMP`, used by unprivileged `ping`) and UDP-Lite are treated as UDP
-  (`src/hooks.c`, `is_intercepted_kind` and `adopt_fd`). *Inspection*: ping sockets are disabled
-  on the review host.
-  - **Fixed (D-29): refused, option (a). Awaiting commit.**
-- [ ] **M8 — the FR-L-02 generation counter is never read.** It is written at
-  `src/fdtable.c:162` and nowhere checked, so the guard that comments and docs describe does not
-  exist. `redirected` is also written but never read. Implement or remove both, and fix the docs.
-  - **Fixed (D-30): both fields removed. Awaiting commit.**
-- [ ] **M9 — a socket shared with another process is re-pointed.** After `fork()` + `exec`, an
-  inherited UDP socket is adopted fresh, and first use `connect()`s the shared socket to a new
-  relay, which also redirects the parent's. The same applies to sockets received via
-  `SCM_RIGHTS` whose sender keeps a copy (noted in D-21). Separately, children keep the parent's
-  control connections open, so the parent's associations linger at the proxy.
-  - **Part (ii) fixed (D-31); part (i) documented, not fixed (D-32). Awaiting commit.**
-- [ ] **M10 — the signal-safety claim (NFR-03) is overstated.** The first send on a socket
-  (`calloc`, handshake), the first datagram on each thread (`udpc_tls_get` mallocs), and
-  `socket`, `dup` and `close` (block `calloc`, `free` via unref) all allocate or free memory.
-  - **Fixed as documentation: NFR-03 marked partial, README lists the cases. Awaiting commit.**
+None open.
 
 ## Low
 
 - [ ] **L1** — `connect()` and `sendto()` copy the family's full address size regardless of the
   `addrlen` passed (`src/hooks.c` connect hook, `src/core.c:234`), so they can read past a short
   buffer. The kernel would return `EINVAL`.
+  - **Fixed, awaiting commit.** Too short for the family is `EINVAL`; other families are
+    `EAFNOSUPPORT`.
 - [ ] **L2** — a bad `msg_iov` pointer segfaults instead of returning `EFAULT`; `msg_iovlen` is
   truncated to `int`; 1024 iovecs plus the header iovec exceeds `UIO_MAXIOV`.
+  - **Fixed, awaiting commit.** `NULL` is `EFAULT`, over `IOV_MAX` is `EMSGSIZE`, and exactly
+    `IOV_MAX` works. Residual, documented in the README: a non-`NULL` invalid pointer still
+    faults inside the shim.
 - [ ] **L4** — per-datagram warnings (oversized inbound, multicast) are not rate-limited. Logs are
   written to fd 2 even if the app has reused it for a file or socket.
+  - **Fixed (D-33), awaiting commit.** Rate-limited to one a second per kind; nothing is
+    written unless fd 2 is still the original stderr. `-q` now also means errors only.
 - [ ] **L5** — config and password-file handling:
   - A password file is silently truncated at 255 bytes, and a Windows line ending (`\r\n`) is not
     stripped.
   - There is no warning when a config file containing `password =` is readable by others.
   - Any value of `UDPCHAINS_QUIET`, including `0`, enables quiet mode.
   - Overlong-line detection misses lines with leading whitespace (`src/config.c:253`).
+  - **Fixed, awaiting commit.** All four; the password-file permission warning is also given
+    once rather than twice (D-33).
 - [ ] **L6** — post-fork `reprivatize_socket` ignores a failed `bind()` and loses a
   wildcard-with-port binding (`src/assoc.c:249`).
+  - **Fixed (D-34), awaiting commit.** Option (b): bind again, and on failure stop declaring
+    the address and warn once.
 - [ ] **L7** — build and address resolution:
   - Internal `udpc_*` symbols are exported (no `-fvisibility=hidden`).
   - There are no hardening flags (`-fstack-protector-strong`, `-z relro -z now`).
   - `udpc_addr_parse` uses only the first `getaddrinfo` result.
+  - **Symbols and hardening fixed (D-35); first-address-only documented, not fixed. Awaiting
+    commit.**
 
 ## Documentation
 
@@ -133,7 +114,8 @@ None open.
   - UDP servers that only receive don't work through a proxy.
   - ~~The README's "No DNS leak" claim is false (C4).~~ Corrected with the D-22 implementation.
 - [ ] **D4** — the configuration reference is incomplete:
-  - The README's environment table omits `UDPCHAINS_PASSWORD`, `_QUIET`, `_DEBUG` and `_LIB`.
+  - The README's environment table omits `UDPCHAINS_PASSWORD` and `_LIB`. (`_QUIET` and `_DEBUG`
+    were added with L5.)
   - Config-file keys are listed nowhere.
   - Nothing says inline `#` comments are unsupported.
   - `connect_timeout` applies per handshake step.

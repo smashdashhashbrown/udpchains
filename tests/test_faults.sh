@@ -78,6 +78,49 @@ P_SMALL=$(start_proxy small --max-dgram 1000 --quiet)
 run_scenario "D-12 configured limit vs the proxy's real limit" "$P_SMALL" "$ECHO" \
 	maxdgram "$ECHO"
 
+# D-34: a proxy that pins each association to its declared address.  After a
+# fork, the child cannot re-bind the parent's port, and must stop declaring it.
+P_PIN=$(start_proxy pin --pin-declared --quiet)
+run_scenario "D-34 a forked child's failed re-bind" "$P_PIN" "$ECHO" forkbind "$ECHO"
+
+# D-33: diagnostics.  These need no working proxy -- multicast is refused
+# before any association -- and run with warnings ON, which run.sh turns off.
+echo
+echo "--- D-33 diagnostics"
+diag() { env -u UDPCHAINS_QUIET UDPCHAINS_PROXY=127.0.0.1:9 timeout 60 "$WRAPPER" "$@"; }
+
+if diag "$BUILD/test_faults" mcast-burst 9 > "$TMP/burst.out" 2> "$TMP/burst.err" &&
+   grep -q '^ok' "$TMP/burst.out"; then
+	n=$(grep -c 'cannot send to multicast' "$TMP/burst.err")
+	if [ "$n" -ge 1 ] && [ "$n" -le 2 ]; then
+		echo "ok - 50 refused multicast sends produce $n warning line(s), not 50"
+	else
+		echo "not ok - 50 refused multicast sends produced $n warning lines" >&2
+		FAIL=1
+	fi
+else
+	echo "not ok - the multicast burst did not run" >&2
+	FAIL=1
+fi
+
+diag -q "$BUILD/test_faults" mcast-burst 9 > /dev/null 2> "$TMP/quiet.err"
+n=$(grep -c 'warning' "$TMP/quiet.err")
+if [ "$n" -eq 0 ]; then
+	echo "ok - under -q, which means errors only, no warning is printed"
+else
+	echo "not ok - -q still printed $n warning lines" >&2
+	FAIL=1
+fi
+
+if diag "$BUILD/test_faults" stderr-reused 9 "$TMP/applog" > "$TMP/reuse.out" &&
+   ! grep -q '^not ok' "$TMP/reuse.out"; then
+	echo "ok - a warning is not written into a file that took over descriptor 2"
+else
+	echo "not ok - the shim wrote into the program's file on descriptor 2:" >&2
+	sed 's/^/#   /' "$TMP/reuse.out" "$TMP/applog" >&2
+	FAIL=1
+fi
+
 if [ "$FAIL" -ne 0 ]; then
 	echo "fault scenarios FAILED" >&2
 	exit 1

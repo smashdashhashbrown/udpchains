@@ -321,10 +321,33 @@ static int reprivatize_socket(int fd, struct udpc_fdent *e, int *out_errno)
 	if (fl >= 0)
 		(void)fcntl(ns, F_SETFL, fl);
 
-	if (atomic_load_explicit(&e->bound_set, memory_order_acquire)) {
-		socklen_t blen = udpc_sa_len((const struct sockaddr *)&e->bound);
-		if (blen != 0)
-			(void)REAL_BIND(ns, (const struct sockaddr *)&e->bound, blen);
+	/* D-34: whatever the application bound -- a concrete address, or a
+	 * wildcard with a port -- the private socket binds again.  The parent
+	 * usually still holds that port, so this usually FAILS.  Carrying on
+	 * as if it had not was the defect: the association would still declare
+	 * the bound address to the proxy (FR-P-05), the child would send from
+	 * another port, and a proxy that pins the association to its declared
+	 * address would drop everything, silently.  So a failed re-bind stops
+	 * the declaration, and says so once. */
+	if (atomic_load_explicit(&e->rebind, memory_order_acquire)) {
+		const struct sockaddr *b = (const struct sockaddr *)&e->bound;
+		socklen_t blen = udpc_sa_len(b);
+
+		if (blen != 0 && REAL_BIND(ns, b, blen) != 0) {
+			static atomic_flag warned = ATOMIC_FLAG_INIT;
+			char abuf[UDPC_ADDRSTRLEN];
+			int berr = errno;
+
+			atomic_store_explicit(&e->bound_set, false, memory_order_release);
+			atomic_store_explicit(&e->rebind, false, memory_order_release);
+			if (!atomic_flag_test_and_set(&warned))
+				udpc_warn("fd %d: after fork, this process could not bind "
+				          "%s again (%s) -- the parent holds it -- so its "
+				          "datagrams leave from another port, and the proxy "
+				          "is no longer told a source address",
+				          fd, udpc_addr_str(b, abuf, sizeof(abuf)),
+				          strerror(berr));
+		}
 	}
 
 	/* dup2 always clears FD_CLOEXEC on the target, so capture and restore

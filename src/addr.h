@@ -21,6 +21,14 @@
  * intercept (FR-I-06). */
 socklen_t udpc_sa_len(const struct sockaddr *sa);
 
+/* Copies a caller-supplied address of `len` bytes into a zeroed ss, checking
+ * the length the way the kernel does: EINVAL if it is too short for its family
+ * (16 bytes for AF_INET; 24 for AF_INET6, which the kernel accepts without the
+ * scope field), EAFNOSUPPORT for a family the shim does not intercept.  Never
+ * reads beyond `len` (review item L1).  Returns 0, or -1 with errno set. */
+int udpc_sa_copy(const struct sockaddr *sa, socklen_t len,
+                 struct sockaddr_storage *ss);
+
 /* Port in host byte order, or 0 if the family is unsupported. */
 uint16_t udpc_sa_port(const struct sockaddr *sa);
 void udpc_sa_set_port(struct sockaddr *sa, uint16_t port);

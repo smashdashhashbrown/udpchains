@@ -99,7 +99,7 @@ inspection basis is recorded in the notes below.
 | FR-L-01 | M | §3.1, §3.5 | TST-07, unit-fdtable | **Verified** — TST-07 under the real shim; unit-fdtable under TSan, which found and fixed a genuine race on the entry `family`/`type` fields |
 | FR-L-02 | M | §3.1, §3.3 | TST-06, unit-fdtable | **Verified** — a reused fd reports `ENOTCONN`, and a released entry keeps none of its state (the generation counter once cited here was never checked, and was removed in D-30; the per-call cookie check of D-23 is what catches a stale entry). A defect was found and fixed here on 2026-08-19 (D-17): release depends on interposing `close()`, and a program whose runtime closes by another route (dig via libuv: 4 of 64 closes reach the hook) stranded its entry, so the next socket on that descriptor number was refused with a spurious `EMFILE` and the association leaked. A non-`FREE` entry at claim time is now treated as stale and recycled |
 | FR-L-03 | M | §3.3 | TST-06, unit-fdtable | **Verified** — `dup` adds no control connection; association survives the original's close |
-| FR-L-04 | M | §3.4 | TST-06 | **Verified** — a defect was found and fixed here: parent and child share one open file description, so the child re-pointing the socket also re-pointed the parent's. The child now gets a private socket |
+| FR-L-04 | M | §3.4 | TST-06 | **Verified** — a defect was found and fixed here: parent and child share one open file description, so the child re-pointing the socket also re-pointed the parent's. The child now gets a private socket. It binds the parent's address or port again, and if it cannot (the parent holds it), it stops declaring that address in `UDP ASSOCIATE` (D-34; TST-faults, under a proxy fixture that enforces the declared address) |
 | FR-L-05 | M | §3.2, §4.1 | TST-06 | **Verified** — every control connection carries `FD_CLOEXEC` |
 | FR-L-06 | S | §4.2, §6.4 | TST-03 | **Verified** — proxy failures surface on the application's send |
 
@@ -111,7 +111,7 @@ inspection basis is recorded in the notes below.
 | FR-C-02 | M | §7.1 | unit-config | **Verified** — layered merge; a lower layer never clobbers a higher one with a value it did not set |
 | FR-C-03 | M | §7.1 | unit-config, TST-03 | **Verified** — no proxy, unknown key, or malformed line all refuse to run |
 | FR-C-04 | S | — | unit-config | **Deferred** (D-08) — a `[ProxyList]` line gives a message naming the deferral |
-| FR-C-05 | M | §7.3 | manual | **Verified** — `udpchains:` prefix on stderr, `-q`/`-v` |
+| FR-C-05 | M | §7.3 | manual, TST-faults | **Verified** — `udpchains:` prefix on stderr, `-q` (errors only) / `-v`. Repeated warnings are rate-limited, and nothing is written to a descriptor 2 that is no longer the original stderr (D-33) |
 | FR-C-06 | S | §7.3 | manual | **Verified** — one line per association, naming destination, relay and the configured limit |
 
 ## §6 Non-functional
@@ -133,7 +133,7 @@ inspection basis is recorded in the notes below.
 | SEC-01 | M | §4.2, §6 | TST-03, capture | **Verified** — the core invariant. No path from a failed proxy attempt to a direct send. Confirmed at the **wire** on 2026-08-20 by `tests/test_failclosed_capture.sh`: with the proxy absent, refusing `UDP ASSOCIATE`, or the shim unconfigured, tcpdump captured **zero** packets, against a positive control that captured 11. TST-03 watches the destination, which cannot see a datagram that leaves this host for the wrong address; this can |
 | SEC-02 | M | §9.4 | TST-03, capture | **Verified** — three scenarios (proxy absent, `UDP ASSOCIATE` refused, shim unconfigured) × 10 send paths: zero datagrams reach the destination, and zero appear on the wire. A control run proves the client would otherwise get through, at both observation points |
 | SEC-03 | M | §7.2 | inspection | **Verified** — `--password` is refused explicitly with a pointer to the file/environment route |
-| SEC-04 | S | §7.2 | unit-config | **Verified** — warns on a group- or world-writable config |
+| SEC-04 | S | §7.2 | unit-config, TST-auth | **Verified** — warns on a group- or world-writable config, and on a config holding `password =` that others can read; a readable password file is warned about once, by the wrapper (D-33) |
 | SEC-05 | M | §1, §4.1 | inspection | **Implemented** — the shim calls `socket()` only for the outbound TCP control connection and the post-`fork` replacement; there is no `listen()` or `accept()` anywhere in `src/` |
 | SEC-06 | M | §7.2 | manual | **Verified** — setuid, setgid and file-capability targets are all refused |
 

@@ -36,6 +36,11 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 - **The wrapper could check one file and run another (D-28).** The setuid/capability check inspected
   the file found on `PATH`, then `execvp()` searched `PATH` again. The checked file is now the one
   executed.
+- **The library exported its internals, and was built without hardening (D-35).** Every internal
+  `udpc_*` function was an exported symbol, so a program defining a function of the same name
+  could replace a piece of the shim. Only the hooks are exported now. The library is built with
+  `-fstack-protector-strong`, full RELRO and immediate binding, and `_FORTIFY_SOURCE=2` in
+  optimised builds.
 
 ### Added
 
@@ -62,6 +67,14 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   longer consulted by proxied programs, since each resolves through a local daemon. Address order
   no longer follows glibc's RFC 6724 sort. Non-ASCII names and `getaddrinfo_a` are refused.
   See the README's *Name resolution* section.
+- **`-q` means errors only, as documented (D-33).** It previously still printed warnings.
+  `UDPCHAINS_QUIET` and `UDPCHAINS_DEBUG` now take a boolean, so `UDPCHAINS_QUIET=0` is no longer
+  quiet, and a value that is not a boolean is an error.
+- **Repeated warnings are rate-limited (D-33).** A warning that fired per datagram (a refused
+  multicast or broadcast send, an oversized inbound datagram) now prints at most once a second,
+  with a count of those held back.
+- **A readable password file is warned about once,** by `udpchains`, not again by the program it
+  runs. A config file holding `password =` that other users can read is now warned about too.
 
 ### Fixed
 
@@ -88,6 +101,22 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   `close_range` or a `dup2` took a control connection away. The shim then polled, and on teardown
   *closed*, whatever the program had put at that number. Shim descriptors now live at 768 and up
   and are protected. `close_range(3, ~0U)` no longer walks a million table entries.
+- **Warnings were written into whatever took over descriptor 2 (D-33).** A daemon that closes
+  stderr and opens its log file gets descriptor 2 for it, and the shim's warnings landed in the
+  log. The shim now checks descriptor 2 is still the stderr it started with.
+- **A forked child's datagrams were dropped by a proxy honouring the declared address (D-34).**
+  The child's private socket lost a wildcard-with-port binding, and a failed re-bind was ignored,
+  so the child declared the parent's address while sending from another port. It now binds again
+  in both cases, and when that fails it stops declaring the address and warns once.
+- **Short addresses and oversized messages were read past or misreported.** `connect()` and
+  `sendto()` copied a full address whatever length was passed, reading past a short buffer; they
+  now fail with `EINVAL`, as the kernel does. A `NULL` `msg_iov` with a non-zero length crashed and
+  is now `EFAULT`. `msg_iovlen` above `IOV_MAX` was truncated to `int` and is now `EMSGSIZE`.
+  A send of exactly `IOV_MAX` buffers, which the header's extra buffer pushed over the kernel's
+  limit, now works.
+- **Password and config-file edge cases.** A password file over 255 bytes, the RFC 1929 limit, was
+  silently truncated and is now an error. A Windows line ending (`\r\n`) is stripped. An overlong
+  config line starting with whitespace was not detected.
 
 Four ways an intercepted socket could escape the shim, all found in review after 1.0.0 and each
 reproduced before being fixed. Two were SEC-01 violations — a datagram sent directly with the
@@ -148,7 +177,21 @@ proxy down — and one was the FR-I-02 defect the project exists to prevent. See
     explicit `IPPROTO_UDP` still works; the old shim accepted all three.
   - The lifecycle test checks that a forked child holds no control connection; the old shim left
     it one.
-- Suite: 616 assertions across 17 groups. Clean under ASan/UBSan, TSan, Valgrind memcheck and
+- L1–L7 (D-33–D-35):
+  - The fidelity test covers short addresses, a 24-byte IPv6 address, a `NULL` `msg_iov`, and
+    `msg_iovlen` of `IOV_MAX + 1` and of a value that truncates to 1, then round-trips `IOV_MAX`
+    one-byte buffers. The previous shim crashes.
+  - The fault test forks a child from a bound socket under a proxy fixture enforcing the declared
+    address (`--pin-declared`). The previous shim times out. It also checks that 50 refused
+    multicast sends print one warning, that `-q` prints none, and that a file opened at descriptor 2
+    receives nothing.
+  - The auth test checks a readable password file is warned about once, and a readable config file
+    holding a password is warned about.
+  - The config unit test covers the password-file limit and `\r\n`, boolean `UDPCHAINS_QUIET`, and
+    overlong lines.
+  - The symbol gate checks that no `udpc_*` symbol is exported, and for RELRO, immediate binding
+    and the stack protector.
+- Suite: 644 assertions across 17 groups. Clean under ASan/UBSan, TSan, Valgrind memcheck and
   Helgrind.
 
 ### Documentation

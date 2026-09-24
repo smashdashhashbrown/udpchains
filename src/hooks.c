@@ -36,6 +36,11 @@
 #include "real.h"
 #include "shim.h"
 
+/* D-35: the shim is built with -fvisibility=hidden, so nothing it defines is
+ * exported unless marked.  Every non-static function from here on is a hook,
+ * and must be exported. */
+#pragma GCC visibility push(default)
+
 /* --- helpers --------------------------------------------------------------- */
 
 static bool is_intercepted_kind(int domain, int type)
@@ -205,6 +210,10 @@ static void adopt_received_fds(const struct msghdr *msg)
 
 __attribute__((constructor)) static void udpc_ctor(void)
 {
+	/* Before anything can log: what stderr is now is the program's
+	 * stderr, and the shim writes nowhere else (D-33). */
+	udpc_log_bind_stderr();
+
 	/* Registering the atfork handler must happen before the application can
 	 * fork (FR-L-04). */
 	udpc_assoc_init();
@@ -275,20 +284,28 @@ int bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
 
 	/* FR-P-05: a concrete bound address is declared in the UDP ASSOCIATE
 	 * request; a wildcard one is not, because proxies pin the association
-	 * to whatever is declared. */
-	if (addr != NULL && udpc_sa_len(addr) != 0) {
+	 * to whatever is declared.  The kernel accepted addrlen, and the copy
+	 * reads no more than it (L1). */
+	{
+		struct sockaddr_storage ss;
 		bool concrete = false;
 
-		if (addr->sa_family == AF_INET) {
-			const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+		if (udpc_sa_copy(addr, addrlen, &ss) != 0)
+			return 0;
+		if (ss.ss_family == AF_INET) {
+			const struct sockaddr_in *in = (const struct sockaddr_in *)&ss;
 			concrete = (in->sin_addr.s_addr != INADDR_ANY);
-		} else if (addr->sa_family == AF_INET6) {
-			const struct sockaddr_in6 *in6 =
-				(const struct sockaddr_in6 *)addr;
+		} else {
+			const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)&ss;
 			concrete = !IN6_IS_ADDR_UNSPECIFIED(&in6->sin6_addr);
 		}
 
-		memcpy(&e->bound, addr, udpc_sa_len(addr));
+		memcpy(&e->bound, &ss, sizeof(e->bound));
+		/* A wildcard bind that names a port still fixes the socket's
+		 * port, which a forked child's private socket must keep (D-34). */
+		atomic_store_explicit(&e->rebind,
+		                      concrete || udpc_sa_port((const struct sockaddr *)&ss) != 0,
+		                      memory_order_relaxed);
 		atomic_store_explicit(&e->bound_set, concrete, memory_order_release);
 	}
 	return 0;
@@ -313,15 +330,24 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
 		return 0;
 	}
 
-	if (addr == NULL || udpc_sa_len(addr) == 0) {
-		errno = EAFNOSUPPORT;
-		return -1;
-	}
+	/* L1: checked against addrlen as the kernel would, since the real
+	 * connect() never sees this address.  A short one is EINVAL, never a
+	 * read past the caller's buffer. */
+	{
+		struct sockaddr_storage ss;
 
-	/* Record the destination the application named.  Published with release
-	 * ordering so a concurrent send that observes `connected` also observes
-	 * a complete address. */
-	memcpy(&e->app_dst, addr, udpc_sa_len(addr));
+		if (addr == NULL) {
+			errno = EFAULT;
+			return -1;
+		}
+		if (udpc_sa_copy(addr, addrlen, &ss) != 0)
+			return -1;
+
+		/* Record the destination the application named.  Published with
+		 * release ordering so a concurrent send that observes `connected`
+		 * also observes a complete address. */
+		memcpy(&e->app_dst, &ss, sizeof(e->app_dst));
+	}
 	atomic_store_explicit(&e->connected, true, memory_order_release);
 
 	/* FR-F-08: a second connect() re-targets.  The association is unchanged
@@ -638,6 +664,18 @@ int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen)
 	return REAL_GETSOCKNAME(fd, addr, addrlen);
 }
 
+/* L2: msg_iovlen is a size_t, and the core takes an int.  Anything above
+ * IOV_MAX is EMSGSIZE in the kernel too, and checking before the cast stops a
+ * huge value wrapping into a small one. */
+static bool iovlen_ok(const struct msghdr *m)
+{
+	if (m->msg_iovlen > (size_t)IOV_MAX) {
+		errno = EMSGSIZE;
+		return false;
+	}
+	return true;
+}
+
 /* --- send hooks (FR-I-03) -------------------------------------------------- */
 
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
@@ -697,6 +735,8 @@ ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
 	 * actually own (§8 of the requirements).  It is ignored rather than
 	 * forwarded, since forwarding relay-relative values would be worse than
 	 * dropping them. */
+	if (!iovlen_ok(msg))
+		return -1;
 	if (msg->msg_controllen > 0)
 		udpc_debug("fd %d: ignoring %zu bytes of ancillary data on send",
 		           fd, (size_t)msg->msg_controllen);
@@ -723,7 +763,8 @@ int sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
 	 * return k; if the first fails, return -1. */
 	for (i = 0; i < vlen; i++) {
 		struct msghdr *m = &msgvec[i].msg_hdr;
-		ssize_t n = udpc_core_send(fd, e, m->msg_iov, (int)m->msg_iovlen,
+		ssize_t n = !iovlen_ok(m) ? -1
+		          : udpc_core_send(fd, e, m->msg_iov, (int)m->msg_iovlen,
 		                           (const struct sockaddr *)m->msg_name,
 		                           m->msg_namelen, flags);
 		if (n < 0) {
@@ -841,6 +882,8 @@ ssize_t recvmsg(int fd, struct msghdr *msg, int flags)
 		return -1;
 	}
 
+	if (!iovlen_ok(msg))
+		return -1;
 	namelen = msg->msg_namelen;
 	n = udpc_core_recv(fd, e, msg->msg_iov, (int)msg->msg_iovlen,
 	                   (struct sockaddr *)msg->msg_name,
@@ -896,7 +939,8 @@ int recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
 		 * at whatever happens to be queued.  Only MSG_WAITFORONE turns
 		 * on MSG_DONTWAIT after the first, which is applied at the
 		 * bottom of this loop. */
-		n = udpc_core_recv(fd, e, m->msg_iov, (int)m->msg_iovlen,
+		n = !iovlen_ok(m) ? -1
+		  : udpc_core_recv(fd, e, m->msg_iov, (int)m->msg_iovlen,
 		                   (struct sockaddr *)m->msg_name,
 		                   m->msg_name != NULL ? &namelen : NULL, use_flags,
 		                   &msgflags);

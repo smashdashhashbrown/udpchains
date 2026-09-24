@@ -30,6 +30,11 @@
 #include "real.h"
 #include "resolve.h"
 
+/* D-35: the shim is built with -fvisibility=hidden, so nothing it defines is
+ * exported unless marked.  Every non-static function from here on is a hook,
+ * and must be exported. */
+#pragma GCC visibility push(default)
+
 /* --- helpers --------------------------------------------------------------- */
 
 /* D-22: IDN conversion is glibc-internal, so a non-ASCII name cannot be

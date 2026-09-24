@@ -22,6 +22,8 @@
  *   --no-peer-lock      accept client datagrams from any source address
  *   --reject-atyp N     reject requests carrying this ATYP
  *   --no-connect        refuse CONNECT (the shim's DNS-over-TCP fallback, D-22)
+ *   --pin-declared      accept client datagrams only from the address declared in
+ *                       UDP ASSOCIATE, when one is declared, as strict proxies do
  *   --quiet             suppress the per-datagram log
  *
  * Prints "PORT <n>" on stdout once listening, so tests can use an ephemeral
@@ -76,8 +78,9 @@ static struct {
 	const char *auth_user;
 	const char *auth_pass;
 	bool no_connect;
+	bool pin_declared;
 } opt = { 0, false, false, 0, 0, 0, 8192, false, true, -1, false, false,
-          "testuser", "testpass", false };
+          "testuser", "testpass", false, false };
 
 static void logf_(const char *fmt, ...)
 	__attribute__((format(printf, 1, 2)));
@@ -386,7 +389,8 @@ static void *client_thread(void *arg)
 	uint8_t buf[BUF_MAX];
 	uint8_t out[BUF_MAX];
 	int relay = -1;
-	struct sockaddr_storage relay_addr, client_addr;
+	struct sockaddr_storage relay_addr, client_addr, declared, last_dst;
+	bool pinned = false;
 	socklen_t rlen;
 	bool client_locked = false;
 	long counter = 0;
@@ -507,6 +511,27 @@ static void *client_thread(void *arg)
 			(void)write_all(cfd, out, 10);
 			goto done;
 		}
+		/* What the client declared (FR-P-05): all zeros unless it bound
+		 * a concrete address.  Logged, and with --pin-declared, enforced. */
+		memset(&declared, 0, sizeof(declared));
+		if (atyp == ATYP_IPV4) {
+			struct sockaddr_in *d = (struct sockaddr_in *)&declared;
+			d->sin_family = AF_INET;
+			memcpy(&d->sin_addr, buf + 4, 4);
+			memcpy(&d->sin_port, buf + 8, 2);
+			pinned = d->sin_addr.s_addr != 0 && d->sin_port != 0;
+		} else if (atyp == ATYP_IPV6) {
+			struct sockaddr_in6 *d = (struct sockaddr_in6 *)&declared;
+			d->sin6_family = AF_INET6;
+			memcpy(&d->sin6_addr, buf + 4, 16);
+			memcpy(&d->sin6_port, buf + 20, 2);
+			pinned = !IN6_IS_ADDR_UNSPECIFIED(&d->sin6_addr) &&
+			         d->sin6_port != 0;
+		}
+		logf_("UDP ASSOCIATE declares %s",
+		      sa_str((struct sockaddr *)&declared, abuf, sizeof(abuf)));
+		pinned = pinned && opt.pin_declared;
+
 		if (opt.refuse_associate) {
 			logf_("refusing UDP ASSOCIATE (fault injection)");
 			out[0] = SOCKS_VER;
@@ -617,6 +642,16 @@ static void *client_thread(void *arg)
 	}
 
 	last_activity = time(NULL);
+	memset(&last_dst, 0, sizeof(last_dst));
+
+	/* --pin-declared: the association belongs to the declared address from
+	 * the start, not to whoever sends first. */
+	if (pinned) {
+		to_mapped(&declared, &client_addr);
+		client_locked = true;
+		logf_("pinned to the declared address %s",
+		      sa_str((struct sockaddr *)&client_addr, abuf, sizeof(abuf)));
+	}
 
 	for (;;) {
 		struct pollfd pfd[2];
@@ -725,6 +760,7 @@ static void *client_thread(void *arg)
 				{
 					struct sockaddr_storage md;
 					to_mapped(&dst, &md);
+					memcpy(&last_dst, &md, sizeof(md));
 					if (sendto(relay, buf + hlen,
 					           (size_t)(n - hlen), 0,
 					           (struct sockaddr *)&md,
@@ -738,6 +774,22 @@ static void *client_thread(void *arg)
 				 * IPv4 peer is told about an IPv4 peer. */
 				struct sockaddr_storage src = from;
 				size_t hlen;
+
+				/* Pinned: a datagram from neither the declared
+				 * client nor a destination it sent to is a client
+				 * sending from the wrong address.  Dropped, as a
+				 * strict proxy drops it -- silently, from the
+				 * client's point of view. */
+				if (pinned && !sa_equal((struct sockaddr *)&from,
+				                        (struct sockaddr *)&last_dst)) {
+					logf_("dropping a datagram from %s: the "
+					      "association is pinned to %s",
+					      sa_str((struct sockaddr *)&from, abuf,
+					             sizeof(abuf)),
+					      sa_str((struct sockaddr *)&client_addr, bbuf,
+					             sizeof(bbuf)));
+					continue;
+				}
 
 				if ((size_t)n > opt.max_dgram) {
 					logf_("reply %zd > max %zu, dropping", n,
@@ -806,6 +858,8 @@ int main(int argc, char **argv)
 			opt.auth_pass = argv[++i];
 		else if (strcmp(a, "--no-connect") == 0)
 			opt.no_connect = true;
+		else if (strcmp(a, "--pin-declared") == 0)
+			opt.pin_declared = true;
 		else {
 			fprintf(stderr, "socks5d: unknown option %s\n", a);
 			return 1;

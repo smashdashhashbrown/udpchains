@@ -178,5 +178,29 @@ else
 	notok "an inline config password failed to authenticate: $out"
 fi
 
+# --- L5 / D-33: permission warnings, once each --------------------------------
+# With warnings on, which run.sh turns off.  The wrapper checks each file's
+# permissions; the processes under it no longer repeat the warning.
+printf 's3cret' > "$TMP/loosepass"
+chmod 644 "$TMP/loosepass"
+out=$(env -u UDPCHAINS_QUIET UDPCHAINS_USERNAME=alice \
+	UDPCHAINS_PASSWORD_FILE="$TMP/loosepass" \
+	"$WRAPPER" -p "127.0.0.1:$PROXY" /bin/true 2>&1) || true
+c=$(printf '%s\n' "$out" | grep -c 'group- or world-accessible' || true)
+if [ "$c" = "1" ]; then
+	ok "a readable password file is warned about exactly once"
+else
+	notok "a readable password file was warned about $c times"
+fi
+
+chmod 644 "$TMP/auth.conf"
+out=$(env -u UDPCHAINS_QUIET "$WRAPPER" -f "$TMP/auth.conf" \
+	-p "127.0.0.1:$PROXY" /bin/true 2>&1) || true
+if printf '%s' "$out" | grep -q 'holds a password and is readable'; then
+	ok "a config file holding a password is called out when others can read it"
+else
+	notok "no warning for a readable config file holding a password: $out"
+fi
+
 echo "1..$n"
 [ "$fail" -eq 0 ] || exit 1

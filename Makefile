@@ -45,6 +45,27 @@ CFLAGS  += -fsanitize=thread -fno-omit-frame-pointer -O1
 LDFLAGS += -fsanitize=thread
 endif
 
+# D-35 / L7: hardening, and an export list of hooks only.  Kept apart from
+# CFLAGS so that a CFLAGS given on the command line -- a distribution's own
+# flags, say -- does not silently drop it.
+#
+#   -fvisibility=hidden   nothing the shim defines is exported unless marked;
+#                         hooks.c and dnshooks.c mark their hooks.  Internal
+#                         udpc_* functions no longer reach every program's
+#                         symbol namespace, and TST-02 checks they do not.
+#   stack protector, full RELRO, immediate binding: the usual set for a
+#                         library loaded into programs it did not write.
+#   _FORTIFY_SOURCE=2     only where it is valid: glibc warns without
+#                         optimisation, -Werror makes that fatal, and it is
+#                         redundant under the sanitisers.
+HARDEN_CFLAGS  := -fvisibility=hidden -fstack-protector-strong
+HARDEN_LDFLAGS := -Wl,-z,relro -Wl,-z,now
+ifeq ($(findstring -O0,$(CFLAGS))$(ASAN)$(TSAN),)
+HARDEN_CFLAGS  += -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
+endif
+CFLAGS  += $(HARDEN_CFLAGS)
+LDFLAGS += $(HARDEN_LDFLAGS)
+
 SRCDIR  := src
 OBJDIR  := build
 TESTDIR := tests

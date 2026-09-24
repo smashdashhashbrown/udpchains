@@ -71,6 +71,7 @@ UDPCHAINS_DNS=9.9.9.9 udpchains -p 127.0.0.1:1080 nc -u example.com 53
 | `UDPCHAINS_DNS_TIMEOUT` | whole-lookup timeout in ms, default 5000 |
 | `UDPCHAINS_DNS_SEARCH` | search domains for single-label names; none by default |
 | `UDPCHAINS_HOSTS_FILE` | hosts file consulted before DNS, default `/etc/hosts` |
+| `UDPCHAINS_QUIET`, `UDPCHAINS_DEBUG` | as `-q` and `-v`; take a boolean (`1`/`0`, `yes`/`no`, `true`/`false`, `on`/`off`) |
 
 Config file:
 
@@ -263,6 +264,24 @@ Consequences you will actually notice:
   use GSO/GRO; their encryption rejects the damage, so QUIC fails rather than delivering garbage,
   but a plain UDP program does not. Even when QUIC works, a UDP flow through a TCP-based tunnel
   inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery.
+
+- **A proxy given by hostname is reached at its first address only.** If the name resolves to
+  several, the others are not tried when the first fails (D-35). Configure the address you want
+  numerically.
+
+- **A forked child cannot always keep its parent's bound port.** A child using an inherited socket
+  binds its private replacement to the same address and port, but while the parent still holds the
+  port that fails. The child then sends from another port, and warns once (D-34).
+
+- **A bad pointer inside a message crashes, as it would without the shim.** A `NULL` `msg_iov`, a
+  too-short address, or more than `IOV_MAX` buffers fail with the `errno` the kernel gives. The
+  shim copies a message before the kernel sees it, so a non-`NULL` pointer to unmapped memory
+  faults inside the shim instead of returning `EFAULT`.
+
+- **Warnings are rate-limited and go only to the original stderr.** A repeated warning (a refused
+  multicast send, an oversized inbound datagram) prints at most once a second, with a count of those
+  held back. If the program closes stderr and something else takes descriptor 2, the shim stays
+  silent rather than write into it (D-33). `-q` prints errors only.
 
 - **TCP is not proxied.** `proxychains-ng` already does that well. Composing the two is fine.
 

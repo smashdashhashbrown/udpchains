@@ -1,6 +1,7 @@
 #include "addr.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <stdio.h>
@@ -19,6 +20,38 @@ socklen_t udpc_sa_len(const struct sockaddr *sa)
 	default:
 		return 0;
 	}
+}
+
+int udpc_sa_copy(const struct sockaddr *sa, socklen_t len,
+                 struct sockaddr_storage *ss)
+{
+	socklen_t need, take;
+
+	if (sa == NULL || len < (socklen_t)sizeof(sa_family_t)) {
+		errno = EINVAL;
+		return -1;
+	}
+	switch (sa->sa_family) {
+	case AF_INET:
+		need = sizeof(struct sockaddr_in);
+		break;
+	case AF_INET6:
+		need = 24; /* SIN6_LEN_RFC2133: no sin6_scope_id */
+		break;
+	default:
+		errno = EAFNOSUPPORT;
+		return -1;
+	}
+	if (len < need) {
+		errno = EINVAL;
+		return -1;
+	}
+	take = udpc_sa_len(sa);
+	if (take > len)
+		take = len;
+	memset(ss, 0, sizeof(*ss));
+	memcpy(ss, sa, take);
+	return 0;
 }
 
 uint16_t udpc_sa_port(const struct sockaddr *sa)

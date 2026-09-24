@@ -15,6 +15,7 @@
 
 #include "addr.h"
 #include "config.h"
+#include "log.h"
 
 static char g_tmpdir[] = "/tmp/udpchains-cfg-XXXXXX";
 
@@ -212,6 +213,71 @@ int main(void)
 		err = NULL;
 		TAP_EQ_INT(udpc_config_finalize(&cfg, &err), -1,
 		           "an unresolvable proxy fails rather than being ignored");
+	}
+
+	TAP_GROUP("L5: password files, switches and long lines");
+	{
+		char pw[300], text[1200];
+		const char *path;
+		char *saved = getenv("UDPCHAINS_QUIET");
+
+		saved = saved != NULL ? strdup(saved) : NULL;
+
+		memset(pw, 'p', 256);
+		pw[256] = '\0';
+		path = write_conf("pw-256", pw, 0600);
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_set(&layer, "password_file", path, &err), -1,
+		           "a 256-byte password file is an error, not a silent "
+		           "truncation");
+
+		memset(pw, 'p', 255);
+		memcpy(pw + 255, "\r\n", 3);
+		path = write_conf("pw-255-crlf", pw, 0600);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_set(&layer, "password_file", path, &err), 0,
+		           "255 bytes -- RFC 1929's limit -- ending in CR LF is "
+		           "accepted");
+		TAP_EQ_INT(strlen(layer.password), 255, "with the CR LF stripped");
+
+		setenv("UDPCHAINS_QUIET", "0", 1);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), 0,
+		           "UDPCHAINS_QUIET=0 parses");
+		TAP_OK(layer.verbosity != UDPC_QUIET, "and does NOT turn quiet mode on");
+		setenv("UDPCHAINS_QUIET", "yes", 1);
+		udpc_config_init(&layer);
+		udpc_config_from_env(&layer, &err);
+		TAP_EQ_INT(layer.verbosity, UDPC_QUIET, "UDPCHAINS_QUIET=yes does");
+		setenv("UDPCHAINS_QUIET", "maybe", 1);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), -1,
+		           "a value that is not a boolean is an error");
+		if (saved != NULL)
+			setenv("UDPCHAINS_QUIET", saved, 1);
+		else
+			unsetenv("UDPCHAINS_QUIET");
+		free(saved);
+
+		/* Leading whitespace once hid a line's length from the check. */
+		memset(text, ' ', 4);
+		memset(text + 4, 'x', 1100);
+		strcpy(text + 1104, "\n");
+		path = write_conf("long-indented.conf", text, 0600);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &(int){0}), -1,
+		           "an over-long line is refused even when indented");
+
+		/* A last line exactly filling the buffer, with no newline, is
+		 * complete -- not too long. */
+		memset(text, ' ', sizeof(text));
+		memcpy(text, "proxy = 127.0.0.1:1080", 22);
+		text[1023] = '\0';
+		path = write_conf("exact-last-line.conf", text, 0600);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &(int){0}), 0,
+		           "a final 1023-byte line without a newline still parses");
 	}
 
 	{

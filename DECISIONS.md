@@ -1275,3 +1275,97 @@ Reviewed, and kept as documented limitations rather than fixed before 1.0. Each 
   holds a socket.
 
 **Revisit if:** any of these is met in real use; the first three have a known fix.
+
+---
+
+## D-33
+### Diagnostics: rate-limited, errors-only under `-q`, and never into a reused fd 2
+
+**Date:** 2026-09-24 · **Status:** Accepted · Review items L4 and, for the permission warnings, L5.
+
+**Context.** Three things were wrong with how the shim reported problems:
+
+- **It warned once per datagram.** Warnings about a refused multicast or broadcast send, or an
+  inbound datagram over `max_datagram`, printed a line for every datagram. A program retrying in a
+  loop filled the terminal or the journal.
+- **It wrote to whatever descriptor 2 was.** A daemon that closes stderr and then opens its log
+  file is given descriptor 2 for that file, and the shim's warnings were written into it. The same
+  happens to a socket that lands at 2, where the warning would be sent to its peer.
+- **`-q` still printed warnings,** though the help text and man page say "errors only". Separately,
+  a group- or world-readable password file was warned about twice: once by the wrapper and again
+  by the shim in the program.
+
+**Decision.**
+
+- **Repeated warnings are rate-limited:** at most one per second for each kind. The next one that
+  prints says how many were held back.
+- **The shim checks descriptor 2 is still the stderr it started with.** Its constructor records
+  fd 2's device and inode, and each message first compares them with `fstat`. If fd 2 was closed,
+  or now refers to something else, the message is dropped. A program that redirects its own stderr
+  with `dup2` after start-up loses the shim's messages as a result. That is the safer way to be
+  wrong.
+- **`-q` means errors only.** Warnings are suppressed under it, as the documentation already said.
+- **The wrapper checks file permissions; the shim does not repeat them.** A shim launched by the
+  wrapper (the resolved-environment marker, D-27) skips the permission warnings. A shim started
+  with `LD_PRELOAD` directly still gives them.
+
+**Consequences.** One `fstat` per message, not per datagram, so there is no cost on the datagram
+path. A burst of 50 refused multicast sends prints one line where it printed 50. The fault test
+checks the burst, `-q`, and a file opened at descriptor 2; the auth test checks each permission
+warning appears once.
+
+---
+
+## D-34
+### A forked child binds its private socket again, and stops declaring an address it cannot own
+
+**Date:** 2026-09-24 · **Status:** Accepted · Review item L6.
+
+**Context.** After `fork()`, a child that uses an inherited UDP socket is given a private
+replacement (FR-L-04). The replacement was bound again only when the original had a concrete
+address, so a wildcard-with-port binding (`0.0.0.0:5000`) was dropped. When that `bind()` failed
+— normally because the parent still holds the port — the failure was ignored. The child then went
+on declaring the parent's address in `UDP ASSOCIATE` while sending from an ephemeral port. A proxy
+that honours the declared address accepts only datagrams from it, so every one of the child's
+datagrams was dropped, and the child waited for replies that never came.
+
+**Decision.** The shim now records whether a socket was bound to a concrete address *or* to a port,
+and the child binds its replacement again in both cases. If that `bind()` fails, the child clears
+the recorded address and warns once. Its later associations declare nothing, so the proxy uses the
+source it actually sees.
+
+**Consequences.** The child's datagrams leave from an ephemeral port whenever the parent still
+holds the original, which is unavoidable, since two sockets cannot bind one port without
+`SO_REUSEPORT`. The warning says so. The proxy fixture gained `--pin-declared`, which enforces the
+declared address. The fault test forks a child from a bound socket under it: the child's round
+trip, and the parent's afterwards, both succeed. The previous shim times out there.
+
+---
+
+## D-35
+### Hidden symbols and standard hardening; the proxy name uses its first address
+
+**Date:** 2026-09-24 · **Status:** Accepted · Review item L7.
+
+**Context.** The library exported every internal `udpc_*` function, so a program with a function
+of the same name could interpose on the shim's internals, or the shim on the program's. It was
+built without the stack protector, RELRO or immediate binding. And `udpc_addr_parse` uses only the
+first address `getaddrinfo` returns for a proxy hostname.
+
+**Decision.**
+
+- **Only the hooks are exported.** The library is built with `-fvisibility=hidden`, and the two
+  files that define hooks mark them visible with `#pragma GCC visibility push(default)`. The symbol
+  gate checks that no `udpc_*` symbol is exported.
+- **The standard hardening flags are always on.** They are `-fstack-protector-strong`,
+  `-Wl,-z,relro` and `-Wl,-z,now`. `-D_FORTIFY_SOURCE=2` is added only in optimised builds without
+  a sanitizer, since it needs optimisation and conflicts with ASan's own checks. The symbol gate
+  checks for the RELRO segment, `BIND_NOW` and the stack protector.
+- **First-address-only is kept and documented.** Failing over between a proxy's addresses would
+  mean retrying the handshake per address inside the send path, which lengthens a send that
+  already blocks (D-32, M3). To choose the address, configure it numerically.
+
+**Consequences.** 54 exported symbols, all hooks. `-z now` binds the library's own imports when it
+loads rather than on first call, which moves a few microseconds to start-up; the hooks' `RTLD_NEXT`
+lookups are unaffected. The stack protector costs a comparison on return from functions with local
+arrays. The performance group stays within the NFR-04 budget.

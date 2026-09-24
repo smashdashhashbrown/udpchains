@@ -111,6 +111,38 @@ for pair in "sendto:recvfrom" "sendmsg:recvmsg" "sendmmsg:recvmmsg" \
 	fi
 done
 
+# D-35: the hooks are the whole export list.  An internal udpc_* function in the
+# dynamic symbol table would reach every program's namespace, and could be
+# interposed by it.
+echo "# TST-02: D-35 -- internal functions are not exported"
+leaked=$(printf '%s\n' "$SYMS" | grep -c '^udpc_' || true)
+if [ "$leaked" = "0" ]; then
+	echo "ok - no internal udpc_* symbol is exported"
+else
+	echo "not ok - $leaked internal udpc_* symbols are exported" >&2
+	fail=1
+fi
+
+echo "# TST-02: D-35 -- hardening"
+if readelf -lW "$SHIM" 2>/dev/null | grep -q GNU_RELRO; then
+	echo "ok - RELRO segment present"
+else
+	echo "not ok - no RELRO segment" >&2
+	fail=1
+fi
+if readelf -dW "$SHIM" 2>/dev/null | grep -qE 'BIND_NOW|FLAGS.*NOW'; then
+	echo "ok - immediate binding (-z now)"
+else
+	echo "not ok - lazy binding: built without -z now" >&2
+	fail=1
+fi
+if nm -D --undefined-only "$SHIM" | grep -q __stack_chk_fail; then
+	echo "ok - built with the stack protector"
+else
+	echo "not ok - no stack protector" >&2
+	fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
 	echo "TST-02 FAILED" >&2
 	exit 1
