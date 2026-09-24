@@ -131,17 +131,17 @@ top[fd >> 8]  →  block of 256 entries  →  entry[fd & 0xff]
 - Top level: fixed array of atomic pointers, sized for the maximum plausible fd. Costs one pointer
   per 256 fds.
 - Blocks: allocated on demand in `socket()`/`dup*()`, published with a release-store CAS. Never
-  freed — an application that once used fd N is likely to again, and freeing would reintroduce the
-  use-after-free hazard the generation counter exists to prevent.
-- **No allocation, no locks, and no syscalls on the datagram path** (NFR-02, NFR-03). A lookup is
-  two atomic loads.
+  freed — an application that once used fd N is likely to again, and a thread still holding a
+  pointer into a freed block would read freed memory.
+- **No allocation and no locks on the datagram path** once a socket's association is up (NFR-02,
+  NFR-03). A lookup is two atomic loads, plus one `getsockopt` for a descriptor the shim tracks,
+  to confirm it is still the same socket (D-23). NFR-03 holds only in that steady state; see §3.5.
 
 Entry contents:
 
 | Field | Purpose |
 |---|---|
 | `state` (atomic) | `FREE` → `CLAIMING` → `ACTIVE` → `DYING` → `FREE`; or `SHIM` for the shim's own descriptors (D-26) |
-| `generation` (atomic) | Bumped on every transition to `FREE`; guards against fd reuse (FR-L-02) |
 | `cookie` (atomic) | The socket's `SO_COOKIE`, checked by every intercepted call so a stale entry never claims whatever reused its number (D-23) |
 | `assoc` | Pointer to the shared association object (§3.2) |
 | `app_dst` | Destination the application named via `connect()` (FR-F-08) |
@@ -198,8 +198,10 @@ with `EBADF`, `close_range` closes around them, and `dup2`/`dup3` onto one fails
 mark whose cookie no longer matches is stale — the descriptor was closed by a route no hook sees —
 and is cleared rather than enforced.
 
-On release the entry's generation is bumped before the state returns to `FREE`, so a subsequent
-socket receiving the same fd number cannot inherit stale state (FR-L-02).
+On release the entry is reset before its state returns to `FREE`, so a subsequent socket receiving
+the same fd number cannot inherit stale state (FR-L-02). A generation counter once described here as
+a guard against reuse was never checked, and has been removed (D-30): the per-call cookie check
+(D-23) is what catches an entry that no longer matches its socket.
 
 Release depends on interposing `close()`, and not every program's closes reach it — `dig` closes
 through libuv, and 4 of its 64 `close` syscalls arrive at the hook. Those entries are stranded
@@ -211,8 +213,11 @@ spurious `EMFILE` and leaked the stranded entry's control connection.
 
 ### 3.4 `fork`
 
-A `pthread_atfork` **child** handler bumps a single global generation counter and does nothing else.
-All real work is deferred off the handler, where async-signal-safety constraints are tightest.
+A `pthread_atfork` **child** handler bumps a global fork generation, and closes the child's copies of
+the parent's control connections (D-31), so the parent's associations end when the parent closes
+them rather than when the last child exits. That is all it does: closing descriptors and storing to
+memory the child alone owns are safe there. It also clears any "establishing" marker left by a parent
+thread that did not survive the fork. Tearing the associations down is deferred to first use.
 
 On the child's next use of an inherited fd, the association's `fork_generation` is found stale and
 the association is torn down and re-established (FR-L-04). Closing the inherited `control_fd` in the
@@ -221,7 +226,12 @@ association survives.
 
 ### 3.5 Concurrency summary
 
-- Datagram path: atomic loads only, no locks, no allocation, no `getpid`.
+- Datagram path, once a socket's association is up: atomic operations, one `getsockopt` (D-23), no
+  locks, no allocation.
+- **NFR-03 is partial.** A socket's first send (association setup allocates and handshakes), a
+  thread's first datagram (its scratch buffers are allocated), and `socket()`, `dup*()` and
+  `close()` (table blocks, association release) all allocate or free memory. Any of those inside a
+  signal handler that interrupted `malloc` can deadlock. The steady-state send and receive cannot.
 - Mutation path (`socket`, `close`, `dup*`, association establishment): CAS on entry state; block
   allocation via CAS on the top-level slot.
 - Association establishment is serialised per entry by the `ESTABLISHING` state, so two threads
@@ -520,12 +530,11 @@ getaddrinfo(name, service, hints)
   condition variable. The resolver path may lock and allocate: `getaddrinfo` is not
   async-signal-safe anyway (D-22).
 - Each entry holds its own control connection and UDP socket. Both are the shim's own descriptors,
-  created under the re-entry guard with `SOCK_CLOEXEC`. Their placement in the descriptor space
-  should follow whatever review item H4 settles for control connections.
+  created under the re-entry guard with `SOCK_CLOEXEC`, and moved into the protected band (D-26).
 - An entry idle long enough to have been expired is re-checked before use, as FR-P-08 does for
   application sockets.
-- After `fork`, entries from the parent's generation are discarded on first use. Closing their
-  descriptors in the child is safe for the same reason as §3.4: the parent holds its own references.
+- After `fork`, the child closes its copies of every entry's descriptors at once (D-31), which is
+  safe for the same reason as §3.4: the parent holds its own references.
 
 ### 11.4 Replies
 

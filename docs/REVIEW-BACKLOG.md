@@ -48,37 +48,47 @@ None open.
 - [ ] **M1 — `strict_loopback` can be bypassed.** The guard runs only at association setup, and
   only for connected sockets (`src/assoc.c:156`). An unconnected `sendto(127.0.0.1)`, a `connect()`
   after association, or a re-connect is never checked. Check per send in `udpc_core_send` instead.
+  - **Documented, not fixed (D-32), awaiting commit.**
 - [ ] **M2 — `MSG_MORE` / `UDP_CORK` / GSO / GRO silently corrupt data.** *PoC.* Sending
   `AAA` + `BBB` with `MSG_MORE` delivers `AAA` + a 10-byte header + `BBB`. The README says such
   programs "fall back or fail". At minimum, reject `MSG_MORE` with `EOPNOTSUPP`.
+  - **Documented, not fixed (D-32), awaiting commit.**
 - [ ] **M3 — the proxy handshake blocks, even on non-blocking sockets.** The first send or receive
   runs the full connect and handshake synchronously, with `connect_timeout` applied per step
   rather than overall. With the proxy down, every failed send makes two full attempts
   (`src/core.c:277`, where `ECONNREFUSED` counts as "looks dead").
+  - **Documented, not fixed (D-32), awaiting commit.**
 - [ ] **M4 — the shim re-reads the default config files.** `udpc_config_load_shim` still reads
   `~/.udpchains.conf` and `/etc/udpchains.conf` (`src/config.c:414`), contradicting the comment at
   `src/config.c:509`. With `-f a.conf`, the home file's credentials still get used, and a broken
   home file breaks the target after the wrapper reported success.
+  - **Fixed (D-27), awaiting commit.**
 - [ ] **M5 — the wrapper exports the proxy's hostname, not its resolved address.** Every exec'd
   descendant repeats the DNS lookup directly and may get a different address.
+  - **Fixed (D-27), awaiting commit.**
 - [ ] **M6 — the setuid/setgid check and the exec can look at different files.** The wrapper
   checks the path `resolve_program()` found, then `execvp` searches `PATH` again
   (`src/wrapper.c:463`). Use `execv(program, ...)`.
+  - **Fixed (D-28), awaiting commit.**
 - [ ] **M7 — interception ignores the protocol number.** ICMP ping sockets
   (`SOCK_DGRAM`/`IPPROTO_ICMP`, used by unprivileged `ping`) and UDP-Lite are treated as UDP
   (`src/hooks.c`, `is_intercepted_kind` and `adopt_fd`). *Inspection*: ping sockets are disabled
   on the review host.
+  - **Fixed (D-29): refused, option (a). Awaiting commit.**
 - [ ] **M8 — the FR-L-02 generation counter is never read.** It is written at
   `src/fdtable.c:162` and nowhere checked, so the guard that comments and docs describe does not
   exist. `redirected` is also written but never read. Implement or remove both, and fix the docs.
+  - **Fixed (D-30): both fields removed. Awaiting commit.**
 - [ ] **M9 — a socket shared with another process is re-pointed.** After `fork()` + `exec`, an
   inherited UDP socket is adopted fresh, and first use `connect()`s the shared socket to a new
   relay, which also redirects the parent's. The same applies to sockets received via
   `SCM_RIGHTS` whose sender keeps a copy (noted in D-21). Separately, children keep the parent's
   control connections open, so the parent's associations linger at the proxy.
+  - **Part (ii) fixed (D-31); part (i) documented, not fixed (D-32). Awaiting commit.**
 - [ ] **M10 — the signal-safety claim (NFR-03) is overstated.** The first send on a socket
   (`calloc`, handshake), the first datagram on each thread (`udpc_tls_get` mallocs), and
   `socket`, `dup` and `close` (block `calloc`, `free` via unref) all allocate or free memory.
+  - **Fixed as documentation: NFR-03 marked partial, README lists the cases. Awaiting commit.**
 
 ## Low
 

@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,7 +85,6 @@ static void unmark(struct udpc_fdent *e)
 	                                            memory_order_acq_rel,
 	                                            memory_order_acquire)) {
 		atomic_store_explicit(&e->cookie, 0, memory_order_relaxed);
-		atomic_fetch_add_explicit(&e->generation, 1u, memory_order_acq_rel);
 		atomic_store_explicit(&e->state, UDPC_FD_FREE, memory_order_release);
 	}
 }
@@ -119,10 +119,9 @@ struct udpc_fdent *udpc_fd_claim(int fd, int family, int type)
 	 *
 	 * Recycling the slot fixes both: udpc_fd_release drops the association
 	 * reference (closing the control connection, releasing the association
-	 * at the proxy) and returns the slot to FREE, bumping the generation so
-	 * anything still holding the old entry is rejected (FR-L-02).  A stale
-	 * SHIM mark means one of the shim's own descriptors was closed behind
-	 * its back; it is simply cleared.
+	 * at the proxy) and returns the slot to FREE, so the new socket inherits
+	 * nothing (FR-L-02).  A stale SHIM mark means one of the shim's own
+	 * descriptors was closed behind its back; it is simply cleared.
 	 *
 	 * Found on 2026-08-19 against a real proxy.  The fixture suite never
 	 * reached it because its clients close through libc. */
@@ -154,7 +153,6 @@ struct udpc_fdent *udpc_fd_claim(int fd, int family, int type)
 	atomic_store_explicit(&e->assoc, NULL, memory_order_relaxed);
 	atomic_store_explicit(&e->connected, false, memory_order_relaxed);
 	atomic_store_explicit(&e->bound_set, false, memory_order_relaxed);
-	atomic_store_explicit(&e->redirected, false, memory_order_relaxed);
 	memset(&e->app_dst, 0, sizeof(e->app_dst));
 	memset(&e->bound, 0, sizeof(e->bound));
 	atomic_store_explicit(&e->cookie, socket_cookie(fd), memory_order_relaxed);
@@ -174,7 +172,7 @@ void udpc_fd_rebind_cookie(struct udpc_fdent *e, int fd)
 
 int udpc_fd_adopt(int fd)
 {
-	int domain = 0, type = 0;
+	int domain = 0, type = 0, protocol = 0;
 	socklen_t len;
 	struct udpc_fdent *e;
 
@@ -186,10 +184,14 @@ int udpc_fd_adopt(int fd)
 		return 0;
 	if (type != SOCK_DGRAM || (domain != AF_INET && domain != AF_INET6))
 		return 0;
+	len = sizeof(protocol);
+	if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &len) == 0 &&
+	    protocol != 0 && protocol != IPPROTO_UDP)
+		return UDPC_ADOPT_UNPROXIABLE;
 
 	e = udpc_fd_claim(fd, domain, type);
 	if (e == NULL)
-		return -1;
+		return UDPC_ADOPT_UNTRACKABLE;
 	udpc_fd_publish(e);
 	return 1;
 }
@@ -281,12 +283,12 @@ void udpc_fd_release(int fd)
 
 	atomic_store_explicit(&e->connected, false, memory_order_relaxed);
 	atomic_store_explicit(&e->bound_set, false, memory_order_relaxed);
-	atomic_store_explicit(&e->redirected, false, memory_order_relaxed);
 
-	/* Bump the generation BEFORE returning the slot to FREE, so a socket()
-	 * that lands on this fd number cannot observe the old generation with a
-	 * free slot (FR-L-02). */
-	atomic_fetch_add_explicit(&e->generation, 1u, memory_order_acq_rel);
+	/* A thread that looked this entry up before the release, and is still
+	 * using it, is racing the application's own close -- which the kernel
+	 * does not order either (D-30).  It reads valid memory (blocks are
+	 * never freed, associations are type-stable, D-24), and the next call
+	 * on the number is checked against the socket now there (D-23). */
 	atomic_store_explicit(&e->state, UDPC_FD_FREE, memory_order_release);
 }
 
@@ -439,6 +441,23 @@ long udpc_fd_next_shim(unsigned from, unsigned last)
 	return -1;
 }
 
+void udpc_fd_for_each_active(void (*fn)(struct udpc_fdent *e))
+{
+	unsigned idx, i;
+
+	for (idx = 0; idx < UDPC_FD_TOP_SIZE; idx++) {
+		struct udpc_fdent *blk =
+			atomic_load_explicit(&g_top[idx], memory_order_acquire);
+
+		if (blk == NULL)
+			continue;
+		for (i = 0; i < UDPC_FD_BLOCK_SIZE; i++)
+			if (atomic_load_explicit(&blk[i].state, memory_order_acquire) ==
+			    UDPC_FD_ACTIVE)
+				fn(&blk[i]);
+	}
+}
+
 /* --- duplication ----------------------------------------------------------- */
 
 int udpc_fd_share(int oldfd, int newfd)
@@ -483,10 +502,6 @@ int udpc_fd_share(int oldfd, int newfd)
 	                      memory_order_relaxed);
 	atomic_store_explicit(&dst->bound_set,
 	                      atomic_load_explicit(&src->bound_set,
-	                                           memory_order_acquire),
-	                      memory_order_relaxed);
-	atomic_store_explicit(&dst->redirected,
-	                      atomic_load_explicit(&src->redirected,
 	                                           memory_order_acquire),
 	                      memory_order_relaxed);
 

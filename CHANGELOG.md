@@ -30,6 +30,13 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   `UDPCHAINS_PASSWORD_CONFIG` naming the config file, both absolute), and each shim reads it from
   there.
 
+- **Processes under the shim looked up the proxy's name directly (D-27).** The wrapper exported the
+  proxy as written, so a hostname was resolved again, unproxied, in every process the program
+  started. It is now exported as the address the wrapper resolved.
+- **The wrapper could check one file and run another (D-28).** The setuid/capability check inspected
+  the file found on `PATH`, then `execvp()` searched `PATH` again. The checked file is now the one
+  executed.
+
 ### Added
 
 - `dns` / `UDPCHAINS_DNS`: the resolver to query through the proxy, numeric only. **No default:**
@@ -41,6 +48,10 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Changed
 
+- **Non-UDP datagram sockets are refused (D-29).** An ICMP "ping" socket or a UDP-Lite socket was
+  taken for UDP and sent to the proxy's relay wrapped in SOCKS headers. Creating one now fails with
+  `EPROTONOSUPPORT` and a diagnostic, and an inherited or received one is closed. `ping` fails
+  under the shim rather than misbehaving.
 - Each intercepted call makes one `getsockopt`, to confirm its descriptor (D-23). That costs about
   0.8 µs per call: a `send()` in a tight loop went from 5.1 to 5.9 µs, averaged over six
   alternating runs, which is essentially the `getsockopt` itself. The effect on a round trip
@@ -65,6 +76,14 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   through a bare pointer, which another thread could free by noticing the proxy had expired it.
   Associations are now type-stable and read through a counted reference. A TSan test reports a
   heap use-after-free on the old code and nothing on the new.
+- **The shim read the default config files behind the wrapper's back (D-27).** With `-f`, the
+  credentials in `~/.udpchains.conf` were still used, and a broken home file made the shim report
+  itself unconfigured after the wrapper had reported success. Launched by the wrapper, the shim now
+  reads only the environment it was given.
+- **Forked children kept the parent's associations alive at the proxy (D-31).** A child held copies
+  of the parent's control connections until it exited, and a TCP connection closes only when its
+  last holder does. The child now closes its copies at fork. A parent thread caught mid-way through
+  setting up an association also no longer leaves the child's first send waiting forever.
 - **The shim's own descriptors could be closed by the program (D-26).** A close-all loop,
   `close_range` or a `dup2` took a control connection away. The shim then polled, and on teardown
   *closed*, whatever the program had put at that number. Shim descriptors now live at 768 and up
@@ -122,7 +141,28 @@ proxy down — and one was the FR-I-02 defect the project exists to prevent. See
     that a relative password file survives a `chdir`.
   - The fd-table test races association readers against replacement under TSan: 15 warnings,
     including a heap use-after-free, on the old code; none on the new.
-- Suite: 601 assertions across 17 groups.
+- M4–M9 (D-27–D-31):
+  - The wrapper test checks a broken home config under `-f`, the numeric proxy export and the
+    resolved-environment marker (the old code fails all three), and a script with no `#!` line.
+  - The fidelity test checks that ICMP, ICMPv6 and UDP-Lite datagram sockets are refused while
+    explicit `IPPROTO_UDP` still works; the old shim accepted all three.
+  - The lifecycle test checks that a forked child holds no control connection; the old shim left
+    it one.
+- Suite: 616 assertions across 17 groups. Clean under ASan/UBSan, TSan, Valgrind memcheck and
+  Helgrind.
+
+### Documentation
+
+- The limitations accepted for 1.0 are now in the README (D-32): `strict_loopback` is checked only
+  at association setup; `MSG_MORE`, `UDP_CORK` and GSO/GRO corrupt data rather than failing; the
+  first send blocks during the handshake, even on a non-blocking socket; and a socket shared with
+  another process is re-pointed for both.
+- NFR-03 (signal safety) is marked partial. The 1.0.0 claim below, that a send from a signal
+  handler "cannot deadlock", holds only for a socket already in use; the README now says which
+  calls allocate.
+- The fd-table generation counter, described as a guard against descriptor reuse but never
+  checked, is removed along with an unused flag (D-30). The docs now point at the per-call cookie
+  check that does the job.
 
 ## [1.0.0] — 2026-08-20
 

@@ -72,6 +72,58 @@ else
 	fail=1
 fi
 
+# --- D-27: the shim takes the wrapper's configuration, and only that ---------
+
+check() {
+	n=$((n + 1))
+	if [ "$1" = "$2" ]; then
+		echo "ok $n - $3"
+	else
+		echo "not ok $n - $3 (got '$1', want '$2')"
+		fail=1
+	fi
+}
+
+echo "# the shim takes its configuration from the wrapper alone (D-27)"
+
+# A broken ~/.udpchains.conf, and a run whose -f names a good file.  The
+# wrapper reads only the good one.  The shim used to read the home file as well,
+# and reported itself unconfigured -- after the wrapper had said all was well.
+mkdir -p "$TMP/home"
+printf 'this line is not key = value at all\n' > "$TMP/home/.udpchains.conf"
+printf 'proxy = 127.0.0.1:1080\n' > "$TMP/good.conf"
+chmod 600 "$TMP/good.conf"
+out=$(HOME="$TMP/home" UDPCHAINS_LIB="$SHIM" "$WRAPPER" -f "$TMP/good.conf" \
+	/bin/echo TARGET-RAN 2>&1) || true
+check "$(printf '%s' "$out" | grep -c 'not configured')" "0" \
+	"a broken home config file does not reach the shim when -f names another"
+check "$(printf '%s' "$out" | grep -c TARGET-RAN)" "1" "and the target runs"
+
+# The proxy is exported as the address the wrapper resolved, so no process
+# under the shim looks the name up again, directly.
+out=$(UDPCHAINS_LIB="$SHIM" "$WRAPPER" -q -p localhost:1080 /usr/bin/env 2>&1) || true
+exported=$(printf '%s\n' "$out" | sed -n 's/^UDPCHAINS_PROXY=//p')
+case "$exported" in
+127.0.0.1:1080 | "[::1]:1080") ok_num=yes ;;
+*) ok_num="no ($exported)" ;;
+esac
+check "$ok_num" "yes" "a proxy named 'localhost' is exported as its address"
+check "$(printf '%s\n' "$out" | grep -c '^UDPCHAINS_RESOLVED=1$')" "1" \
+	"and the environment is marked as resolved"
+
+# --- D-28: the wrapper runs the file it checked -------------------------------
+
+echo "# the wrapper execs the file it checked (D-28)"
+
+# execv() rather than execvp() must keep execvp's one extra: a script with no
+# #! line runs under /bin/sh.
+mkdir -p "$TMP/bin"
+printf 'echo NOSHEBANG-RAN "$1"\n' > "$TMP/bin/noshebang"
+chmod 755 "$TMP/bin/noshebang"
+out=$(PATH="$TMP/bin:$PATH" UDPCHAINS_LIB="$SHIM" "$WRAPPER" -q \
+	-p 127.0.0.1:1080 noshebang arg1 2>&1) || true
+check "$out" "NOSHEBANG-RAN arg1" "a script with no #! line still runs, with its arguments"
+
 # NOTE: the noexec / security-policy case exercises the same refusal through the
 # PROT_EXEC probe, and is not covered here because creating a noexec mount needs
 # either root or unprivileged user namespaces, neither of which a test run can

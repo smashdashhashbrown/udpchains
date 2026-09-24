@@ -1122,3 +1122,156 @@ descriptors the application did not open, and the shim's descriptors appearing i
 
 **Revisit if:** a program is found that `dup2`s onto a specific number in the band. Relocating the
 shim's descriptor there, rather than refusing, would need an owner back-reference in the table.
+
+---
+
+## D-27
+### Configuration reaches the shim resolved, once
+
+**Date:** 2026-09-24 · **Status:** Accepted · Review items M4 and M5.
+
+**Context.** Two gaps between what the wrapper resolved and what the shim used.
+
+- **M4.** The shim still read `~/.udpchains.conf` and `/etc/udpchains.conf`, contradicting the
+  wrapper's own comment that it must not. With `-f a.conf`, credentials in the home file reached the
+  shim anyway. A broken home file made the shim report itself unconfigured — after the wrapper had
+  reported success — so every send failed inside a program that had apparently started fine.
+- **M5.** The wrapper exported the proxy as the user wrote it, so a hostname was looked up again in
+  every process started under the shim. That lookup must bypass the proxy it is trying to find, so
+  it went directly, once per process, and could return a different address from the one the wrapper
+  had checked.
+
+**Decision.** The wrapper exports `UDPCHAINS_RESOLVED=1`, and a shim that sees it reads the
+environment only. A bare `LD_PRELOAD`, without the wrapper, still reads the config files — they are
+then the only configuration there is. The proxy is exported as the numeric address the wrapper
+resolved: `a.b.c.d:port`, or `[v6]:port` with any scope kept.
+
+**Consequences.** What the wrapper checked is exactly what every process uses. Diagnostics from
+processes under the shim name the proxy by address, not by name. A proxy whose address changes while
+the program runs is not followed; the wrapper's resolution stands for the whole run, which is also
+what makes it checkable.
+
+---
+
+## D-28
+### The wrapper runs the file it checked
+
+**Date:** 2026-09-24 · **Status:** Accepted · Review item M6.
+
+**Context.** SEC-06 refuses setuid, setgid and capability-endowed targets, by inspecting the file
+`resolve_program()` finds on `PATH`. The wrapper then called `execvp()`, which searches `PATH` again.
+A file swapped in between, or a `PATH` directory that changed, meant the file inspected need not
+be the file run.
+
+**Decision.** `execv()` of the resolved path. `argv[0]` stays as the user typed it. `execvp`'s one
+extra is kept: a file with neither an ELF header nor a `#!` line is run by `/bin/sh`, still naming
+the checked path.
+
+**Consequences.** The check and the exec now name one file. A race on the file's *contents* between
+check and exec remains, as it does for any check followed by an exec; SEC-06 was about which file,
+not about that.
+
+---
+
+## D-29
+### Datagram sockets the proxy cannot carry are refused
+
+**Date:** 2026-09-24 · **Status:** Accepted · Review item M7.
+
+**Context.** Interception keyed on `SOCK_DGRAM` in `AF_INET`/`AF_INET6` and ignored the protocol.
+An ICMP "ping" socket — `SOCK_DGRAM`/`IPPROTO_ICMP`, which is how unprivileged `ping` works — and a
+UDP-Lite socket were taken for UDP, wrapped in SOCKS headers, and sent to the proxy's relay.
+
+**Decision.** Refused, in the terms D-18 set out for raw sockets: SOCKS5 carries only UDP, and
+"cannot proxy" means "refuse", not "pass through". `socket()` for any protocol other than `0` or
+`IPPROTO_UDP` fails with `EPROTONOSUPPORT` and a diagnostic. Such a socket inherited across `exec`
+or received over `SCM_RIGHTS` is closed, with a diagnostic.
+
+**Consequences.** `ping` fails under the shim instead of misbehaving. Raw sockets (D-18) are
+unchanged: still not intercepted, and still the one documented exception to the no-bypass claim.
+
+---
+
+## D-30
+### The fd-table generation counter is removed, not implemented
+
+**Date:** 2026-09-24 · **Status:** Accepted · Review item M8.
+
+**Context.** Each entry carried a generation counter, bumped on release and described in DESIGN.md
+and the FR-L-02 notes as the guard against descriptor reuse: a thread that looked an entry up just
+before another thread closed and reused the number would see the generation change and reject the
+entry. Nothing ever compared it. A `redirected` flag was likewise written and never read.
+
+**Decision.** Both fields are removed, and the documentation points at what does the job:
+
+- The scenario is the application racing its own close. A thread using a descriptor another thread
+  is closing reaches whatever the number refers to next — in the kernel as well — so the shim
+  matching that is not a defect.
+- Memory safety in that race is already guaranteed: table blocks are never freed, and associations
+  are type-stable and counted (D-24).
+- Treating the wrong socket as tracked is what D-23's per-call cookie check catches, and it does so
+  on every call rather than only mid-call.
+
+`redirected` was redundant: an entry has an association exactly when its socket has been pointed at
+a relay.
+
+**Consequences.** Two fewer atomic stores per release and per association. The unit test's
+generation assertions now check that released state does not survive, which is what FR-L-02
+asks.
+
+---
+
+## D-31
+### A forked child lets go of the parent's control connections
+
+**Date:** 2026-09-24 · **Status:** Accepted · Review item M9, part (ii); part (i) is D-32.
+
+**Context.** A forked child inherited copies of the parent's control connections and kept them
+until it exited or exec'd. A TCP connection is closed — its FIN sent — only when the last process
+holding it closes it, so each parent association stayed alive at the proxy for as long as any child
+lived: a pre-forked worker pool kept every one of its parent's associations open indefinitely.
+
+**Decision.** The fork child handler closes the child's copies at once and marks the inherited
+associations as having none; the resolver pool does the same for its own. The work is a walk of the
+table with atomic loads, `close()`, and stores to memory the child alone owns — all allowed in the
+child of a multithreaded parent. The associations themselves are still dropped on first use, when
+their fork generation is found stale, as before.
+
+While there, a second fork hazard is fixed. A parent thread in the middle of establishing an
+association leaves an "establishing" marker that, in the child, no surviving thread would ever
+clear, so the child's first send on that socket would have waited forever. The handler resets it.
+
+**Consequences.** Closing a socket in the parent releases its association at the proxy, whatever
+children exist. The cost is one `close` per live association on each `fork`.
+
+---
+
+## D-32
+### Limitations accepted for 1.0, and documented
+
+**Date:** 2026-09-24 · **Status:** Accepted · Review items M1, M2, M3, and M9 part (i).
+
+Reviewed, and kept as documented limitations rather than fixed before 1.0. Each is in the README's
+"What does not work".
+
+- **M1 — `strict_loopback` is checked once per association,** when it is set up, and only for a
+  connected socket. An unconnected `sendto()` to loopback, or a `connect()` to loopback after setup,
+  goes to the proxy host's loopback unwarned. *Fix when revisited:* check on every send; it is two
+  comparisons.
+- **M2 — `MSG_MORE`, `UDP_CORK` and GSO/GRO corrupt data** rather than failing: each call gets its
+  own header, so a corked datagram carries a header in its middle. *Fix when revisited:* refuse
+  `MSG_MORE` per call, and check the three socket options when the association is set up.
+- **M3 — the first send or receive blocks, even on a non-blocking socket,** while the proxy
+  handshake completes. Its timeout applies to each handshake step rather than overall, and a send
+  whose association cannot be set up makes a second full attempt. *Fix when revisited:* one overall
+  deadline, and no retry when the failure was the setup itself; truly non-blocking setup needs its
+  own design.
+- **M9 (i) — a socket shared with another process is re-pointed.** When a socket inherited across
+  `exec`, or received over `SCM_RIGHTS`, is also still held elsewhere, the shim's first use points
+  it at a new relay, which redirects the other holder too. There is no safe general fix. Replacing
+  the socket with a private one breaks sockets whose local port matters — systemd socket activation,
+  a server socket handed to a worker — and a socket that has been used has a local port whether or
+  not it was bound, so the two cases cannot be told apart. Nor does Linux tell a process who else
+  holds a socket.
+
+**Revisit if:** any of these is met in real use; the first three have a known fix.

@@ -260,18 +260,17 @@ int main(void)
 	TAP_GROUP("FR-L-02: a released entry is not visible to a later lookup");
 	{
 		struct udpc_fdent *e = udpc_fd_claim(77, AF_INET, SOCK_DGRAM);
-		unsigned gen_before;
 
 		TAP_OK(e != NULL, "descriptor 77 is claimed");
 		udpc_fd_publish(e);
-		gen_before = atomic_load(&e->generation);
+		atomic_store(&e->connected, true);
 		TAP_OK(udpc_fd_lookup(77) != NULL, "and is visible");
 
 		udpc_fd_release(77);
 		TAP_OK(udpc_fd_lookup(77) == NULL, "after release it is invisible");
-		TAP_OK(atomic_load(&e->generation) != gen_before,
-		       "and the generation counter advanced, so a reused fd "
-		       "number cannot inherit stale state");
+		TAP_OK(!atomic_load(&e->connected),
+		       "and its state is reset, so a reused fd number cannot "
+		       "inherit it");
 	}
 
 
@@ -289,12 +288,11 @@ int main(void)
 	TAP_GROUP("a stale entry is recycled, not refused (uninterposed close)");
 	{
 		struct udpc_fdent *first, *second;
-		unsigned gen_before;
 
 		first = udpc_fd_claim(91, AF_INET, SOCK_DGRAM);
 		TAP_OK(first != NULL, "descriptor 91 is claimed");
 		udpc_fd_publish(first);
-		gen_before = atomic_load(&first->generation);
+		atomic_store(&first->connected, true);
 
 		/* No udpc_fd_release: this is precisely the close the shim
 		 * never saw. */
@@ -304,9 +302,8 @@ int main(void)
 		       "which is what produced a spurious EMFILE");
 		TAP_OK(second == first,
 		       "and reuses the same slot, as the fd number demands");
-		TAP_OK(atomic_load(&second->generation) != gen_before,
-		       "the generation advanced, so anything holding the old "
-		       "entry is rejected (FR-L-02)");
+		TAP_OK(!atomic_load(&second->connected),
+		       "none of the stranded entry's state survives (FR-L-02)");
 		TAP_EQ_INT(atomic_load(&second->family), AF_INET6,
 		           "the slot carries the NEW socket's family, not the "
 		           "stranded one's");

@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -586,11 +587,34 @@ int udpc_config_load_layers(struct udpc_config *cfg, const char *cli_path,
 	return 0;
 }
 
+/* The proxy as a numeric "host:port" or "[v6]:port" -- a v6 scope kept, as
+ * getnameinfo writes it (fe80::1%eth0). */
+static int numeric_proxy(const struct udpc_config *cfg, char *out, size_t outlen)
+{
+	char host[NI_MAXHOST], serv[NI_MAXSERV];
+	int n;
+
+	if (getnameinfo((const struct sockaddr *)&cfg->proxy,
+	                udpc_sa_len((const struct sockaddr *)&cfg->proxy), host,
+	                sizeof(host), serv, sizeof(serv),
+	                NI_NUMERICHOST | NI_NUMERICSERV) != 0)
+		return -1;
+	n = snprintf(out, outlen, cfg->proxy.ss_family == AF_INET6 ? "[%s]:%s" : "%s:%s",
+	             host, serv);
+	return (n < 0 || (size_t)n >= outlen) ? -1 : 0;
+}
+
 int udpc_config_export(const struct udpc_config *cfg)
 {
-	char buf[64];
+	char buf[64], proxy[NI_MAXHOST + NI_MAXSERV + 4];
 
-	if (setenv("UDPCHAINS_PROXY", cfg->proxy_spec, 1) != 0)
+	/* D-27: the ADDRESS the wrapper resolved and checked, not the name.
+	 * Exported by name, every process started under the shim looked the
+	 * proxy up again -- directly, since that lookup must bypass the proxy
+	 * it is trying to find -- and could reach a different address. */
+	if (numeric_proxy(cfg, proxy, sizeof(proxy)) != 0)
+		snprintf(proxy, sizeof(proxy), "%s", cfg->proxy_spec);
+	if (setenv("UDPCHAINS_PROXY", proxy, 1) != 0)
 		return -1;
 
 	snprintf(buf, sizeof(buf), "%zu", cfg->max_datagram);
@@ -667,10 +691,12 @@ int udpc_config_export(const struct udpc_config *cfg)
 		}
 	}
 
-	/* The shim must not re-read the file: the wrapper already resolved
+	/* The shim must not re-read any file: the wrapper already resolved
 	 * everything, and re-reading could pick up a file that changed between
-	 * exec and first use. */
+	 * exec and first use -- or a different one entirely (D-27). */
 	unsetenv("UDPCHAINS_CONFIG");
+	if (setenv("UDPCHAINS_RESOLVED", "1", 1) != 0)
+		return -1;
 	return 0;
 }
 
@@ -680,17 +706,23 @@ int udpc_config_load_shim(struct udpc_config *cfg, const char **err)
 
 	udpc_config_defaults(cfg);
 
-	/* In the normal case the wrapper has exported a complete, resolved
-	 * configuration and this is just a read of the environment.  A bare
-	 * LD_PRELOAD invocation without the wrapper lands here too, which is
-	 * why the file layer is still consulted. */
-	if (udpc_config_load_layers(cfg, NULL, err) != 0)
-		return -1;
-
-	udpc_config_init(&envcfg);
-	if (udpc_config_from_env(&envcfg, err) != 0)
-		return -1;
-	udpc_config_merge(cfg, &envcfg);
+	if (getenv("UDPCHAINS_RESOLVED") != NULL) {
+		/* D-27: the wrapper exported a complete, resolved configuration,
+		 * and it is the whole of it.  Consulting the default config files
+		 * as well, as this once did, let ~/.udpchains.conf supply
+		 * credentials to a run whose -f named a different file, and let a
+		 * broken home file break the program after the wrapper had
+		 * reported success. */
+		udpc_config_init(&envcfg);
+		if (udpc_config_from_env(&envcfg, err) != 0)
+			return -1;
+		udpc_config_merge(cfg, &envcfg);
+	} else {
+		/* A bare LD_PRELOAD, without the wrapper: the files are the only
+		 * configuration there is, with the environment above them. */
+		if (udpc_config_load_layers(cfg, NULL, err) != 0)
+			return -1;
+	}
 
 	return udpc_config_finalize(cfg, err);
 }

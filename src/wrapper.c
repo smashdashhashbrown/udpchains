@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <link.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -470,7 +471,30 @@ int main(int argc, char **argv)
 	                         sizeof(addrbuf)),
 	           cfg.proxy_is_local ? " (local)" : "", cfg.max_datagram);
 
-	execvp(argv[i], &argv[i]);
+	/* D-28: exec the file that was checked, not a name.  execvp() would
+	 * search PATH a second time, and the setuid/capability check above
+	 * could then have inspected a different file from the one run -- a
+	 * swapped binary, or a PATH entry that changed in between.  argv[0]
+	 * stays as the user typed it. */
+	execv(program, &argv[i]);
+
+	/* execvp's one extra: a file with no #! line and no ELF header is run
+	 * by /bin/sh.  Kept, still naming the checked file. */
+	if (errno == ENOEXEC) {
+		int n = argc - i;
+		char **shargv = calloc((size_t)n + 2, sizeof(*shargv));
+
+		if (shargv != NULL) {
+			int k;
+
+			shargv[0] = (char *)(uintptr_t)"sh";
+			shargv[1] = program;
+			for (k = 1; k < n; k++)
+				shargv[k + 1] = argv[i + k];
+			execv("/bin/sh", shargv);
+			free(shargv);
+		}
+	}
 
 	fprintf(stderr, "udpchains: cannot exec %s: %s\n", argv[i],
 	        strerror(errno));

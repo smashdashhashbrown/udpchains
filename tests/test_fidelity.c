@@ -704,6 +704,37 @@ static void t_passthrough(void)
 	close(tcp);
 }
 
+/* D-29: a datagram socket that is not UDP carries something SOCKS5 cannot relay,
+ * so it is refused -- neither sent directly nor wrapped as UDP. */
+static void t_non_udp_refused(void)
+{
+	int fd;
+	char buf[16];
+
+	TAP_GROUP("D-29: non-UDP datagram sockets are refused, not let through");
+
+	errno = 0;
+	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+	TAP_OK(fd < 0 && errno == EPROTONOSUPPORT,
+	       "an ICMP ping socket is refused with EPROTONOSUPPORT");
+	errno = 0;
+	fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+	TAP_OK(fd < 0 && errno == EPROTONOSUPPORT, "so is an ICMPv6 one");
+	errno = 0;
+	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDPLITE);
+	TAP_OK(fd < 0 && errno == EPROTONOSUPPORT, "and a UDP-Lite one");
+
+	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	TAP_OK(fd >= 0, "IPPROTO_UDP named explicitly is still accepted");
+	{
+		struct timeval tv = { 3, 0 };
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	}
+	sendto(fd, "udp", 3, 0, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 3, "and proxied like any other");
+	close(fd);
+}
+
 /* A _FORTIFY_SOURCE build calls these instead of recvfrom/recv/read when the
  * buffer's size is known and the length is not.  glibc's own implementations
  * bypass the hooks and deliver the SOCKS header as payload.  Called directly
@@ -791,6 +822,7 @@ int main(int argc, char **argv)
 	t_unrepresentable();
 	t_passthrough();
 	t_fortified();
+	t_non_udp_refused();
 
 	TAP_DONE();
 }

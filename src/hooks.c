@@ -59,25 +59,27 @@ static bool is_intercepted_kind(int domain, int type)
  *
  * Returns 0 if fd was adopted or is not a socket we intercept, and -1 if it is
  * one but cannot be tracked. */
-static int adopt_fd(int fd, const char *how)
+/* An untrackable UDP socket is closed rather than left in the application's
+ * hands, where it would send unproxied -- the same choice the socket() hook
+ * makes, and the only fail-closed one.  So is a datagram socket for a protocol
+ * SOCKS5 cannot carry (D-29). */
+static void adopt_or_close(int fd, const char *how)
 {
 	int rc = udpc_fd_adopt(fd);
 
 	if (rc > 0)
 		udpc_debug("adopted %s UDP descriptor %d", how, fd);
-	return rc < 0 ? -1 : 0;
-}
-
-/* An untrackable UDP socket is closed rather than left in the application's
- * hands, where it would send unproxied -- the same choice the socket() hook
- * makes, and the only fail-closed one. */
-static void adopt_or_close(int fd, const char *how)
-{
-	if (adopt_fd(fd, how) == 0)
+	if (rc >= 0)
 		return;
-	udpc_err("cannot track %s UDP descriptor %d; closing it rather than "
-	         "leaving it unproxied",
-	         how, fd);
+	if (rc == UDPC_ADOPT_UNPROXIABLE)
+		udpc_err("%s descriptor %d is a non-UDP datagram socket (ICMP or "
+		         "UDP-Lite), which SOCKS5 cannot carry; closing it rather "
+		         "than leaving it unproxied",
+		         how, fd);
+	else
+		udpc_err("cannot track %s UDP descriptor %d; closing it rather "
+		         "than leaving it unproxied",
+		         how, fd);
 	REAL_CLOSE(fd);
 }
 
@@ -221,9 +223,23 @@ __attribute__((constructor)) static void udpc_ctor(void)
 
 int socket(int domain, int type, int protocol)
 {
-	int fd = REAL_SOCKET(domain, type, protocol);
 	struct udpc_fdent *e;
+	int fd;
 
+	/* D-29: a datagram socket in AF_INET/AF_INET6 that is not UDP -- ICMP
+	 * "ping" sockets, UDP-Lite -- carries a protocol SOCKS5 cannot relay.
+	 * Letting it through would send directly; wrapping it as UDP would
+	 * send ICMP to the proxy's relay.  So it is refused, as multicast is. */
+	if (!UDPC_IN_SHIM() && is_intercepted_kind(domain, type) && protocol != 0 &&
+	    protocol != IPPROTO_UDP) {
+		udpc_warn("refusing a datagram socket for IP protocol %d: SOCKS5 "
+		          "carries only UDP, and udpchains sends nothing directly",
+		          protocol);
+		errno = EPROTONOSUPPORT;
+		return -1;
+	}
+
+	fd = REAL_SOCKET(domain, type, protocol);
 	if (fd < 0 || UDPC_IN_SHIM())
 		return fd;
 	if (!is_intercepted_kind(domain, type))

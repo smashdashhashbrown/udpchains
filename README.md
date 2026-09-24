@@ -160,6 +160,7 @@ This section is the honest part. Read it before deciding whether this tool suits
 | **Go binaries** | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. |
 | **setuid/setgid binaries** | The loader ignores `LD_PRELOAD` for them. `udpchains` detects this and **refuses to run them** rather than running them unproxied. Binaries with file capabilities are refused for the same reason. |
 | **Programs sending through `syscall()` directly** | Same reason. `ptrace`-based interception is the only answer, and is out of scope. (Creating, duplicating and closing descriptors through `syscall()` *is* tracked, which is how libuv closes them; sends and receives through it are not.) |
+| **`ping`, and other non-UDP datagram sockets** | An unprivileged `ping` uses an ICMP datagram socket, which SOCKS5 cannot carry. `udpchains` refuses to create one (`EPROTONOSUPPORT`, with a diagnostic) rather than send it directly or wrap it as UDP (D-29). UDP-Lite is refused the same way. |
 | **Programs using raw sockets** | `SOCK_RAW` is not intercepted, and SOCKS5 has no way to carry a raw IP packet. Such traffic goes **direct** — see the warning below. `nmap`, `traceroute` and similar tools are in this category. |
 
 ### Traffic it deliberately refuses
@@ -203,8 +204,14 @@ Consequences you will actually notice:
   [Name resolution](#name-resolution). A program with its own resolver sends ordinary UDP, which
   is proxied, but its TCP fallback for large answers is TCP and is not.
 
-- **The proxy's own hostname is resolved directly** if you configure it by name rather than by
-  address. Configure a numeric address if that matters to you.
+- **The proxy's own hostname is resolved directly, once,** by `udpchains` itself, if you configure
+  it by name rather than by address. Every program it starts is then given that address, not the
+  name, so none of them looks it up again (D-27). Configure a numeric address if even the one
+  lookup matters to you.
+
+- **Configuration is resolved once, by `udpchains`.** The programs it runs use exactly what it
+  resolved, and do not read the config files themselves (D-27). Only a program started with
+  `LD_PRELOAD` directly, without `udpchains`, reads them.
 
 - **Ancillary data (`msg_control`) is returned empty.** `IP_PKTINFO`, `IP_RECVERR`, ECN and friends
   would describe a socket the application does not actually own, and there is no honest emulation.
@@ -226,11 +233,36 @@ Consequences you will actually notice:
 - **After `fork()`, a child that keeps using an inherited UDP socket gets a fresh socket.** The child
   must not share the parent's association, and parent and child share one open file description, so
   the child's socket is replaced with a private one. `O_NONBLOCK`, close-on-exec and a concrete
-  `bind()` are carried over; other socket options are not.
+  `bind()` are carried over; other socket options are not. The child drops its copies of the
+  parent's proxy connections at fork, so the parent's associations end when the parent closes them
+  (D-31).
 
-- **GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`) are not supported.** Modern QUIC stacks use them and will fall
-  back or fail. Even when QUIC works, a UDP flow through a TCP-based tunnel inherits
-  retransmit-and-wait behaviour that fights QUIC's own loss recovery.
+- **A socket shared with another process is re-pointed.** When a socket inherited across `exec`, or
+  passed over a Unix socket, is also still held by another process, the shim's first use points it
+  at a new proxy relay, and that redirects the other holder's traffic too. There is no safe general
+  fix: the shim cannot tell who else holds a socket (D-32). Avoid sharing a UDP socket between a
+  proxied and an unproxied process.
+
+- **`strict_loopback` is checked when a socket's association is set up, and only for a connected
+  socket.** An unconnected `sendto()` to loopback, or a `connect()` to loopback after the socket has
+  already sent, is not caught, and goes to the *proxy host's* loopback (D-32).
+
+- **The first send or receive on a socket blocks while the proxy handshake runs,** even on a
+  non-blocking socket, which can stall an event loop. `connect_timeout` applies to each step of the
+  handshake rather than to the whole, and a send whose association cannot be set up tries once more
+  before failing (D-32).
+
+- **Sending from a signal handler is safe only on a socket already in use.** The steady-state path
+  takes no locks and allocates nothing. But a socket's first send, a thread's first datagram, and
+  `socket()`, `dup()` and `close()` all allocate or free memory, so doing any of those inside a
+  signal handler that interrupted `malloc` can deadlock.
+
+- **`MSG_MORE`, `UDP_CORK`, GSO and GRO (`UDP_SEGMENT`, `UDP_GRO`) corrupt data.** They are not
+  refused. Each call is sent with its own SOCKS header, so a datagram built up over several calls
+  arrives with a header in its middle, and a coalesced receive is misread (D-32). Modern QUIC stacks
+  use GSO/GRO; their encryption rejects the damage, so QUIC fails rather than delivering garbage,
+  but a plain UDP program does not. Even when QUIC works, a UDP flow through a TCP-based tunnel
+  inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery.
 
 - **TCP is not proxied.** `proxychains-ng` already does that well. Composing the two is fine.
 
@@ -284,7 +316,7 @@ but read back data with the SOCKS header still attached. A 36-cell test matrix
 recvmmsg}`) asserts byte-identical round-trips, across IPv4 and IPv6, connected and unconnected.
 
 Per-descriptor state lives in a lock-free two-level radix table, with no allocation and no locks on
-the datagram path once a socket's association is up. Each intercepted call makes one extra system
+the datagram path once a socket's association is up (see the signal-handler caveat above). Each intercepted call makes one extra system
 call, a `getsockopt`, to confirm its descriptor is still the socket the shim recorded (D-23).
 Associations are type-stable, so a thread reading one while another tears it down reads valid
 memory (D-24).

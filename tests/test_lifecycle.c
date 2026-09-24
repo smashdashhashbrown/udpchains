@@ -545,6 +545,36 @@ static void t_fork_isolation(void)
 	close(fd);
 }
 
+/* D-31: a forked child held copies of the parent's control connections until
+ * it exited, and a TCP connection only closes when its LAST holder closes it --
+ * so the parent's associations lingered at the proxy for as long as any child
+ * lived.  The child now closes its copies at fork. */
+static void t_fork_child_drops_control(void)
+{
+	int fd, before, status = 0;
+	pid_t pid;
+
+	TAP_GROUP("D-31: a forked child holds none of the parent's control connections");
+
+	fd = udp4();
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_OK(roundtrip(fd, "pre-fork-ctl"), "an association is up");
+	before = count_tcp_sockets(NULL);
+	TAP_OK(before >= 1, "the parent holds its control connection (%d)", before);
+
+	pid = fork();
+	if (pid == 0)
+		_exit(count_tcp_sockets(NULL) == 0 ? 0 : 1);
+	waitpid(pid, &status, 0);
+	TAP_OK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	       "the child's copies were closed at fork, so only the parent's "
+	       "own close decides when the proxy releases the association");
+	TAP_EQ_INT(count_tcp_sockets(NULL), before,
+	           "the parent's control connections are untouched");
+	TAP_OK(roundtrip(fd, "post-fork-ctl"), "and its association still works");
+	close(fd);
+}
+
 static void t_close_releases(void)
 {
 	int i, before, after;
@@ -624,6 +654,7 @@ int main(int argc, char **argv)
 	t_other_close_routes();
 	t_shim_fds_protected();
 	t_fd_reuse();
+	t_fork_child_drops_control();
 	t_fork_isolation();
 	t_close_releases();
 #ifdef __linux__

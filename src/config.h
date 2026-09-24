@@ -136,8 +136,9 @@ int udpc_config_load_layers(struct udpc_config *cfg, const char *cli_path,
  * shim inherits it without re-parsing.  Used by the wrapper before exec. */
 int udpc_config_export(const struct udpc_config *cfg);
 
-/* Loads configuration inside the shim, from the environment the wrapper set,
- * or from a bare LD_PRELOAD invocation.  Returns 0 on success. */
+/* Loads configuration inside the shim.  Launched by the wrapper -- which sets
+ * UDPCHAINS_RESOLVED -- only the environment is read; under a bare LD_PRELOAD
+ * the config files are read too (D-27).  Returns 0 on success. */
 int udpc_config_load_shim(struct udpc_config *cfg, const char **err);
 
 #endif /* UDPCHAINS_CONFIG_H */

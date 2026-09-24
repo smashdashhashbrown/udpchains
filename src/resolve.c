@@ -102,17 +102,21 @@ static void cond_init(void)
 
 /* The child is single-threaded.  Every entry belongs to the parent: its control
  * connection is the parent's association, and a lookup that held it lives on
- * only in a thread that did not survive the fork.  Entries are marked stale and
- * closed on next use, as §3.4 does for application associations; closing the
- * child's copies is safe because the parent holds its own. */
+ * only in a thread that did not survive the fork. */
+static void ent_close(struct pool_ent *e);
+
 static void atfork_child(void)
 {
 	int i;
 
+	/* D-31: the child's copies are closed at once, so the parent's
+	 * associations are released at the proxy when the parent is done with
+	 * them rather than when the last child exits.  close() is safe here;
+	 * the parent keeps its own copies. */
 	for (i = 0; i < POOL_MAX; i++) {
 		g_pool[i].busy = false;
 		if (g_pool[i].used)
-			g_pool[i].stale = true;
+			ent_close(&g_pool[i]);
 	}
 	cond_init();
 	pthread_mutex_unlock(&g_mu);

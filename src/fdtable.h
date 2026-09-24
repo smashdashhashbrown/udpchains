@@ -6,13 +6,14 @@
  *
  * Blocks are allocated on demand in socket()/dup*(), never on the datagram
  * path, so NFR-02 holds without a fixed fd ceiling chosen at start-up.  A
- * lookup on the datagram path is two atomic loads: no locks, no allocation, no
- * syscalls, which is what makes NFR-03 hold by construction rather than by
- * documented caveat.
+ * lookup on the datagram path is two atomic loads, and no locks or allocation;
+ * for a descriptor the shim tracks, udpc_fd_lookup_verified adds one
+ * getsockopt (D-23).
  *
  * Blocks are never freed.  A program that once used fd N is likely to again,
- * and freeing would reintroduce the use-after-free hazard the generation
- * counter exists to prevent.
+ * and a thread still holding a pointer into a freed block -- one looked up an
+ * instant before another thread closed the descriptor -- would read freed
+ * memory.
  */
 #ifndef UDPCHAINS_FDTABLE_H
 #define UDPCHAINS_FDTABLE_H
@@ -49,7 +50,6 @@ enum udpc_fd_state {
 
 struct udpc_fdent {
 	_Atomic int state;         /* enum udpc_fd_state */
-	_Atomic unsigned generation; /* bumped on release; guards fd reuse */
 
 	/* The kernel's SO_COOKIE for the socket this entry describes: unique
 	 * for the life of the system, never reused.  A descriptor closed by a
@@ -86,10 +86,6 @@ struct udpc_fdent {
 	/* Concrete address the application bound, for FR-P-05 and FR-I-05. */
 	struct sockaddr_storage bound;
 	_Atomic bool bound_set;
-
-	/* Set once the application's own fd has been pointed at the relay
-	 * (FR-I-07), so the redirect is not repeated on every send. */
-	_Atomic bool redirected;
 };
 
 /* Returns the entry for fd if it is being intercepted, else NULL.
@@ -103,10 +99,14 @@ struct udpc_fdent *udpc_fd_lookup(int fd);
  * is a UDP socket (D-23).  This is the lookup every hooked call makes. */
 struct udpc_fdent *udpc_fd_lookup_verified(int fd);
 
-/* Adopts fd if it is an AF_INET/AF_INET6 datagram socket the table does not yet
+/* Adopts fd if it is an AF_INET/AF_INET6 UDP socket the table does not yet
  * track -- one inherited across exec, received over SCM_RIGHTS, or found behind
- * a stale entry.  Returns 1 if adopted, 0 if it is not such a socket, and -1 if
- * it is one but cannot be tracked: the caller must then not let it through. */
+ * a stale entry.  Returns 1 if adopted and 0 if it is not a datagram socket in
+ * those families.  A negative return means the caller must not let it through:
+ * UDPC_ADOPT_UNTRACKABLE for a UDP socket the table cannot hold, and
+ * UDPC_ADOPT_UNPROXIABLE for a datagram socket that is not UDP (D-29). */
+#define UDPC_ADOPT_UNTRACKABLE (-1)
+#define UDPC_ADOPT_UNPROXIABLE (-2)
 int udpc_fd_adopt(int fd);
 
 /* Claims fd, allocating a block if needed.  Returns the entry, or NULL if the
@@ -122,7 +122,7 @@ void udpc_fd_publish(struct udpc_fdent *e);
  * for a stale entry (D-23). */
 void udpc_fd_rebind_cookie(struct udpc_fdent *e, int fd);
 
-/* Releases fd: drops the association reference and bumps the generation so a
+/* Releases fd: drops the association reference and resets the entry, so a
  * later socket landing on the same fd number inherits nothing (FR-L-02).  A
  * shim-owned entry is left alone: only udpc_fd_shim_close releases one. */
 void udpc_fd_release(int fd);
@@ -157,6 +157,10 @@ bool udpc_fd_is_shim(int fd);
 
 /* The lowest shim-marked descriptor in [from, last], or -1. */
 long udpc_fd_next_shim(unsigned from, unsigned last);
+
+/* Calls fn for every ACTIVE entry, visiting only allocated blocks.  Takes no
+ * lock and allocates nothing, so it may run in a fork child handler (D-31). */
+void udpc_fd_for_each_active(void (*fn)(struct udpc_fdent *e));
 
 /* Called after the kernel has made newfd a duplicate of oldfd, by any route
  * (dup, dup2, dup3, fcntl F_DUPFD).  If oldfd is intercepted, points newfd at

@@ -33,13 +33,42 @@ unsigned udpc_fork_generation(void)
 	return atomic_load_explicit(&g_fork_generation, memory_order_acquire);
 }
 
+/* D-31, for each of the child's table entries: let go of the parent's
+ * control connection, and of a half-built association. */
+static void child_drop_inherited(struct udpc_fdent *e)
+{
+	struct udpc_assoc *a = atomic_load_explicit(&e->assoc, memory_order_acquire);
+
+	/* A thread of the parent's was establishing this association when the
+	 * fork happened.  That thread does not exist in the child, so nothing
+	 * would ever clear the marker, and the child's first send would wait
+	 * on it forever. */
+	if (a == ASSOC_ESTABLISHING) {
+		atomic_store_explicit(&e->assoc, NULL, memory_order_release);
+		return;
+	}
+	if (a != NULL && a->conn.control_fd >= 0) {
+		udpc_fd_shim_close(a->conn.control_fd);
+		a->conn.control_fd = -1;
+	}
+}
+
 static void atfork_child(void)
 {
-	/* Bump a counter and nothing else.  Tearing down inherited associations
-	 * here would mean closing descriptors and touching the allocator from a
-	 * context where neither is safe; the work is deferred to next use
-	 * (DESIGN.md 3.4). */
 	atomic_fetch_add_explicit(&g_fork_generation, 1u, memory_order_release);
+
+	/* D-31: close the child's copies of the parent's control connections
+	 * now.  Left open, they kept each association alive at the proxy for
+	 * as long as any child lived: closing a TCP connection sends its FIN
+	 * only when the LAST process holding it closes it.  The parent keeps
+	 * its own copies, so nothing changes for the parent.
+	 *
+	 * This runs in the child of a possibly multithreaded parent, where
+	 * only async-signal-safe work is allowed.  It is: a walk of the table
+	 * with atomic loads, close(), and plain stores to memory the child
+	 * alone now owns.  The associations themselves are still dropped on
+	 * next use, when their fork generation is found stale (DESIGN.md 3.4). */
+	udpc_fd_for_each_active(child_drop_inherited);
 }
 
 void udpc_assoc_init(void)
@@ -159,7 +188,6 @@ void udpc_assoc_drop(struct udpc_fdent *e, struct udpc_assoc *a)
 	if (atomic_compare_exchange_strong_explicit(&e->assoc, &a, NULL,
 	                                            memory_order_acq_rel,
 	                                            memory_order_acquire)) {
-		atomic_store_explicit(&e->redirected, false, memory_order_release);
 		udpc_assoc_unref(a);
 	}
 }
@@ -368,7 +396,6 @@ static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg
 		return -1;
 	}
 
-	atomic_store_explicit(&e->redirected, true, memory_order_release);
 	atomic_store_explicit(&e->assoc, a, memory_order_release);
 
 	/* FR-C-06: one line per association, naming the destination -- so the
