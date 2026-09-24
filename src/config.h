@@ -77,6 +77,14 @@ struct udpc_config {
 	char username[256];
 	char password[256];
 
+	/* D-25: where the password came from, so the wrapper can pass THAT to
+	 * the target rather than the secret itself.  At most one is set: the
+	 * absolute path of a password file, or of a config file holding
+	 * `password =` inline.  Neither means UDPCHAINS_PASSWORD, which the
+	 * user put in the environment themselves. */
+	char password_file[4096];
+	char password_config[4096];
+
 	char config_path[4096];
 };
 

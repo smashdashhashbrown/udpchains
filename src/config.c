@@ -50,6 +50,10 @@ void udpc_config_merge(struct udpc_config *dst, const struct udpc_config *src)
 	}
 	if (m & UDPC_SET_PASSWORD) {
 		memcpy(dst->password, src->password, sizeof(dst->password));
+		memcpy(dst->password_file, src->password_file,
+		       sizeof(dst->password_file));
+		memcpy(dst->password_config, src->password_config,
+		       sizeof(dst->password_config));
 		dst->have_credentials = true;
 	}
 	if (m & UDPC_SET_VERBOSITY)
@@ -222,13 +226,27 @@ int udpc_config_set(struct udpc_config *cfg, const char *key, const char *value,
 			return -1;
 		}
 		snprintf(cfg->password, sizeof(cfg->password), "%s", value);
+		/* An inline value.  If it came from a config file,
+		 * udpc_config_read_file records which one (D-25). */
+		cfg->password_file[0] = '\0';
+		cfg->password_config[0] = '\0';
 		cfg->set_mask |= UDPC_SET_PASSWORD;
 		return 0;
 	}
 	if (strcmp(key, "password_file") == 0) {
+		char *abs;
+
 		if (read_password_file(value, cfg->password, sizeof(cfg->password),
 		                       err) != 0)
 			return -1;
+		/* D-25: remembered as an ABSOLUTE path, so a target that changes
+		 * directory -- or a descendant that starts elsewhere -- can still
+		 * read it. */
+		abs = realpath(value, NULL);
+		snprintf(cfg->password_file, sizeof(cfg->password_file), "%s",
+		         abs != NULL ? abs : value);
+		free(abs);
+		cfg->password_config[0] = '\0';
 		cfg->set_mask |= UDPC_SET_PASSWORD;
 		return 0;
 	}
@@ -354,6 +372,16 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 	fclose(f);
 	snprintf(cfg->config_path, sizeof(cfg->config_path), "%s", path);
 	cfg->set_mask |= UDPC_SET_CONFIG_PATH;
+
+	/* D-25: a password written inline in this file is passed on by naming
+	 * the file, never by copying the value into the environment. */
+	if ((cfg->set_mask & UDPC_SET_PASSWORD) && cfg->password_file[0] == '\0') {
+		char *abs = realpath(path, NULL);
+
+		snprintf(cfg->password_config, sizeof(cfg->password_config), "%s",
+		         abs != NULL ? abs : path);
+		free(abs);
+	}
 	return 0;
 }
 
@@ -390,9 +418,39 @@ int udpc_config_from_env(struct udpc_config *cfg, const char **err)
 			return -1;
 	}
 
+	/* D-25: the wrapper names the config file holding an inline password,
+	 * rather than exporting the password.  Only the password is taken from
+	 * it; everything else arrived resolved, in the variables above. */
+	v = getenv("UDPCHAINS_PASSWORD_CONFIG");
+	if (v != NULL && *v != '\0') {
+		struct udpc_config tmp;
+		const char *ferr = NULL;
+		int fline = 0;
+		int rc;
+
+		udpc_config_init(&tmp);
+		rc = udpc_config_read_file(&tmp, v, &ferr, &fline);
+		if (rc == 0 && (tmp.set_mask & UDPC_SET_PASSWORD)) {
+			memcpy(cfg->password, tmp.password, sizeof(cfg->password));
+			snprintf(cfg->password_config, sizeof(cfg->password_config),
+			         "%s", v);
+			cfg->password_file[0] = '\0';
+			cfg->set_mask |= UDPC_SET_PASSWORD;
+		}
+		explicit_bzero(tmp.password, sizeof(tmp.password));
+		if (rc != 0 || !(cfg->set_mask & UDPC_SET_PASSWORD)) {
+			*err = "cannot read the password from the file named by "
+			       "UDPCHAINS_PASSWORD_CONFIG";
+			return -1;
+		}
+	}
+
 	/* SEC-03 note: UDPCHAINS_PASSWORD (the value itself, rather than a path
 	 * to it) is accepted because the environment of a process is not
-	 * visible in `ps` the way argv is.  A file is still preferable. */
+	 * visible in `ps` the way argv is.  It is also inherited by every
+	 * descendant and shows up in anything that dumps the environment, so a
+	 * file is preferable -- and the wrapper never creates this variable
+	 * itself (D-25). */
 	v = getenv("UDPCHAINS_PASSWORD");
 	if (v != NULL && *v != '\0') {
 		if (udpc_config_set(cfg, "password", v, err) != 0)
@@ -582,16 +640,31 @@ int udpc_config_export(const struct udpc_config *cfg)
 		unsetenv("UDPCHAINS_DEBUG");
 	}
 
-	/* Credentials are passed through for the shim's RFC 1929 exchange
-	 * (FR-P-09, D-20).  Never via argv: SEC-03, because argv is visible in
-	 * ps(1).  The environment of a process is readable only by its owner. */
+	/* Credentials for the shim's RFC 1929 exchange (FR-P-09, D-20).  Never
+	 * via argv (SEC-03), and -- D-25 -- never the password itself via the
+	 * environment either.  The target and every process it starts inherit
+	 * the environment, and anything that dumps it (a crash reporter, a CI
+	 * log, a stray `env`) would print the secret.  So the wrapper exports
+	 * WHERE the password is -- the password file, or the config file
+	 * holding it inline -- and each shim reads it from there.  A password
+	 * the user supplied as UDPCHAINS_PASSWORD is already in the environment
+	 * by their choice, and is left as it is. */
 	if (cfg->have_credentials) {
 		if (cfg->username[0] != '\0' &&
 		    setenv("UDPCHAINS_USERNAME", cfg->username, 1) != 0)
 			return -1;
-		if (cfg->password[0] != '\0' &&
-		    setenv("UDPCHAINS_PASSWORD", cfg->password, 1) != 0)
-			return -1;
+		unsetenv("UDPCHAINS_PASSWORD_CONFIG");
+		if (cfg->password_file[0] != '\0') {
+			if (setenv("UDPCHAINS_PASSWORD_FILE", cfg->password_file, 1) != 0)
+				return -1;
+			unsetenv("UDPCHAINS_PASSWORD");
+		} else if (cfg->password_config[0] != '\0') {
+			if (setenv("UDPCHAINS_PASSWORD_CONFIG", cfg->password_config,
+			           1) != 0)
+				return -1;
+			unsetenv("UDPCHAINS_PASSWORD");
+			unsetenv("UDPCHAINS_PASSWORD_FILE");
+		}
 	}
 
 	/* The shim must not re-read the file: the wrapper already resolved

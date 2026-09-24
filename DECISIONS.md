@@ -955,3 +955,170 @@ unchanged.
 **Revisit if:** a program is found that needs `getaddrinfo_a`, IDN, or glibc's address sorting; or a
 proxy commonly paired with this tool lacks `CONNECT`, which would make the truncation fallback
 unreliable.
+
+---
+
+## D-23
+### Every intercepted call confirms its descriptor is still the socket it was
+
+**Date:** 2026-09-23 · **Status:** Accepted · Review item H1; completes D-17.
+
+**Context.** D-17 recycles a stale entry — one left behind when a descriptor was closed by a route
+no hook sees — but only when a UDP `socket()` or a dup lands on the same number. Every other way
+the kernel can reuse the number — `open`, `pipe`, `accept`, `socketpair`, a TCP `socket()` — left
+the entry in place. Whatever arrived there was then treated as the old UDP socket. Reproduced two
+ways. A Unix stream socket's `write()` failed. A TCP socket's `connect()` was swallowed by the
+connect hook, which recorded a UDP destination and never connected, so the peer's `accept()`
+waited forever. A connected TCP stream would have had SOCKS headers injected into its bytes, and
+its reads would have discarded data as malformed datagrams.
+
+The routes that strand entries are ordinary. libuv (and so `dig`) closes through `syscall()`.
+glibc's `closefrom()` calls its internal `close_range`. `fclose()` on an `fdopen()`ed socket calls
+glibc's internal `close`.
+
+**Decision.** Two layers.
+
+- **Identity.** Each entry records the socket's kernel cookie (`SO_COOKIE`: 64 bits, never reused)
+  when it is claimed. Every intercepted call confirms it with one `getsockopt` before trusting the
+  entry. On a mismatch, the entry is released — which also releases the association D-17 said
+  would otherwise be held until exit — and whatever now holds the number is adopted if it is a
+  UDP socket, or passed through if not. Exactly one thread recovers an entry: the cookie field
+  doubles as the lock, and other threads wait for it.
+- **Fewer strandings.** `closefrom()` is hooked. `syscall()` is hooked for the descriptor-lifecycle
+  numbers — `close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl`, `socket` — which are routed to
+  the ordinary hooks. So libuv's closes release their entries at once, and a socket created or
+  duplicated through `syscall()` is tracked like any other. Data calls through `syscall()` remain
+  unsupported, as the README says.
+
+The shim's own replacement of a socket after `fork` (FR-L-04) re-records the cookie. Without that,
+the first run of this change mistook the fork fix for a stale entry and hung the lifecycle test.
+
+**Consequences.**
+
+- **Cost:** one `getsockopt` per intercepted call, about 0.6 µs on the review host. Descriptors the
+  shim does not track still cost two loads and no syscall. A `send()` in a tight loop went from
+  5.1 to 5.9 µs, averaged over six alternating runs against the old shim. The effect on a round
+  trip through the proxy is a few microseconds at most, inside run-to-run noise. The first
+  measurement, taken while the host was busy, suggested 6–15 µs per round trip; alternating runs
+  on a quieter host showed that was noise. The check does retire the claim of "no syscalls on the
+  datagram path" (review item D7).
+- **Residual:** while one thread recovers a stale entry, another thread's call on that same number
+  finds no entry and passes through. That matters only if the number now holds a UDP socket that
+  arrived by a route no hook saw. Before this record such a socket was misattributed rather than
+  passed through, so this is not a regression.
+- A stale entry whose number is never used again still holds its association until exit, as D-17
+  said. It is now released on the first call of any kind that touches the number, not only on the
+  next UDP `socket()`.
+
+**Revisit if:** the per-call cost matters for a real workload. The only cheaper check would be one
+the kernel does not offer.
+
+---
+
+## D-24
+### Associations are type-stable, and read only through a counted reference
+
+**Date:** 2026-09-23 · **Status:** Accepted · Review item H2.
+
+**Context.** The datagram path read an association's relay address, idle time and fork generation
+through a bare pointer loaded from the fd-table entry. Another thread could drop the last
+reference at the same moment — most simply by noticing that the proxy had expired an idle
+association — and `free()` the object between the load and the read. Threads sharing one socket is
+legal, and TST-07 does it, but it never combined sharing with expiry. A TSan test of exactly that
+race reports 15 warnings against the old code, including a heap use-after-free in
+`udpc_assoc_relay`.
+
+**Decision.** Keep the datagram path lock-free (D-07) and make the pointer safe to have loaded.
+
+- **Type-stable memory.** An association is never returned to the allocator. On its last
+  reference it goes onto a free list for reuse, so a stale pointer always points at a valid
+  object, even if a recycled one. Pushes are a lock-free Treiber stack. Pops are serialised by a
+  mutex that is only ever *tried*, which rules out ABA without letting a signal handler, or a
+  forked child, wait on it; a failed try just allocates.
+- **Counted access.** `udpc_assoc_get()` takes a reference only while the count is non-zero, then
+  checks the entry still points at the same object; otherwise it lets go and reloads.
+- **One reference per datagram.** The datagram path takes its reference once, through
+  `udpc_assoc_hold()`, which also makes sure the association exists and does the FR-P-08 idle
+  check. The send then uses it for the relay address and the activity stamp, and on a failure
+  detaches that same association with `udpc_assoc_drop()`, never one another thread may have put
+  in its place. The first version took a fresh reference for each of those reads — four per send
+  — and alternating runs put that at about 0.5 µs per call. Consolidating them recovered it. A
+  receive holds one reference for its whole duration.
+
+**Consequences.** Readers never block and teardown never waits. The price is one reference —
+two atomic read-modify-writes — per datagram, on a cache line shared by threads using one socket.
+Memory for associations is bounded by the peak number alive at once, rather than returned. The same
+race, rewritten against the new interface, is clean under TSan.
+
+**Revisit if:** association churn makes the peak-sized pool material, which would argue for
+returning memory under a grace-period scheme instead.
+
+---
+
+## D-25
+### The wrapper passes where the password is, never the password
+
+**Date:** 2026-09-23 · **Status:** Accepted · Review item H3.
+
+**Context.** The wrapper resolved the password — from a password file, or from `password =` in a
+config file — and exported it to the target as `UDPCHAINS_PASSWORD=<secret>`. Every process the
+target started inherited it. Anything that dumps an environment — a crash reporter, a CI log, a
+stray `env`, `ps e` — would print it. A user who chose a password file to keep the secret out of
+the environment got the opposite, silently.
+
+**Decision.** The wrapper exports the password's *location*, and each shim reads it from there.
+
+- From a password file: `UDPCHAINS_PASSWORD_FILE=<absolute path>`. Absolute, because the target
+  or a descendant may change directory before its first datagram; a test covers exactly that.
+- From `password =` in a config file: `UDPCHAINS_PASSWORD_CONFIG=<absolute path of that file>`. The
+  shim reads only the password from it; everything else arrives resolved, as before.
+- Supplied by the user as `UDPCHAINS_PASSWORD`: already in the environment by their choice, and
+  left as it is. The wrapper never creates that variable.
+
+The wrapper clears its own copy with `explicit_bzero` once exported.
+
+**Consequences.** The secret stays in the file the user protected. A process running as the same
+user could read that file anyway, so the threat this removes is accidental disclosure through the
+environment, not a same-user attacker. A password file deleted or changed after launch now affects
+descendants started afterwards — which is arguably what a user rotating a password wants.
+
+**Revisit if:** a deployment needs the password to outlive its file.
+
+---
+
+## D-26
+### The shim's own descriptors are moved out of the way and protected
+
+**Date:** 2026-09-23 · **Status:** Accepted · Review item H4.
+
+**Context.** Control connections, and the resolver's sockets (D-22), are ordinary descriptors in
+the application's descriptor space, at whatever low number the kernel handed out. A daemon's
+close-all loop, a `close_range(3, ~0U)`, or a `dup2` onto the number took one away without the
+shim knowing. After that, the association polled whatever the application had put at that number,
+and on teardown closed it — the application's pipe, file or socket.
+
+**Decision.**
+
+- **Moved.** Each shim-owned descriptor is moved with `F_DUPFD_CLOEXEC` into a band starting at
+  768 (half the soft limit if that is below 1024), clear of the lowest-free numbers applications
+  are given. The band does not follow a larger soft limit upward: the kernel sizes a process's
+  descriptor table to the highest number in use, and a table grown to a million entries costs
+  megabytes per process.
+- **Marked.** The fd table records these numbers in a new `SHIM` state, with the socket's cookie
+  (D-23).
+- **Protected.** `close()` on one returns `EBADF` — the application never opened it, so to the
+  application it is not open. `close_range` and `closefrom` close *around* them. `dup2`/`dup3`
+  onto one fails with `EBUSY`, the error `dup2` already has for "that number cannot be used right
+  now". A mark whose cookie no longer matches — the descriptor was closed by a route no hook sees,
+  and the number reused — is cleared, never enforced, so an application is never refused its own
+  descriptor.
+
+**Consequences.** A close-all loop, and `close_range` over the whole band, leave every association
+working with no re-association, and tearing an association down closes nothing of the
+application's. Both are tested. The visible changes are the two errno values above, for
+descriptors the application did not open, and the shim's descriptors appearing in the 768+ band of
+`/proc/self/fd`. The range release this needed now visits only allocated blocks, so
+`close_range(3, ~0U)` no longer walks a million entries (review item L3).
+
+**Revisit if:** a program is found that `dup2`s onto a specific number in the band. Relocating the
+shim's descriptor there, rather than refusing, would need an owner back-reference in the table.

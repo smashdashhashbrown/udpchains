@@ -15,7 +15,8 @@ set -eu
 
 SOCKS5D="$1"
 UDPECHO="$2"
-WRAPPER="$3"
+# Absolute: one case below runs the wrapper from another directory.
+WRAPPER="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"
 
 TMP=$(mktemp -d)
 PIDS=""
@@ -129,6 +130,52 @@ if printf '%s' "$out" | grep -q open-proxy-ok; then
 	ok "configured credentials do not break a proxy that wants none"
 else
 	notok "credentials broke an unauthenticated proxy: $out"
+fi
+
+# --- D-25: the password is never put in the target's environment ------------
+# The wrapper passes WHERE the password is, and each shim reads it from there.
+# Checked by running env(1) as the target, which prints exactly what the target
+# -- and anything it starts -- inherits.
+envout=$(UDPCHAINS_USERNAME=alice UDPCHAINS_PASSWORD_FILE="$TMP/pass" \
+	"$WRAPPER" -q -p "127.0.0.1:$PROXY" env 2>&1) || true
+if printf '%s' "$envout" | grep -q s3cret; then
+	notok "D-25: the password from a password file is in the target's environment"
+else
+	ok "D-25: a password file's contents are not in the target's environment"
+fi
+if printf '%s' "$envout" | grep -q "^UDPCHAINS_PASSWORD_FILE=$TMP/pass\$"; then
+	ok "the target is told where the file is instead"
+else
+	notok "UDPCHAINS_PASSWORD_FILE was not passed on: $envout"
+fi
+
+# A relative path is passed on as an absolute one, so a target that changes
+# directory before its first datagram still finds the file.
+out=$(cd "$TMP" && echo "relative-path-ok" | UDPCHAINS_USERNAME=alice \
+	UDPCHAINS_PASSWORD_FILE=pass \
+	timeout 15 "$WRAPPER" -p "127.0.0.1:$PROXY" \
+	sh -c "cd / && exec nc -u -w 3 127.0.0.1 $ECHO_PORT" 2>&1) || true
+if printf '%s' "$out" | grep -q relative-path-ok; then
+	ok "a relative password file still works after the target changes directory"
+else
+	notok "a relative password file broke after a chdir: $out"
+fi
+
+# A password written inline in a config file.
+printf 'username = alice\npassword = s3cret\n' > "$TMP/auth.conf"
+chmod 600 "$TMP/auth.conf"
+envout=$("$WRAPPER" -q -f "$TMP/auth.conf" -p "127.0.0.1:$PROXY" env 2>&1) || true
+if printf '%s' "$envout" | grep -q s3cret; then
+	notok "D-25: an inline config password is in the target's environment"
+else
+	ok "D-25: an inline config password is not in the target's environment"
+fi
+out=$(echo "inline-config-ok" | timeout 15 "$WRAPPER" -f "$TMP/auth.conf" \
+	-p "127.0.0.1:$PROXY" nc -u -w 3 127.0.0.1 "$ECHO_PORT" 2>&1) || true
+if printf '%s' "$out" | grep -q inline-config-ok; then
+	ok "and it still authenticates, read by the shim from the config file"
+else
+	notok "an inline config password failed to authenticate: $out"
 fi
 
 echo "1..$n"

@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -231,6 +232,26 @@ int main(int argc, char **argv)
 				record("sendto-after-failed-dup2",
 				       sendto(fd, g_payload, 4, 0,
 				              (struct sockaddr *)&g_dst, g_dstlen));
+			close(fd);
+		}
+	}
+
+	/* The same, through syscall() -- how libuv reaches the kernel.  A socket
+	 * created or duplicated there never met a hook (D-23). */
+	{
+		int fd = (int)syscall(SYS_socket, g_family, SOCK_DGRAM, 0);
+		if (fd >= 0) {
+			int copy = (int)syscall(SYS_dup, fd);
+
+			record("sendto-via-syscall-socket",
+			       sendto(fd, g_payload, 4, 0, (struct sockaddr *)&g_dst,
+			              g_dstlen));
+			if (copy >= 0) {
+				record("sendto-via-syscall-dup",
+				       sendto(copy, g_payload, 4, 0,
+				              (struct sockaddr *)&g_dst, g_dstlen));
+				close(copy);
+			}
 			close(fd);
 		}
 	}

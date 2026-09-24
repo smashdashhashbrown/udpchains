@@ -90,6 +90,11 @@ UDPCHAINS_USERNAME=alice UDPCHAINS_PASSWORD_FILE=~/.udpchains.pw \
     udpchains -p proxy.example:1080 dig @9.9.9.9 example.com
 ```
 
+The password itself never enters the environment of the program you run, or of anything it
+starts: `udpchains` passes on *where* the password is — the password file, or the config file that
+holds `password =` — and the shim reads it from there (D-25). The one exception is a password you
+put in `UDPCHAINS_PASSWORD` yourself, which is inherited as you set it. Prefer a file.
+
 RFC 1929 username/password authentication is supported. Method `0x02` is offered **only** when
 credentials are configured, so a proxy that accepts either is not pushed into an authenticated
 exchange you did not ask for. If authentication fails, the send fails — there is no fallback to an
@@ -154,7 +159,7 @@ This section is the honest part. Read it before deciding whether this tool suits
 | **Statically-linked binaries** | No libc to interpose on. Unfixable by this approach. |
 | **Go binaries** | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. |
 | **setuid/setgid binaries** | The loader ignores `LD_PRELOAD` for them. `udpchains` detects this and **refuses to run them** rather than running them unproxied. Binaries with file capabilities are refused for the same reason. |
-| **Programs calling `syscall()` directly** | Same reason. `ptrace`-based interception is the only answer, and is out of scope. |
+| **Programs sending through `syscall()` directly** | Same reason. `ptrace`-based interception is the only answer, and is out of scope. (Creating, duplicating and closing descriptors through `syscall()` *is* tracked, which is how libuv closes them; sends and receives through it are not.) |
 | **Programs using raw sockets** | `SOCK_RAW` is not intercepted, and SOCKS5 has no way to carry a raw IP packet. Such traffic goes **direct** — see the warning below. `nmap`, `traceroute` and similar tools are in this category. |
 
 ### Traffic it deliberately refuses
@@ -206,13 +211,17 @@ Consequences you will actually notice:
   A program that depends on them will misbehave, and the cause will not be obvious — this is the
   most likely source of a confusing failure.
 
-- **A socket closed by a route that bypasses libc keeps its association until the descriptor number
-  is reused.** The shim releases its per-socket state from the `close()` hook, and not every runtime
-  goes through it — `dig`, via libuv, makes 64 `close` syscalls of which 4 reach the hook. A stranded
-  entry is detected and recycled when the kernel hands the same descriptor number to a new socket
-  (D-17), so nothing breaks; but a program that closes such a socket and never reuses the number
-  holds that association open until it exits. Bounded by the number of UDP sockets opened, not
-  unbounded, and invisible in normal use.
+- **A socket closed by a route no hook sees keeps its association until the number is touched
+  again.** `close()`, `close_range()`, `closefrom()` and `syscall(SYS_close)` all release a socket's
+  state at once. `fclose()` on an `fdopen()`ed socket, and anything issuing the raw system call,
+  do not. Every intercepted call checks that its descriptor is still the socket the shim tracked
+  (D-23), so whatever the kernel puts at that number next is never mistaken for it. But a number
+  that is never used again holds its association until the program exits.
+
+- **The shim's own descriptors sit at 768 and up** (lower if your file limit is under 1024): the
+  proxy connections, and the resolver's sockets. The program cannot close them. `close()` on one
+  fails with `EBADF`, a close-all loop or `close_range` goes around them, and `dup2()` onto one
+  fails with `EBUSY` (D-26). They are close-on-exec.
 
 - **After `fork()`, a child that keeps using an inherited UDP socket gets a fresh socket.** The child
   must not share the parent's association, and parent and child share one open file description, so
@@ -274,8 +283,11 @@ but read back data with the SOCKS header still attached. A 36-cell test matrix
 (`{sendto, send, write, writev, sendmsg, sendmmsg} × {recvfrom, recv, read, readv, recvmsg,
 recvmmsg}`) asserts byte-identical round-trips, across IPv4 and IPv6, connected and unconnected.
 
-Per-descriptor state lives in a lock-free two-level radix table: no allocation, no locks and no
-syscalls on the datagram path, so a send from a signal handler cannot deadlock.
+Per-descriptor state lives in a lock-free two-level radix table, with no allocation and no locks on
+the datagram path once a socket's association is up. Each intercepted call makes one extra system
+call, a `getsockopt`, to confirm its descriptor is still the socket the shim recorded (D-23).
+Associations are type-stable, so a thread reading one while another tears it down reads valid
+memory (D-24).
 
 ## Documentation
 

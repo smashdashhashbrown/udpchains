@@ -23,6 +23,13 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   an answer is truncated. The host's resolver is never consulted; if the proxy route fails, the
   lookup fails.
 
+- **The password was exported into the target's environment (D-25).** The wrapper resolved a
+  password file, or `password =` in a config file, and exported the secret as `UDPCHAINS_PASSWORD`,
+  where every process the target started inherited it, and anything that dumped the environment
+  printed it. The wrapper now exports only where the password is (`UDPCHAINS_PASSWORD_FILE`, or
+  `UDPCHAINS_PASSWORD_CONFIG` naming the config file, both absolute), and each shim reads it from
+  there.
+
 ### Added
 
 - `dns` / `UDPCHAINS_DNS`: the resolver to query through the proxy, numeric only. **No default:**
@@ -34,12 +41,34 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Changed
 
+- Each intercepted call makes one `getsockopt`, to confirm its descriptor (D-23). That costs about
+  0.8 µs per call: a `send()` in a tight loop went from 5.1 to 5.9 µs, averaged over six
+  alternating runs, which is essentially the `getsockopt` itself. The effect on a round trip
+  through the proxy is a few microseconds at most, inside run-to-run noise.
+- The program cannot close the shim's descriptors: `close()` on one is `EBADF`, and `dup2()` onto
+  one is `EBUSY` (D-26).
 - Name services other than the hosts file and DNS (mDNS, `systemd-resolved`, `myhostname`) are no
   longer consulted by proxied programs, since each resolves through a local daemon. Address order
   no longer follows glibc's RFC 6724 sort. Non-ASCII names and `getaddrinfo_a` are refused.
   See the README's *Name resolution* section.
 
 ### Fixed
+
+- **A stale fd-table entry took over whatever reused its number (D-23).** A UDP socket closed by
+  a route no hook saw — libuv's `syscall(SYS_close)`, glibc's `closefrom()`, `fclose()` on an
+  `fdopen()`ed socket — left its entry behind. The next file, pipe or TCP socket given that number
+  was treated as UDP: writes failed, and a TCP `connect()` was swallowed so the peer waited
+  forever. Each entry now records the socket's kernel cookie, and every intercepted call confirms
+  it. `closefrom()` and the lifecycle calls of `syscall()` are now hooked, so those routes release
+  at once.
+- **A use-after-free when threads share a socket (D-24).** The datagram path read the association
+  through a bare pointer, which another thread could free by noticing the proxy had expired it.
+  Associations are now type-stable and read through a counted reference. A TSan test reports a
+  heap use-after-free on the old code and nothing on the new.
+- **The shim's own descriptors could be closed by the program (D-26).** A close-all loop,
+  `close_range` or a `dup2` took a control connection away. The shim then polled, and on teardown
+  *closed*, whatever the program had put at that number. Shim descriptors now live at 768 and up
+  and are protected. `close_range(3, ~0U)` no longer walks a million table entries.
 
 Four ways an intercepted socket could escape the shim, all found in review after 1.0.0 and each
 reproduced before being fixed. Two were SEC-01 violations — a datagram sent directly with the
@@ -83,7 +112,17 @@ proxy down — and one was the FR-I-02 defect the project exists to prevent. See
   port-53 sends. The resolver is clean under ASan/UBSan (codec), Valgrind memcheck and Helgrind
   (the association pool). The wire-level capture script gains a DNS case, **not yet run**: it
   needs root.
-- Suite: 563 assertions across 17 groups.
+- H1–H4 (D-23–D-26). Each new test fails, or hangs, against the previous shim:
+  - The lifecycle test covers a stale entry reused by a TCP socket, which hung; `syscall(SYS_close)`
+    and `closefrom()` releasing at once; and a close-all loop, `close_range`, `close()` and `dup2()`
+    against the shim's descriptors, including that teardown closes none of the program's.
+  - The leak test sends through a socket created, and one duplicated, via `syscall()`; the old shim
+    let both through with the proxy down.
+  - The auth test checks, with `env` as the target, that no password reaches the environment, and
+    that a relative password file survives a `chdir`.
+  - The fd-table test races association readers against replacement under TSan: 15 warnings,
+    including a heap use-after-free, on the old code; none on the new.
+- Suite: 601 assertions across 17 groups.
 
 ## [1.0.0] — 2026-08-20
 

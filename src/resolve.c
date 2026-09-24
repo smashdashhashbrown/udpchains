@@ -16,6 +16,7 @@
 
 #include "addr.h"
 #include "assoc.h"
+#include "fdtable.h"
 #include "guard.h"
 #include "log.h"
 #include "real.h"
@@ -125,10 +126,8 @@ static void init_once(void)
 
 static void ent_close(struct pool_ent *e)
 {
-	if (e->udp_fd >= 0)
-		REAL_CLOSE(e->udp_fd);
-	if (e->ctl_fd >= 0)
-		REAL_CLOSE(e->ctl_fd);
+	udpc_fd_shim_close(e->udp_fd);
+	udpc_fd_shim_close(e->ctl_fd);
 	e->udp_fd = e->ctl_fd = -1;
 	e->used = e->stale = false;
 }
@@ -161,8 +160,10 @@ static int ent_establish(const struct udpc_config *cfg, struct pool_ent *e,
 		return -1;
 	}
 
-	e->ctl_fd = conn.control_fd;
-	e->udp_fd = udp;
+	/* Both are the shim's own descriptors, kept out of the application's
+	 * way and out of its close-all loops (D-26). */
+	e->ctl_fd = udpc_fd_shim_adopt(conn.control_fd);
+	e->udp_fd = udpc_fd_shim_adopt(udp);
 	e->used = true;
 	e->stale = false;
 	e->last_used = (long)(now_ms() / 1000);
@@ -486,6 +487,7 @@ static int tcp_exchange(const struct udpc_config *cfg, struct xfer *x,
 		           strerror(*err));
 		return -1;
 	}
+	fd = udpc_fd_shim_adopt(fd);
 
 	buf = malloc(TCP_MSG_MAX);
 	if (buf == NULL) {
@@ -515,7 +517,7 @@ static int tcp_exchange(const struct udpc_config *cfg, struct xfer *x,
 	rc = 0;
 out:
 	free(buf);
-	REAL_CLOSE(fd);
+	udpc_fd_shim_close(fd);
 	return rc;
 }
 

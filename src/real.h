@@ -46,6 +46,7 @@ enum udpc_real_slot {
 	R_DUP3,
 	R_FCNTL,
 	R_FCNTL64,
+	R_SYSCALL,
 	/* introspection */
 	R_GETPEERNAME,
 	R_GETSOCKNAME,
@@ -86,6 +87,7 @@ typedef int (*udpc_dup_fn)(int);
 typedef int (*udpc_dup2_fn)(int, int);
 typedef int (*udpc_dup3_fn)(int, int, int);
 typedef int (*udpc_fcntl_fn)(int, int, ...);
+typedef long (*udpc_syscall_fn)(long, ...);
 
 typedef int (*udpc_getpeername_fn)(int, struct sockaddr *, socklen_t *);
 typedef int (*udpc_getsockname_fn)(int, struct sockaddr *, socklen_t *);
@@ -121,6 +123,7 @@ typedef int (*udpc_getnameinfo_fn)(const struct sockaddr *, socklen_t, char *,
 #define REAL_DUP3 ((udpc_dup3_fn)udpc_real(R_DUP3, "dup3"))
 #define REAL_FCNTL ((udpc_fcntl_fn)udpc_real(R_FCNTL, "fcntl"))
 #define REAL_FCNTL64 ((udpc_fcntl_fn)udpc_real(R_FCNTL64, "fcntl64"))
+#define REAL_SYSCALL ((udpc_syscall_fn)udpc_real(R_SYSCALL, "syscall"))
 
 #define REAL_GETPEERNAME \
 	((udpc_getpeername_fn)udpc_real(R_GETPEERNAME, "getpeername"))

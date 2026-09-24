@@ -47,11 +47,90 @@ void udpc_assoc_init(void)
 	(void)pthread_atfork(NULL, NULL, atfork_child);
 }
 
-void udpc_assoc_ref(struct udpc_assoc *a)
+/* --- type-stable allocation (D-24) ----------------------------------------- */
+
+/* Freed associations go onto a Treiber stack and are never returned to the
+ * allocator.  Pushes are lock-free.  Pops are serialised by a mutex, which is
+ * what rules out the ABA problem: a node can only leave the stack through the
+ * one popper holding the lock.  The mutex is only ever TRIED, so a pop from a
+ * signal handler that interrupted another pop -- or from a forked child whose
+ * parent held it -- falls back to a fresh allocation instead of deadlocking. */
+static _Atomic(struct udpc_assoc *) g_free;
+static pthread_mutex_t g_pop = PTHREAD_MUTEX_INITIALIZER;
+
+static long now_coarse(void);
+
+struct udpc_assoc *udpc_assoc_alloc(void)
 {
-	if (a == NULL || a == ASSOC_ESTABLISHING)
-		return;
-	atomic_fetch_add_explicit(&a->refcount, 1, memory_order_relaxed);
+	struct udpc_assoc *a = NULL;
+
+	if (pthread_mutex_trylock(&g_pop) == 0) {
+		a = atomic_load_explicit(&g_free, memory_order_acquire);
+		while (a != NULL &&
+		       !atomic_compare_exchange_weak_explicit(&g_free, &a, a->next_free,
+		                                              memory_order_acquire,
+		                                              memory_order_acquire))
+			;
+		pthread_mutex_unlock(&g_pop);
+	}
+	if (a == NULL) {
+		a = calloc(1, sizeof(*a));
+		if (a == NULL)
+			return NULL;
+	}
+
+	/* Everything but the count first.  A reader holding a stale pointer to
+	 * this object can take a reference only once the count is non-zero, and
+	 * even then it will find the entry pointing elsewhere and let go. */
+	a->next_free = NULL;
+	a->fork_generation = udpc_fork_generation();
+	memset(&a->conn, 0, sizeof(a->conn));
+	a->conn.control_fd = -1;
+	atomic_store_explicit(&a->last_used, now_coarse(), memory_order_relaxed);
+	atomic_store_explicit(&a->refcount, 1, memory_order_release);
+	return a;
+}
+
+static void free_push(struct udpc_assoc *a)
+{
+	struct udpc_assoc *head = atomic_load_explicit(&g_free, memory_order_relaxed);
+
+	do {
+		a->next_free = head;
+	} while (!atomic_compare_exchange_weak_explicit(&g_free, &head, a,
+	                                                memory_order_release,
+	                                                memory_order_relaxed));
+}
+
+struct udpc_assoc *udpc_assoc_get(struct udpc_fdent *e)
+{
+	for (;;) {
+		struct udpc_assoc *a =
+			atomic_load_explicit(&e->assoc, memory_order_acquire);
+		int rc;
+
+		if (a == NULL || a == ASSOC_ESTABLISHING)
+			return NULL;
+
+		/* Take a reference only while the count is non-zero: zero means
+		 * the object is being torn down or is on the free list, and must
+		 * not be revived.  The memory itself is always valid (D-24). */
+		rc = atomic_load_explicit(&a->refcount, memory_order_relaxed);
+		while (rc > 0 &&
+		       !atomic_compare_exchange_weak_explicit(&a->refcount, &rc, rc + 1,
+		                                              memory_order_acquire,
+		                                              memory_order_relaxed))
+			;
+		if (rc <= 0)
+			continue; /* torn down under us; reload the entry */
+
+		/* The object may have been recycled for another socket between
+		 * the load and the reference.  Only if the entry still points at
+		 * it is it this entry's association. */
+		if (atomic_load_explicit(&e->assoc, memory_order_acquire) == a)
+			return a;
+		udpc_assoc_unref(a);
+	}
 }
 
 void udpc_assoc_unref(struct udpc_assoc *a)
@@ -60,44 +139,50 @@ void udpc_assoc_unref(struct udpc_assoc *a)
 		return;
 	if (atomic_fetch_sub_explicit(&a->refcount, 1, memory_order_acq_rel) == 1) {
 		/* Last reference: closing the control connection is what tells
-		 * the proxy to release the association (FR-P-02). */
+		 * the proxy to release the association (FR-P-02).  It is the
+		 * shim's own descriptor, so it is released as one (D-26). */
 		atomic_thread_fence(memory_order_acquire);
-		udpc_socks_disconnect(&a->conn);
-		free(a);
+		udpc_fd_shim_close(a->conn.control_fd);
+		a->conn.control_fd = -1;
+		free_push(a);
 	}
 }
 
-bool udpc_assoc_relay(const struct udpc_fdent *e, struct sockaddr_storage *out)
+void udpc_assoc_drop(struct udpc_fdent *e, struct udpc_assoc *a)
 {
-	struct udpc_assoc *a =
-		atomic_load_explicit(&e->assoc, memory_order_acquire);
-
-	if (a == NULL || a == ASSOC_ESTABLISHING)
-		return false;
-
-	/* The relay's family follows the control connection; the application's
-	 * socket has whatever family the application chose.  An AF_INET6 socket
-	 * with a proxy reached over IPv4 is entirely normal, so the relay
-	 * address is adapted to something this socket can actually reach. */
-	return udpc_addr_for_family((const struct sockaddr *)&a->conn.relay,
-	                            atomic_load_explicit(&e->family,
-	                                                 memory_order_relaxed),
-	                            out) == 0;
-}
-
-void udpc_assoc_invalidate(struct udpc_fdent *e)
-{
-	struct udpc_assoc *a =
-		atomic_load_explicit(&e->assoc, memory_order_acquire);
-
 	if (a == NULL || a == ASSOC_ESTABLISHING)
 		return;
+	/* Only if the entry still points at THIS association: another thread
+	 * may already have replaced it, and its replacement is not ours to
+	 * drop.  Winning the exchange transfers the entry's own reference to
+	 * us, so the object cannot be freed before the unref below. */
 	if (atomic_compare_exchange_strong_explicit(&e->assoc, &a, NULL,
 	                                            memory_order_acq_rel,
 	                                            memory_order_acquire)) {
 		atomic_store_explicit(&e->redirected, false, memory_order_release);
 		udpc_assoc_unref(a);
 	}
+}
+
+void udpc_assoc_invalidate(struct udpc_fdent *e)
+{
+	udpc_assoc_drop(e, atomic_load_explicit(&e->assoc, memory_order_acquire));
+}
+
+bool udpc_assoc_relay_of(const struct udpc_assoc *a, int family,
+                         struct sockaddr_storage *out)
+{
+	/* The relay's family follows the control connection; the application's
+	 * socket has whatever family the application chose.  An AF_INET6 socket
+	 * with a proxy reached over IPv4 is entirely normal, so the relay
+	 * address is adapted to something this socket can actually reach. */
+	return udpc_addr_for_family((const struct sockaddr *)&a->conn.relay,
+	                            family, out) == 0;
+}
+
+void udpc_assoc_mark_used(struct udpc_assoc *a)
+{
+	atomic_store_explicit(&a->last_used, now_coarse(), memory_order_relaxed);
 }
 
 static long now_coarse(void)
@@ -109,44 +194,6 @@ static long now_coarse(void)
 	if (clock_gettime(CLOCK_MONOTONIC_COARSE, &ts) != 0)
 		return 0;
 	return (long)ts.tv_sec;
-}
-
-void udpc_assoc_touch(struct udpc_fdent *e)
-{
-	struct udpc_assoc *a =
-		atomic_load_explicit(&e->assoc, memory_order_acquire);
-
-	if (a == NULL || a == ASSOC_ESTABLISHING)
-		return;
-	atomic_store_explicit(&a->last_used, now_coarse(), memory_order_relaxed);
-}
-
-void udpc_assoc_revalidate(struct udpc_fdent *e)
-{
-	struct udpc_assoc *a =
-		atomic_load_explicit(&e->assoc, memory_order_acquire);
-	long last, now;
-
-	if (a == NULL || a == ASSOC_ESTABLISHING)
-		return;
-
-	last = atomic_load_explicit(&a->last_used, memory_order_relaxed);
-	now = now_coarse();
-	if (now - last < UDPC_IDLE_PROBE_SECS)
-		return;
-
-	/* The proxy ties association lifetime to the control connection
-	 * (baseline §0.5), so an expired association shows up as a closed
-	 * control connection. */
-	if (!udpc_socks_control_alive(&a->conn)) {
-		udpc_debug("association idle for %lds and the control connection "
-		           "is gone; re-associating before this send (FR-P-08)",
-		           now - last);
-		udpc_assoc_invalidate(e);
-	} else {
-		/* Still alive: do not probe again until it goes idle afresh. */
-		atomic_store_explicit(&a->last_used, now, memory_order_relaxed);
-	}
 }
 
 /* D-05 R2: a loopback destination is resolved at the PROXY, so with a remote
@@ -262,6 +309,9 @@ static int reprivatize_socket(int fd, struct udpc_fdent *e, int *out_errno)
 		return -1;
 	}
 	REAL_CLOSE(ns);
+	/* A different socket now sits behind fd, by design; without this the
+	 * next call would take it for a stale entry and drop it (D-23). */
+	udpc_fd_rebind_cookie(e, fd);
 
 	if (fdflags >= 0)
 		(void)fcntl(fd, F_SETFD, fdflags);
@@ -282,15 +332,11 @@ static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg
 	if (loopback_guard(cfg, e, out_errno) != 0)
 		return -1;
 
-	a = calloc(1, sizeof(*a));
+	a = udpc_assoc_alloc();
 	if (a == NULL) {
 		*out_errno = ENOMEM;
 		return -1;
 	}
-	atomic_store_explicit(&a->refcount, 1, memory_order_relaxed);
-	atomic_store_explicit(&a->last_used, now_coarse(), memory_order_relaxed);
-	a->fork_generation = udpc_fork_generation();
-	a->conn.control_fd = -1;
 
 	/* FR-P-05: declare the bound address only when the application actually
 	 * bound a concrete one.  Proxies pin the association to a declared
@@ -303,17 +349,22 @@ static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg
 	UDPC_GUARD_ENTER();
 	if (udpc_socks_associate(cfg, bind_addr, &a->conn, out_errno) != 0) {
 		UDPC_GUARD_LEAVE();
-		free(a);
+		udpc_assoc_unref(a);
 		/* SEC-01: the failure is reported on the application's call.
 		 * There is no fallback to a direct send. */
 		return -1;
 	}
 	UDPC_GUARD_LEAVE();
 
+	/* D-26: the control connection is the shim's own descriptor.  Moved
+	 * out of the application's way and marked, so a close-all loop in the
+	 * application cannot take it -- and so this association can never
+	 * close a number the application has since been given. */
+	a->conn.control_fd = udpc_fd_shim_adopt(a->conn.control_fd);
+
 	if (redirect_fd(fd, atomic_load_explicit(&e->family, memory_order_relaxed),
 	                a, out_errno) != 0) {
-		udpc_socks_disconnect(&a->conn);
-		free(a);
+		udpc_assoc_unref(a);
 		return -1;
 	}
 
@@ -343,8 +394,11 @@ static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg
 	return 0;
 }
 
-int udpc_assoc_ensure(int fd, struct udpc_fdent *e, const struct udpc_config *cfg,
-                      int *out_errno)
+/* udpc_assoc_ensure, returning a reference to the association it ensured, so
+ * the caller can use it without taking another (D-24).  NULL on failure. */
+static struct udpc_assoc *ensure_held(int fd, struct udpc_fdent *e,
+                                      const struct udpc_config *cfg,
+                                      int *out_errno)
 {
 	struct udpc_assoc *a;
 	int spins = 0;
@@ -353,9 +407,21 @@ int udpc_assoc_ensure(int fd, struct udpc_fdent *e, const struct udpc_config *cf
 		a = atomic_load_explicit(&e->assoc, memory_order_acquire);
 
 		if (a != NULL && a != ASSOC_ESTABLISHING) {
+			bool inherited;
+
+			/* Read through a reference: another thread may be
+			 * dropping this association right now (D-24). */
+			a = udpc_assoc_get(e);
+			if (a == NULL)
+				continue;
+			inherited = a->fork_generation != udpc_fork_generation();
+			if (!inherited)
+				return a; /* the caller's reference */
+			udpc_assoc_unref(a);
+
 			/* FR-L-04: an association inherited across fork belongs
 			 * to the parent.  Drop it and establish our own. */
-			if (a->fork_generation != udpc_fork_generation()) {
+			{
 				udpc_debug("fd %d: association inherited across "
 				           "fork, re-establishing",
 				           fd);
@@ -364,10 +430,9 @@ int udpc_assoc_ensure(int fd, struct udpc_fdent *e, const struct udpc_config *cf
 				 * lands on this process's own socket rather than
 				 * the one still shared with the parent. */
 				if (reprivatize_socket(fd, e, out_errno) != 0)
-					return -1;
+					return NULL;
 				continue;
 			}
-			return 0;
 		}
 
 		if (a == ASSOC_ESTABLISHING) {
@@ -376,7 +441,7 @@ int udpc_assoc_ensure(int fd, struct udpc_fdent *e, const struct udpc_config *cf
 				 * from a signal handler, for the very fd being
 				 * established.  Waiting could never succeed. */
 				*out_errno = EAGAIN;
-				return -1;
+				return NULL;
 			}
 			if (++spins < 64)
 				sched_yield();
@@ -404,10 +469,53 @@ int udpc_assoc_ensure(int fd, struct udpc_fdent *e, const struct udpc_config *cf
 				atomic_compare_exchange_strong_explicit(
 					&e->assoc, &expected, NULL,
 					memory_order_acq_rel, memory_order_acquire);
-				return -1;
+				return NULL;
 			}
-			return 0;
+			continue; /* established: loop once to take the reference */
 		}
 		/* Lost the race; loop and observe the winner's result. */
 	}
+}
+
+int udpc_assoc_ensure(int fd, struct udpc_fdent *e, const struct udpc_config *cfg,
+                      int *out_errno)
+{
+	struct udpc_assoc *a = ensure_held(fd, e, cfg, out_errno);
+
+	if (a == NULL)
+		return -1;
+	udpc_assoc_unref(a);
+	return 0;
+}
+
+struct udpc_assoc *udpc_assoc_hold(int fd, struct udpc_fdent *e,
+                                   const struct udpc_config *cfg, bool revalidate,
+                                   int *out_errno)
+{
+	struct udpc_assoc *a = ensure_held(fd, e, cfg, out_errno);
+	long last, now;
+
+	if (a == NULL || !revalidate)
+		return a;
+
+	/* FR-P-08: an association idle long enough to have been expired is
+	 * checked before the send, not discovered from a failure after it --
+	 * by then the datagram has gone to a relay port that no longer exists.
+	 * Busy sockets pay nothing: the check is a comparison until the
+	 * association has been quiet for UDPC_IDLE_PROBE_SECS. */
+	last = atomic_load_explicit(&a->last_used, memory_order_relaxed);
+	now = now_coarse();
+	if (now - last < UDPC_IDLE_PROBE_SECS)
+		return a;
+	if (udpc_socks_control_alive(&a->conn)) {
+		atomic_store_explicit(&a->last_used, now, memory_order_relaxed);
+		return a;
+	}
+
+	udpc_debug("association idle for %lds and the control connection is "
+	           "gone; re-associating before this send (FR-P-08)",
+	           now - last);
+	udpc_assoc_drop(e, a);
+	udpc_assoc_unref(a);
+	return ensure_held(fd, e, cfg, out_errno);
 }

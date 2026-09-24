@@ -35,19 +35,23 @@ None open.
   unix stream socket's `write()` failed with `EAGAIN`. A connected TCP socket would get SOCKS headers
   injected into its stream, and its reads would silently lose bytes. a7ec506 fixed the dup routes
   only.
+  - **Implemented (D-23), awaiting commit.**
 - [ ] **H2 — use-after-free when one socket is used from several threads.** *Inspection.*
   `udpc_assoc_relay`, `_touch`, `_revalidate` and `_ensure` read `e->assoc` and dereference it
   without taking a reference. `udpc_assoc_invalidate` on another thread can free it at the same
   time, for example when idle expiry is detected. See `src/assoc.c:70-150` and
   `src/core.c:140,266,281,356`. TST-07 never combines multiple threads with expiry.
+  - **Implemented (D-24), awaiting commit.**
 - [ ] **H3 — the password is exported in plaintext to the target and all its descendants.**
   `udpc_config_export` (`src/config.c:500`) turns `password_file` into
   `UDPCHAINS_PASSWORD=<secret>`. This defeats the reason for using a file.
+  - **Implemented (D-25), awaiting commit.**
 - [ ] **H4 — control-connection descriptors are unprotected in the app's descriptor space.** If
   the app closes one (close-all loops, `close_range`, `dup2` onto that number), the association
   keeps the stale number. `udpc_socks_disconnect` (`src/socks5.c:726`) later closes whatever the
   app has there, and the liveness probe polls the wrong descriptor. Usual fix: `F_DUPFD_CLOEXEC`
   to a high number.
+  - **Implemented (D-26), awaiting commit.**
 
 ## Medium
 
@@ -94,6 +98,8 @@ None open.
 - [ ] **L2** — a bad `msg_iov` pointer segfaults instead of returning `EFAULT`; `msg_iovlen` is
   truncated to `int`; 1024 iovecs plus the header iovec exceeds `UIO_MAXIOV`.
 - [ ] **L3** — `close_range(3, ~0U)` walks up to 1,048,576 entries. Iterate only allocated blocks.
+  - **Fixed alongside H4 (D-26), awaiting commit:** the range release now visits only allocated
+    blocks.
 - [ ] **L4** — per-datagram warnings (oversized inbound, multicast) are not rate-limited. Logs are
   written to fd 2 even if the app has reused it for a file or socket.
 - [ ] **L5** — config and password-file handling:
@@ -125,7 +131,8 @@ None open.
   - RFC 1929 credentials cross the network in cleartext.
   - The relay leg to a remote proxy is unauthenticated and unencrypted, so spoofed datagrams can
     claim any source.
-  - The password is propagated through the environment (H3).
+  - ~~The password is propagated through the environment (H3).~~ No longer true (D-25); the README
+    now says what is passed instead.
   - UDP servers that only receive don't work through a proxy.
   - ~~The README's "No DNS leak" claim is false (C4).~~ Corrected with the D-22 implementation.
 - [ ] **D4** — the configuration reference is incomplete:
@@ -151,8 +158,9 @@ None open.
     the actual count is 108.
   - The TRACEABILITY rows need entries for D-21.
 - [ ] **D7** — overclaims to soften:
-  - "no syscalls on the datagram path … cannot deadlock" (M10; the send path also calls `poll()`
-    after 1 s idle).
+  - ~~"no syscalls on the datagram path … cannot deadlock" (M10; the send path also calls `poll()`
+    after 1 s idle).~~ Removed from the README with D-23, which adds a `getsockopt` per call. The
+    same claim remains in the CHANGELOG's 1.0.0 entry and in DESIGN.md §3.1.
   - The FR-L-02 generation guard (M8).
   - "fall back or fail" for GSO/GRO (M2).
   - "nothing breaks" for the D-17 fix (H1).

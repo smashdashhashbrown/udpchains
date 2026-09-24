@@ -17,7 +17,12 @@ struct udpc_fdent *udpc_intercept(int fd)
 {
 	if (UDPC_IN_SHIM())
 		return NULL;
-	return udpc_fd_lookup(fd);
+	/* Verified, at the cost of one getsockopt per intercepted call: an
+	 * entry whose socket was closed behind the shim's back must not claim
+	 * whatever the kernel has since put at that number (D-23).  Calls on
+	 * descriptors the shim does not track still cost two loads and no
+	 * syscall. */
+	return udpc_fd_lookup_verified(fd);
 }
 
 static size_t iov_total(const struct iovec *iov, int iovcnt)
@@ -124,10 +129,11 @@ static bool association_looks_dead(int e)
 	       e == ECONNRESET || e == EHOSTUNREACH;
 }
 
-static ssize_t send_once(int fd, struct udpc_fdent *e,
-                         const struct udpc_config *cfg, const struct iovec *iov,
-                         int iovcnt, const struct sockaddr *dst, int flags,
-                         size_t paylen, int *out_errno)
+/* One datagram through a held association. */
+static ssize_t send_via(int fd, struct udpc_fdent *e, struct udpc_assoc *a,
+                        const struct udpc_config *cfg, const struct iovec *iov,
+                        int iovcnt, const struct sockaddr *dst, int flags,
+                        size_t paylen, int *out_errno)
 {
 	struct udpc_tls *tls;
 	struct sockaddr_storage relay;
@@ -135,9 +141,9 @@ static ssize_t send_once(int fd, struct udpc_fdent *e,
 	ssize_t hlen, n;
 	int i;
 
-	if (udpc_assoc_ensure(fd, e, cfg, out_errno) != 0)
-		return -1;
-	if (!udpc_assoc_relay(e, &relay)) {
+	if (!udpc_assoc_relay_of(a, atomic_load_explicit(&e->family,
+	                                                 memory_order_relaxed),
+	                         &relay)) {
 		*out_errno = ENETUNREACH;
 		return -1;
 	}
@@ -206,6 +212,32 @@ static ssize_t send_once(int fd, struct udpc_fdent *e,
 	return (ssize_t)paylen;
 }
 
+static ssize_t send_once(int fd, struct udpc_fdent *e,
+                         const struct udpc_config *cfg, const struct iovec *iov,
+                         int iovcnt, const struct sockaddr *dst, int flags,
+                         size_t paylen, int *out_errno)
+{
+	struct udpc_assoc *a;
+	ssize_t rc;
+
+	/* One reference serves the whole datagram (D-24): establishing if
+	 * needed, the FR-P-08 idle check, the relay address and the activity
+	 * stamp all use it.  Taking a fresh one for each cost four pairs of
+	 * atomic operations per send. */
+	a = udpc_assoc_hold(fd, e, cfg, true, out_errno);
+	if (a == NULL)
+		return -1;
+	rc = send_via(fd, e, a, cfg, iov, iovcnt, dst, flags, paylen, out_errno);
+	if (rc >= 0)
+		udpc_assoc_mark_used(a);
+	else if (association_looks_dead(*out_errno))
+		/* Detach THIS association, so the retry re-associates -- not
+		 * one another thread may already have put in its place. */
+		udpc_assoc_drop(e, a);
+	udpc_assoc_unref(a);
+	return rc;
+}
+
 ssize_t udpc_core_send(int fd, struct udpc_fdent *e, const struct iovec *iov,
                        int iovcnt, const struct sockaddr *dst, socklen_t dstlen,
                        int flags)
@@ -260,30 +292,24 @@ ssize_t udpc_core_send(int fd, struct udpc_fdent *e, const struct iovec *iov,
 		return -1;
 	}
 
-	/* FR-P-08: check up front whether an idle association has been expired,
+	/* send_once checks an idle association before using it (FR-P-08),
 	 * rather than discovering it from a failure after the datagram has
 	 * already gone to a relay port that no longer exists. */
-	udpc_assoc_revalidate(e);
-
 	rc = send_once(fd, e, cfg, iov, iovcnt, target, flags, paylen, &err);
-	if (rc >= 0) {
-		udpc_assoc_touch(e);
+	if (rc >= 0)
 		return rc;
-	}
 
 	/* FR-P-08: the proxy expires idle associations.  Re-associate once,
 	 * transparently, and retry -- the application should see a successful
-	 * send, not an error it has to handle. */
+	 * send, not an error it has to handle.  send_once has already detached
+	 * the dead association. */
 	if (association_looks_dead(err)) {
 		udpc_debug("fd %d: association appears expired (%s); "
 		           "re-associating",
 		           fd, strerror(err));
-		udpc_assoc_invalidate(e);
 		rc = send_once(fd, e, cfg, iov, iovcnt, target, flags, paylen, &err);
-		if (rc >= 0) {
-			udpc_assoc_touch(e);
+		if (rc >= 0)
 			return rc;
-		}
 	}
 
 	/* SEC-01 again: a second failure fails the call. */
@@ -296,6 +322,7 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
                        int flags, int *out_msgflags)
 {
 	const struct udpc_config *cfg = udpc_shim_config();
+	struct udpc_assoc *a;
 	struct udpc_tls *tls;
 	struct udpc_socks_hdr hdr;
 	struct iovec sciov;
@@ -315,14 +342,17 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 
 	/* A receive is a use of the socket, so it establishes the association
 	 * if there is not one yet (FR-P-01): without a relay there is nothing
-	 * to receive from. */
-	if (udpc_assoc_ensure(fd, e, cfg, &err) != 0) {
+	 * to receive from.  The reference is held for the whole receive, which
+	 * may block for as long as the application's socket does (D-24). */
+	a = udpc_assoc_hold(fd, e, cfg, false, &err);
+	if (a == NULL) {
 		errno = err;
 		return -1;
 	}
 
 	tls = udpc_tls_get(cfg->max_datagram + UDPC_SOCKS_HDR_MAX);
 	if (tls == NULL) {
+		udpc_assoc_unref(a);
 		errno = ENOMEM;
 		return -1;
 	}
@@ -353,13 +383,18 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 				udpc_debug("fd %d: association appears expired on "
 				           "receive; re-associating",
 				           fd);
-				udpc_assoc_invalidate(e);
-				if (udpc_assoc_ensure(fd, e, cfg, &err) != 0) {
+				udpc_assoc_drop(e, a);
+				udpc_assoc_unref(a);
+				a = udpc_assoc_hold(fd, e, cfg, false, &err);
+				if (a == NULL) {
 					errno = err;
 					return -1;
 				}
 				continue;
 			}
+			err = errno;
+			udpc_assoc_unref(a);
+			errno = err;
 			return -1;
 		}
 
@@ -468,7 +503,8 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 				*out_msgflags |= MSG_TRUNC;
 		}
 
-		udpc_assoc_touch(e);
+		udpc_assoc_mark_used(a);
+		udpc_assoc_unref(a);
 
 		/* recvmsg called WITH MSG_TRUNC returns the true payload
 		 * length; without it, the amount actually delivered. */

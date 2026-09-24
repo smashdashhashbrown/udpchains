@@ -32,6 +32,10 @@
 #include <string.h>
 #include <sys/socket.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
+#include "assoc.h"
 #include "fdtable.h"
 
 #define NTHREADS 8
@@ -134,6 +138,69 @@ static void *sharer(void *arg)
 		if (udpc_fd_lookup(newfd) != NULL)
 			udpc_fd_release(newfd);
 	}
+	return NULL;
+}
+
+/* D-24: readers of an association against threads that drop and replace it.
+ *
+ * Threads sharing one socket is legal, and each send reads the association's
+ * relay address.  Before D-24 those reads went through a bare pointer load,
+ * and another thread noticing the proxy had expired the association could free
+ * it in between.  Against that code, an earlier form of this test drew 15 TSan
+ * warnings, among them a heap use-after-free in the relay read.  The readers
+ * here do what the datagram path now does: take one reference, read through
+ * it, stamp it, drop it. */
+static int g_assoc_fd = 8000;
+static _Atomic int g_stop;
+static _Atomic long g_reads;
+
+static struct udpc_assoc *fake_assoc(void)
+{
+	struct udpc_assoc *a = udpc_assoc_alloc();
+	struct sockaddr_in *r = (struct sockaddr_in *)&a->conn.relay;
+
+	r->sin_family = AF_INET;
+	r->sin_port = htons(1);
+	r->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	return a;
+}
+
+static void *assoc_reader(void *arg)
+{
+	struct udpc_fdent *e = arg;
+
+	(void)arg;
+	while (!atomic_load(&g_stop)) {
+		struct sockaddr_storage out;
+		struct udpc_assoc *a = udpc_assoc_get(e);
+
+		if (a != NULL) {
+			if (!udpc_assoc_relay_of(a, AF_INET, &out) ||
+			    out.ss_family != AF_INET)
+				atomic_fetch_add(&g_errors, 1);
+			udpc_assoc_mark_used(a);
+			if (atomic_load(&g_reads) % 7 == 0)
+				udpc_assoc_drop(e, a); /* as a failed send does */
+			udpc_assoc_unref(a);
+		}
+		atomic_fetch_add(&g_reads, 1);
+	}
+	return NULL;
+}
+
+static void *assoc_replacer(void *arg)
+{
+	struct udpc_fdent *e = arg;
+	int i;
+
+	for (i = 0; i < NITER * 10; i++) {
+		struct udpc_assoc *a = fake_assoc(), *expect = NULL;
+
+		udpc_assoc_invalidate(e);
+		if (!atomic_compare_exchange_strong(&e->assoc, &expect, a))
+			udpc_assoc_unref(a);
+	}
+	atomic_store(&g_stop, 1);
 	return NULL;
 }
 
@@ -249,6 +316,30 @@ int main(void)
 		udpc_fd_publish(second);
 		TAP_OK(udpc_fd_lookup(91) != NULL, "the recycled entry is usable");
 		udpc_fd_release(91);
+	}
+
+	TAP_GROUP("D-24: reading an association while another thread drops it");
+	{
+		struct udpc_fdent *e = udpc_fd_claim(g_assoc_fd, AF_INET, SOCK_DGRAM);
+
+		TAP_OK(e != NULL, "the descriptor is claimed");
+		udpc_fd_publish(e);
+		atomic_store(&e->assoc, fake_assoc());
+		atomic_store(&g_errors, 0);
+		atomic_store(&g_stop, 0);
+
+		for (i = 0; i < NTHREADS - 1; i++)
+			pthread_create(&th[i], NULL, assoc_reader, e);
+		pthread_create(&th[NTHREADS - 1], NULL, assoc_replacer, e);
+		for (i = 0; i < NTHREADS; i++)
+			pthread_join(th[i], NULL);
+
+		TAP_OK(atomic_load(&g_reads) > 0, "readers ran (%ld reads)",
+		       atomic_load(&g_reads));
+		TAP_EQ_INT(atomic_load(&g_errors), 0,
+		           "every read saw a whole, live association -- under TSan, "
+		           "with no use-after-free reported");
+		udpc_fd_release(g_assoc_fd);
 	}
 
 	TAP_DONE();

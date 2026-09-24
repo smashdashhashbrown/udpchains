@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -60,25 +61,11 @@ static bool is_intercepted_kind(int domain, int type)
  * one but cannot be tracked. */
 static int adopt_fd(int fd, const char *how)
 {
-	int domain = 0, type = 0;
-	socklen_t len;
-	struct udpc_fdent *e;
+	int rc = udpc_fd_adopt(fd);
 
-	len = sizeof(domain);
-	if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &len) != 0)
-		return 0;
-	len = sizeof(type);
-	if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0)
-		return 0;
-	if (!is_intercepted_kind(domain, type))
-		return 0;
-
-	e = udpc_fd_claim(fd, domain, type);
-	if (e == NULL)
-		return -1;
-	udpc_fd_publish(e);
-	udpc_debug("adopted %s UDP descriptor %d", how, fd);
-	return 0;
+	if (rc > 0)
+		udpc_debug("adopted %s UDP descriptor %d", how, fd);
+	return rc < 0 ? -1 : 0;
 }
 
 /* An untrackable UDP socket is closed rather than left in the application's
@@ -341,26 +328,70 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
 
 int close(int fd)
 {
-	if (!UDPC_IN_SHIM())
+	if (!UDPC_IN_SHIM()) {
+		/* D-26: the shim's own descriptor.  The application never opened
+		 * it -- the kernel gave it to the shim -- so to the application
+		 * it is not open, and closing it is EBADF.  Letting it through
+		 * would drop a live association, and the shim would later close
+		 * whatever the application had put at that number. */
+		if (udpc_fd_is_shim(fd)) {
+			udpc_debug("fd %d belongs to the shim; not closing it", fd);
+			errno = EBADF;
+			return -1;
+		}
 		udpc_fd_release(fd);
+	}
 	return REAL_CLOSE(fd);
 }
 
 #if UDPCHAINS_HAVE_CLOSE_RANGE
+/* close_range, split around the shim's own descriptors (D-26).  Almost always
+ * a single call: shim descriptors sit in one band, and most ranges miss it. */
+static int close_range_around_shim(unsigned first, unsigned last, int flags)
+{
+	unsigned lo = first;
+	int rc = 0, err = 0;
+
+	while (lo <= last) {
+		long s = udpc_fd_next_shim(lo, last);
+
+		if (s >= 0 && !udpc_fd_is_shim((int)s))
+			continue; /* a stale mark, now cleared: look again */
+		if (s < 0 || (unsigned)s > lo) {
+			unsigned hi = s < 0 ? last : (unsigned)s - 1;
+
+			if (REAL_CLOSE_RANGE(lo, hi, flags) != 0) {
+				rc = -1;
+				err = errno;
+			}
+		}
+		if (s < 0 || (unsigned)s == UINT_MAX)
+			break;
+		lo = (unsigned)s + 1;
+	}
+	if (rc != 0)
+		errno = err;
+	return rc;
+}
+
 int close_range(unsigned first, unsigned last, int flags)
 {
 	/* CLOSE_RANGE_CLOEXEC marks descriptors rather than closing them, so
-	 * the entries must survive. */
-	if (!UDPC_IN_SHIM() && (flags & CLOSE_RANGE_CLOEXEC) == 0) {
-		unsigned fd;
+	 * the entries must survive -- and the shim's are close-on-exec already,
+	 * so there is nothing to protect. */
+	if (UDPC_IN_SHIM() || (flags & CLOSE_RANGE_CLOEXEC))
+		return REAL_CLOSE_RANGE(first, last, flags);
 
-		for (fd = first; fd <= last && fd < UDPC_FD_MAX; fd++) {
-			udpc_fd_release((int)fd);
-			if (fd == UINT_MAX)
-				break;
-		}
-	}
-	return REAL_CLOSE_RANGE(first, last, flags);
+	udpc_fd_release_range(first, last);
+	return close_range_around_shim(first, last, flags);
+}
+
+/* glibc's closefrom calls its internal close_range, which no hook sees: every
+ * UDP socket above lowfd was left stranded in the table (D-23), and every
+ * control connection above it was closed from under its association (D-26). */
+void closefrom(int lowfd)
+{
+	(void)close_range(lowfd < 0 ? 0u : (unsigned)lowfd, ~0u, 0);
 }
 #endif
 
@@ -390,10 +421,25 @@ int dup(int oldfd)
  * dup2 -- EBADF on oldfd, say -- with newfd still open, still a UDP socket and
  * no longer tracked, so its next send went direct.  udpc_fd_share replaces or
  * releases the entry once the call has succeeded. */
+/* D-26: dup2 onto the shim's own descriptor would close it silently.  Refused
+ * with EBUSY, the one error dup2 already has for "that number cannot be used
+ * right now".  The shim's descriptors sit in a band a program rarely names. */
+static bool onto_shim(int oldfd, int newfd)
+{
+	if (UDPC_IN_SHIM() || oldfd == newfd || !udpc_fd_is_shim(newfd))
+		return false;
+	udpc_debug("refusing to dup onto fd %d: it belongs to the shim", newfd);
+	errno = EBUSY;
+	return true;
+}
+
 int dup2(int oldfd, int newfd)
 {
-	int rc = REAL_DUP2(oldfd, newfd);
+	int rc;
 
+	if (onto_shim(oldfd, newfd))
+		return -1;
+	rc = REAL_DUP2(oldfd, newfd);
 	if (rc < 0 || UDPC_IN_SHIM() || oldfd == newfd)
 		return rc;
 	return track_dup(oldfd, rc);
@@ -401,7 +447,11 @@ int dup2(int oldfd, int newfd)
 
 int dup3(int oldfd, int newfd, int flags)
 {
-	int rc = REAL_DUP3(oldfd, newfd, flags);
+	int rc;
+
+	if (onto_shim(oldfd, newfd))
+		return -1;
+	rc = REAL_DUP3(oldfd, newfd, flags);
 
 	if (rc < 0 || UDPC_IN_SHIM() || oldfd == newfd)
 		return rc;
@@ -448,6 +498,56 @@ int fcntl64(int fd, int cmd, ...)
 	arg = va_arg(ap, void *);
 	va_end(ap);
 	return fcntl_common(REAL_FCNTL64, fd, cmd, arg);
+}
+
+/* syscall() is how some runtimes reach the kernel without libc's wrappers --
+ * libuv closes descriptors this way, which is what stranded dig's table entries
+ * (D-17, D-23).  The descriptor-lifecycle calls are routed to the hooks above,
+ * so a socket created, duplicated or closed through syscall() is tracked like
+ * any other.  Everything else, including sends and receives, goes straight to
+ * the kernel: data calls through syscall() are unsupported, as the README says.
+ *
+ * Six arguments are read whatever the call, as glibc's own syscall() does; no
+ * Linux system call takes more. */
+long syscall(long number, ...)
+{
+	va_list ap;
+	long a0, a1, a2, a3, a4, a5;
+
+	va_start(ap, number);
+	a0 = va_arg(ap, long);
+	a1 = va_arg(ap, long);
+	a2 = va_arg(ap, long);
+	a3 = va_arg(ap, long);
+	a4 = va_arg(ap, long);
+	a5 = va_arg(ap, long);
+	va_end(ap);
+
+	if (!UDPC_IN_SHIM()) {
+		switch (number) {
+		case SYS_close:
+			return close((int)a0);
+#if UDPCHAINS_HAVE_CLOSE_RANGE && defined(SYS_close_range)
+		case SYS_close_range:
+			return close_range((unsigned)a0, (unsigned)a1, (int)a2);
+#endif
+		case SYS_dup:
+			return dup((int)a0);
+#ifdef SYS_dup2
+		case SYS_dup2:
+			return dup2((int)a0, (int)a1);
+#endif
+		case SYS_dup3:
+			return dup3((int)a0, (int)a1, (int)a2);
+		case SYS_fcntl:
+			return fcntl((int)a0, (int)a1, (void *)(uintptr_t)a2);
+		case SYS_socket:
+			return socket((int)a0, (int)a1, (int)a2);
+		default:
+			break;
+		}
+	}
+	return REAL_SYSCALL(number, a0, a1, a2, a3, a4, a5);
 }
 
 /* --- introspection (FR-I-05) ----------------------------------------------- */

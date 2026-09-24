@@ -90,7 +90,8 @@ Required by FR-I-03/04/05, gated at build time by TST-02 (`nm -D`).
 | Send | `sendto`, `sendmsg`, `sendmmsg`, `send`, `write`, `writev` |
 | Receive | `recvfrom`, `recvmsg`, `recvmmsg`, `recv`, `read`, `readv` |
 | Receive, fortified | `__recvfrom_chk`, `__recv_chk`, `__read_chk` (D-21) |
-| Lifecycle | `socket`, `connect`, `bind`, `close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl`, `fcntl64` (D-21) |
+| Lifecycle | `socket`, `connect`, `bind`, `close`, `close_range`, `closefrom`, `dup`, `dup2`, `dup3`, `fcntl`, `fcntl64` (D-21, D-23) |
+| Lifecycle via `syscall()` | `syscall` — only its `close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl` and `socket` numbers, routed to the hooks above; every other number goes straight to the kernel (D-23) |
 | Introspection | `getpeername`, `getsockname` |
 
 The fortified variants are what a `_FORTIFY_SOURCE` build calls in place of `recvfrom`, `recv` and
@@ -139,8 +140,9 @@ Entry contents:
 
 | Field | Purpose |
 |---|---|
-| `state` (atomic) | `FREE` → `CLAIMING` → `ACTIVE` → `DYING` → `FREE` |
+| `state` (atomic) | `FREE` → `CLAIMING` → `ACTIVE` → `DYING` → `FREE`; or `SHIM` for the shim's own descriptors (D-26) |
 | `generation` (atomic) | Bumped on every transition to `FREE`; guards against fd reuse (FR-L-02) |
+| `cookie` (atomic) | The socket's `SO_COOKIE`, checked by every intercepted call so a stale entry never claims whatever reused its number (D-23) |
 | `assoc` | Pointer to the shared association object (§3.2) |
 | `app_dst` | Destination the application named via `connect()` (FR-F-08) |
 | `connected` | Whether `connect()` has been called and not dissolved |
@@ -165,6 +167,14 @@ Owns the SOCKS5 relationship for one application socket (D-13):
 
 It owns **no data socket** — the application's fd is the data socket (FR-I-07).
 
+Association objects are **type-stable** (D-24): released ones go onto a free list and are never
+returned to the allocator, and every reader takes a counted reference through `udpc_assoc_get()`,
+which re-checks the entry still points at the object. A thread that loaded the pointer just as
+another dropped the last reference therefore reads valid memory, and lets go on finding it
+recycled. The datagram path takes exactly one reference per datagram, through `udpc_assoc_hold()`,
+and uses it for everything the datagram needs. It stays lock-free. Its control connection is a shim-owned descriptor in
+the protected band (§3.3, D-26).
+
 ### 3.3 Refcounting, `dup`, and `close`
 
 `dup`/`dup2`/`dup3` point the new fd's entry at the same association and increment the refcount
@@ -179,8 +189,14 @@ intercepted, the new descriptor shares its association. Otherwise any stale entr
 is released. A duplicate of an intercepted socket that the table cannot track is closed, and the
 call fails with `EMFILE`.
 
-`close_range` iterates the requested range and releases each entry, honouring `CLOSE_RANGE_CLOEXEC`
-by marking rather than closing.
+`close_range` releases each entry in the range, visiting only allocated blocks, and honours
+`CLOSE_RANGE_CLOEXEC` by marking rather than closing. `closefrom` is `close_range(lowfd, ~0U)`.
+
+**The shim's own descriptors are protected** (D-26). Control connections and the resolver's
+sockets are moved into a band from 768 up, and marked `SHIM` in the table. `close()` on one fails
+with `EBADF`, `close_range` closes around them, and `dup2`/`dup3` onto one fails with `EBUSY`. A
+mark whose cookie no longer matches is stale — the descriptor was closed by a route no hook sees —
+and is cleared rather than enforced.
 
 On release the entry's generation is bumped before the state returns to `FREE`, so a subsequent
 socket receiving the same fd number cannot inherit stale state (FR-L-02).

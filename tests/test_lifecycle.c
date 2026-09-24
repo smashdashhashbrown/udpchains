@@ -11,8 +11,10 @@
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -81,6 +83,38 @@ static int count_tcp_sockets(int *missing_cloexec)
 		flags = fcntl(fd, F_GETFD);
 		if (missing_cloexec && (flags < 0 || !(flags & FD_CLOEXEC)))
 			(*missing_cloexec)++;
+	}
+	closedir(d);
+	return n;
+}
+
+/* The descriptor numbers of the TCP sockets this process holds -- under the
+ * shim, its control connections. */
+static int tcp_fds(int *out, int max)
+{
+	DIR *d = opendir("/proc/self/fd");
+	struct dirent *ent;
+	int n = 0;
+
+	if (d == NULL)
+		return -1;
+	while ((ent = readdir(d)) != NULL && n < max) {
+		int fd, domain = 0, type = 0;
+		socklen_t l;
+
+		if (ent->d_name[0] == '.')
+			continue;
+		fd = atoi(ent->d_name);
+		if (fd == dirfd(d))
+			continue;
+		l = sizeof(domain);
+		if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &l) != 0)
+			continue;
+		l = sizeof(type);
+		if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &l) != 0)
+			continue;
+		if (type == SOCK_STREAM && (domain == AF_INET || domain == AF_INET6))
+			out[n++] = fd;
 	}
 	closedir(d);
 	return n;
@@ -301,6 +335,149 @@ static void t_scm_rights_adopted(void)
 	close(got);
 }
 
+/* D-23: a descriptor closed by a route no hook sees leaves its entry behind.
+ * fclose() on an fdopen()ed socket is one: glibc closes through an internal
+ * function.  The number is then free, and whatever the kernel puts there next
+ * must not be treated as the old UDP socket. */
+static void t_stale_entry_not_hijacked(void)
+{
+	struct sockaddr_in la;
+	socklen_t ll = sizeof(la);
+	int lst, fd, stale, cli, srv, before;
+	char buf[16];
+	FILE *f;
+
+	TAP_GROUP("D-23: a stale entry does not take over the next descriptor");
+
+	lst = socket(AF_INET, SOCK_STREAM, 0);
+	memset(&la, 0, sizeof(la));
+	la.sin_family = AF_INET;
+	la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	bind(lst, (struct sockaddr *)&la, sizeof(la));
+	listen(lst, 1);
+	getsockname(lst, (struct sockaddr *)&la, &ll);
+
+	fd = udp4();
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_OK(roundtrip(fd, "pre-fclose"), "the UDP socket works");
+	before = count_tcp_sockets(NULL);
+
+	stale = fd;
+	f = fdopen(fd, "r+");
+	TAP_OK(f != NULL && fclose(f) == 0,
+	       "fclose(fdopen(fd)) closes it by a route no hook sees");
+
+	cli = socket(AF_INET, SOCK_STREAM, 0);
+	TAP_EQ_INT(cli, stale, "a TCP socket is given the same number");
+	connect(cli, (struct sockaddr *)&la, sizeof(la));
+	srv = accept(lst, NULL, NULL);
+
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(write(cli, "hello", 5), 5, "a write to it succeeds");
+	TAP_EQ_INT(recv(srv, buf, sizeof(buf), 0), 5,
+	           "and exactly those 5 bytes cross the stream: no SOCKS header");
+	TAP_EQ_MEM(buf, "hello", 5, "unaltered");
+	TAP_EQ_INT(write(srv, "world", 5), 5, "the peer replies");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(read(cli, buf, sizeof(buf)), 5,
+	           "and a read returns the stream's bytes, not a discarded 'datagram'");
+	TAP_EQ_MEM(buf, "world", 5, "unaltered");
+	TAP_EQ_INT(count_tcp_sockets(NULL), before - 1 + 2,
+	           "the stranded association's control connection was released "
+	           "(the 2 are this test's own TCP pair)");
+
+	close(cli);
+	close(srv);
+	close(lst);
+}
+
+/* D-23: libuv, and so dig, closes through syscall(); closefrom() goes through
+ * glibc's internal close_range.  Neither reached a hook, so each left its
+ * association open until the descriptor number happened to be reused. */
+static void t_other_close_routes(void)
+{
+	int fd, before;
+
+	TAP_GROUP("D-23: syscall(SYS_close) and closefrom release at once");
+
+	fd = udp4();
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_OK(roundtrip(fd, "via-syscall"), "an association is up");
+	before = count_tcp_sockets(NULL);
+	TAP_EQ_INT(syscall(SYS_close, fd), 0, "syscall(SYS_close) succeeds");
+	TAP_EQ_INT(count_tcp_sockets(NULL), before - 1,
+	           "and releases the association there and then");
+
+	fd = udp4();
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_OK(roundtrip(fd, "via-closefrom"), "another association is up");
+	before = count_tcp_sockets(NULL);
+	closefrom(fd);
+	TAP_EQ_INT(count_tcp_sockets(NULL), before - 1,
+	           "closefrom releases it, and closes no control connection "
+	           "belonging to anything else");
+}
+
+/* D-26: the shim's own descriptors are out of the application's way, and out
+ * of its reach. */
+static void t_shim_fds_protected(void)
+{
+	int a, b, i, n, before, ctl[64], p[2];
+	char buf[8] = { 0 };
+
+	TAP_GROUP("D-26: the shim's descriptors survive the application's closes");
+
+	a = udp4();
+	b = udp4();
+	connect(a, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	connect(b, (struct sockaddr *)&g_echo2, sizeof(g_echo2));
+	TAP_OK(roundtrip(a, "a-up") && roundtrip(b, "b-up"), "two associations are up");
+
+	n = tcp_fds(ctl, 64);
+	before = n;
+	{
+		int low = 0;
+		for (i = 0; i < n; i++)
+			if (ctl[i] < 256)
+				low++;
+		TAP_EQ_INT(low, 0, "no control connection sits among the low "
+		                   "numbers the application is allocated");
+	}
+
+	TAP_EQ_INT(close(ctl[0]), -1, "close() on a control connection fails");
+	TAP_EQ_INT(errno, EBADF, "with EBADF: to the application it is not open");
+	TAP_EQ_INT(dup2(0, ctl[0]), -1, "dup2() onto one fails");
+	TAP_EQ_INT(errno, EBUSY, "with EBUSY");
+
+	/* A daemon's close-all loop. */
+	for (i = 3; i < 1024; i++)
+		if (i != a && i != b)
+			close(i);
+	TAP_EQ_INT(count_tcp_sockets(NULL), before,
+	           "a close-all loop leaves every control connection open");
+	TAP_OK(roundtrip(a, "a-after") && roundtrip(b, "b-after"),
+	       "and both sockets still work, on their original associations");
+	TAP_EQ_INT(count_tcp_sockets(NULL), before, "with no re-association");
+
+	TAP_EQ_INT(close_range((unsigned)(a > b ? a : b) + 1, ~0u, 0), 0,
+	           "close_range over the whole band succeeds");
+	TAP_EQ_INT(count_tcp_sockets(NULL), before, "and closes around them");
+
+	/* The hazard itself: the shim closing an application descriptor that
+	 * took over a control connection's old number. */
+	TAP_OK(pipe(p) == 0, "the application opens a pipe");
+	close(a);
+	TAP_OK(fcntl(p[0], F_GETFD) >= 0 && fcntl(p[1], F_GETFD) >= 0,
+	       "tearing down an association closes none of the application's "
+	       "descriptors");
+	TAP_EQ_INT(write(p[1], "ok", 2), 2, "the pipe still works");
+	TAP_EQ_INT(read(p[0], buf, sizeof(buf)), 2, "end to end");
+
+	close(p[0]);
+	close(p[1]);
+	close(b);
+}
+
 static void t_fd_reuse(void)
 {
 	int fd, again;
@@ -443,6 +620,9 @@ int main(int argc, char **argv)
 	t_dup2_failure_keeps_tracking();
 	t_dup2_pipe_onto_udp();
 	t_scm_rights_adopted();
+	t_stale_entry_not_hijacked();
+	t_other_close_routes();
+	t_shim_fds_protected();
 	t_fd_reuse();
 	t_fork_isolation();
 	t_close_releases();

@@ -26,11 +26,18 @@
  * poll().  Well under the reference proxy's 60 s expiry (baseline §0.5). */
 #define UDPC_IDLE_PROBE_SECS 1
 
+/* Associations are TYPE-STABLE (D-24): once allocated, an object is never
+ * returned to the allocator, only to a free list for reuse.  A thread that
+ * loaded a pointer an instant before another thread dropped the last reference
+ * therefore reads valid -- if possibly recycled -- memory, never freed memory.
+ * udpc_assoc_get() turns that into safety: it takes a reference only while the
+ * count is non-zero, then checks the entry still points at the same object. */
 struct udpc_assoc {
-	_Atomic int refcount;
-	unsigned fork_generation; /* global generation when established */
-	_Atomic long last_used;   /* CLOCK_MONOTONIC_COARSE seconds */
+	_Atomic int refcount;       /* 0 while on the free list */
+	unsigned fork_generation;   /* global generation when established */
+	_Atomic long last_used;     /* CLOCK_MONOTONIC_COARSE seconds */
 	struct udpc_socks_conn conn;
+	struct udpc_assoc *next_free;
 };
 
 /* Global fork generation.  A pthread_atfork child handler bumps this and does
@@ -41,7 +48,16 @@ unsigned udpc_fork_generation(void);
 /* Registers the atfork handler.  Called once from shim initialisation. */
 void udpc_assoc_init(void);
 
-void udpc_assoc_ref(struct udpc_assoc *a);
+/* A new association with one reference and no control connection, from the
+ * free list when one is available.  NULL only if allocation fails. */
+struct udpc_assoc *udpc_assoc_alloc(void);
+
+/* Takes a reference to e's current association, or returns NULL if it has
+ * none.  Every read of an association's fields goes through this, and the
+ * caller drops the reference with udpc_assoc_unref() -- a bare load of e->assoc
+ * may be racing with the last unref on another thread (D-24). */
+struct udpc_assoc *udpc_assoc_get(struct udpc_fdent *e);
+
 void udpc_assoc_unref(struct udpc_assoc *a);
 
 /* Ensures fd has a live association, establishing one if needed, and points
@@ -56,26 +72,32 @@ void udpc_assoc_unref(struct udpc_assoc *a);
 int udpc_assoc_ensure(int fd, struct udpc_fdent *e, const struct udpc_config *cfg,
                       int *out_errno);
 
+/* The datagram path's way in: ensures fd has a live association and returns ONE
+ * reference to it, which the caller uses for everything the datagram needs and
+ * then drops with udpc_assoc_unref() (D-24).  With revalidate, an association
+ * idle long enough to have been expired is first checked, and replaced if the
+ * proxy has dropped it (FR-P-08).  NULL on failure, with *out_errno set --
+ * there is no path from here to a direct send (SEC-01). */
+struct udpc_assoc *udpc_assoc_hold(int fd, struct udpc_fdent *e,
+                                   const struct udpc_config *cfg, bool revalidate,
+                                   int *out_errno);
+
+/* Detaches a from e if e still points at it, so the next use re-establishes.
+ * The caller's own reference to a is untouched. */
+void udpc_assoc_drop(struct udpc_fdent *e, struct udpc_assoc *a);
+
+/* a's relay address, in a form a socket of `family` can reach.  False if there
+ * is none. */
+bool udpc_assoc_relay_of(const struct udpc_assoc *a, int family,
+                         struct sockaddr_storage *out);
+
+/* Records activity on a held association, for the idle check. */
+void udpc_assoc_mark_used(struct udpc_assoc *a);
+
 /* Tears down the association on this entry, so the next send re-establishes.
  * Used for transparent re-association after the proxy expires an idle
  * association (FR-P-08). */
 void udpc_assoc_invalidate(struct udpc_fdent *e);
 
-/* Records activity, so the idle probe knows when the association last carried
- * anything. */
-void udpc_assoc_touch(struct udpc_fdent *e);
-
-/* If the association has been idle long enough to have been expired, checks
- * whether the proxy has dropped it and invalidates it if so (FR-P-08).
- *
- * Called before a send rather than after a failure, because by the time a
- * failure is visible the datagram that triggered it has already gone to a relay
- * port that no longer exists -- the application would see a successful send
- * whose payload vanished.  Detecting it up front is what makes the
- * re-association actually transparent. */
-void udpc_assoc_revalidate(struct udpc_fdent *e);
-
-/* The relay address for a live association.  Returns false if there is none. */
-bool udpc_assoc_relay(const struct udpc_fdent *e, struct sockaddr_storage *out);
 
 #endif /* UDPCHAINS_ASSOC_H */

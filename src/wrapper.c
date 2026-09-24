@@ -460,6 +460,10 @@ int main(int argc, char **argv)
 		        strerror(errno));
 		return 1;
 	}
+	/* The wrapper needs the password no longer: the target reads it from
+	 * wherever it came from (D-25). */
+	explicit_bzero(cfg.password, sizeof(cfg.password));
+	explicit_bzero(cli.password, sizeof(cli.password));
 
 	udpc_debug("proxy %s -> %s%s, max_datagram %zu", cfg.proxy_spec,
 	           udpc_addr_str((const struct sockaddr *)&cfg.proxy, addrbuf,
