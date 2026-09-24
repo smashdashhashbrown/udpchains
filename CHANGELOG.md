@@ -136,7 +136,7 @@ Documented in full in the README's *Security considerations* and *What does not 
 - **LSM denials may still leak** (D-19). The pre-`exec` loadability probe runs in the wrapper's
   security domain; if the target transitions to a confined domain on `exec`, the probe can pass
   while the target is denied and runs unproxied.
-- **Tested against one real proxy.** Interop was checked against `dtun`, on the same host, with
+- **Tested against one real proxy.** Interop was checked against one SOCKS5 proxy, on the same host, with
   `nc -u`, TFTP (10 MB), `dig`, `iperf -u` and `ntpdate -q`. A proxy on another host, other proxies
   such as Dante, `ATYP 0x04` destinations, and name resolution through a real proxy are untested.
   See [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md).

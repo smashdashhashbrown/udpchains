@@ -481,7 +481,7 @@ into the shim. Paired with a trivial UDP echo server for the matrix. Fault-injec
 in D-06 — the reason the fixture exists rather than being borrowed is that a real proxy cannot be
 made to expire an association or inject `FRAG != 0` on demand.
 
-Interop against the real `dtun-client` remains a separate manual step (TST-04). A green fixture suite
+Interop against a real proxy remains a separate manual step (TST-04). A green fixture suite
 is not evidence of interop.
 
 ### 9.2 Hook matrix (TST-01)

@@ -89,7 +89,7 @@ None open.
     vulnerability reporting, which must be enabled in the repository settings.
     `CONTRIBUTING.md` carries the D-01 statement.
 - [ ] **D2** — interop is overstated. The CHANGELOG says "interop confirmed against a real SOCKS5
-  proxy", but that was one proxy (`dtun`, co-located). No end-to-end run against a remote proxy has
+  proxy", but that was one proxy, co-located. No end-to-end run against a remote proxy has
   succeeded, and `ATYP 0x04` has never been tested against a real proxy. Add this to Known
   limitations, and test Dante plus one other UDP-capable proxy before 1.0.
   - **Documentation done, awaiting commit:** the claim is narrowed in the CHANGELOG, and the README

@@ -60,11 +60,10 @@ Three levels of ambition were considered. This project targets the middle one.
    correctly and then reads the reply **with the 10-byte SOCKS header still attached**. Silent data
    corruption, not an error. Avoiding exactly this is FR-I-02.
 
-3. **Pure-Java or TPROXY alternatives were ruled out.** Transparent UDP interception via Linux
-   TPROXY needs `IP_RECVORIGDSTADDR` ancillary data; the JDK exposes no ancillary-data API
-   (`DatagramChannel.supportedOptions()` on Java 17 lists only `IP_TOS`, `SO_RCVBUF`, `SO_SNDBUF`,
-   `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_BROADCAST`, `IP_DONTFRAGMENT`, `IP_MULTICAST_*`,
-   `SO_INCOMING_NAPI_ID`). Hence C and `LD_PRELOAD`.
+3. **Proxy-side TPROXY alternatives were ruled out.** Transparent UDP interception via Linux
+   TPROXY needs the proxy to read `IP_RECVORIGDSTADDR` ancillary data, which cannot be assumed of
+   an arbitrary proxy, and it ties the solution to one proxy rather than working with any. Hence a
+   client-side shim, in C, with `LD_PRELOAD`.
 
 ### 0.4 Project setup decisions
 
@@ -96,8 +95,8 @@ the remaining milestones will not rescue it.
 
 ### 0.5 Interoperability target
 
-Any RFC 1928 SOCKS5 proxy offering `UDP ASSOCIATE`. The reference implementation used for
-development is a Java tunnel client (`dtun-client`) whose relevant behaviours are:
+Any RFC 1928 SOCKS5 proxy offering `UDP ASSOCIATE`. The reference proxy used during development
+has these relevant behaviours:
 
 | Behaviour | Value |
 |---|---|

@@ -108,7 +108,7 @@ Counters are system-wide, so take the baseline immediately before the run on an 
 **Watch for:** loss climbing sharply with rate, or the association dropping under load. Some loss is
 normal for UDP; a cliff is not. A cliff with *zero* loss below it is a capacity ceiling, not a defect.
 
-✅ **Passed 2026-08-18**, against `dtun` with `iperf` 2 (not iperf3):
+✅ **Passed 2026-08-18**, against the reference proxy with `iperf` 2 (not iperf3):
 
 | offered | delivered | loss |
 |---|---|---|

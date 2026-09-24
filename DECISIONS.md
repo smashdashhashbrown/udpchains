@@ -3,10 +3,10 @@
 Decisions taken before implementation began, against the baseline
 [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) (commit `ba07249`).
 
-The requirements document is the **baseline** and is not edited. This file records what was decided
-where that document deferred a choice, contained an internal tension, or left a gap. Each entry
-states what would cause it to be reopened, so that a later change is a visible amendment rather than
-a silent drift.
+The requirements document is the **baseline**, and its requirements are not edited. This file
+records what was decided where that document deferred a choice, contained an internal tension, or
+left a gap. Each entry states what would cause it to be reopened, so that a later change is a
+visible amendment rather than a silent drift.
 
 **Date decided:** 2026-08-17 for D-01 to D-15; later entries carry their own dates. **Status of all
 entries:** Accepted. "Review" items are from the pre-release review, tracked in
@@ -87,7 +87,7 @@ taken after clean-room code exists without auditing what came from where.
 **Context.** §0.4 states this; recorded here as confirmed rather than re-argued.
 
 **Decision.** `udpchains` lives in its own repository. It is not a subdirectory of any proxy it is
-tested against, including the reference `dtun-client`.
+tested against, including the reference proxy.
 
 **Consequences.** The shim speaks only standard SOCKS5 and works with any RFC 1928 proxy offering
 `UDP ASSOCIATE`; coupling it to one implementation would misrepresent its scope and would drag a C
@@ -210,8 +210,8 @@ from v1 is the mitigation.
 ### Test proxy: minimal SOCKS5 server as an in-repo C fixture
 
 **Context.** TST-01 (hook matrix), TST-03 (leak test) and TST-05 (fidelity) all need a live SOCKS5
-peer supporting `UDP ASSOCIATE`. The reference `dtun-client` (§0.5) is Java, which would put a JDK on
-the CI path, and its failure modes cannot be triggered on demand.
+peer supporting `UDP ASSOCIATE`. The reference proxy (§0.5) is a separate program, which would add a
+dependency to the test path, and its failure modes cannot be triggered on demand.
 
 **Decision.** Write a minimal SOCKS5 `UDP ASSOCIATE` server as a test fixture in the repository,
 in C, built by the same `make`. Paired with a trivial UDP echo server for the TST-01 matrix.
@@ -232,7 +232,7 @@ borrowed:
 
 **Consequences.**
 - `make && make test` stays dependency-free, honouring NFR-01 in spirit for the test path too.
-- Interop against the real `dtun-client` remains a **separate, manual** acceptance step (TST-04,
+- Interop against a real proxy remains a **separate, manual** acceptance step (TST-04,
   acceptance criterion 4). The fixture proves correctness against the RFC; it does not prove
   interop. Do not let a green fixture suite substitute for the real-proxy run.
 - The fixture is test-only code and must never be linked into the shipped shim.

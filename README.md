@@ -361,7 +361,7 @@ clients use, precisely because of the port switch — is not filtered by the shi
 ### How far it has been tested against real proxies
 
 The automated suite runs against an in-repo proxy fixture. Against a real proxy, 1.0.0 has been
-checked with one: `dtun`, running on the same host, with `nc -u`, TFTP, `dig`, `iperf` and
+checked with one SOCKS5 proxy, running on the same host, with `nc -u`, TFTP, `dig`, `iperf` and
 `ntpdate` (see [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md)). **Not yet tested:** a
 proxy on another host, other proxies such as Dante, IPv6 destinations sent as `ATYP 0x04`, and name
 resolution through a real proxy. Reports from those setups are welcome.
@@ -403,7 +403,7 @@ memory (D-24).
 
 | | |
 |---|---|
-| [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) | the requirements baseline, unmodified |
+| [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) | the requirements baseline |
 | [`DECISIONS.md`](DECISIONS.md) | every design decision, with consequences and revisit conditions |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | how it is built |
 | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | every requirement mapped to design section and test |
