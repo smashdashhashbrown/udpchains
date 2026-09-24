@@ -8,7 +8,9 @@ where that document deferred a choice, contained an internal tension, or left a 
 states what would cause it to be reopened, so that a later change is a visible amendment rather than
 a silent drift.
 
-**Date decided:** 2026-08-17 · **Status of all entries:** Accepted
+**Date decided:** 2026-08-17 for D-01 to D-15; later entries carry their own dates. **Status of all
+entries:** Accepted. "Review" items are from the pre-release review, tracked in
+[`docs/REVIEW-BACKLOG.md`](docs/REVIEW-BACKLOG.md).
 
 | ID | Decision | Resolves |
 |---|---|---|
@@ -27,6 +29,26 @@ a silent drift.
 | [D-13](#d-13) | One association per app socket, shared on `dup` | Derived from FR-P-02 + FR-L-03 |
 | [D-14](#d-14) | IPv4-mapped destinations are emitted as `ATYP 0x01` | Interop defect found against a real proxy |
 | [D-15](#d-15) | A connected socket receives only from its connected peer | Fidelity gap vs. an unhooked socket |
+| [D-16](#d-16) | A loopback or wildcard `BND.ADDR` is replaced by the proxy's address | Interop defect found against a remote proxy |
+| [D-17](#d-17) | A non-`FREE` fd-table entry at claim time is stale, and recycled | Defect: closes that bypass the hook (libuv) |
+| [D-18](#d-18) | Raw sockets are not intercepted; documented, not refused | Gap — SEC-01 vs. `SOCK_RAW` |
+| [D-19](#d-19) | The wrapper proves the shim is loadable, not merely readable | Defect found on a VPS |
+| [D-20](#d-20) | RFC 1929 username/password authentication | Supersedes the FR-P-09 deferral in D-08 |
+| [D-21](#d-21) | Every route a UDP socket enters by is hooked; an untrackable one is refused | Review C1–C3 |
+| [D-22](#d-22) | Name resolution by the shim, through the proxy | Review C4 |
+| [D-23](#d-23) | Every intercepted call confirms its descriptor by socket cookie | Review H1 |
+| [D-24](#d-24) | Type-stable associations, read through a counted reference | Review H2 |
+| [D-25](#d-25) | The wrapper passes where the password is, never the password | Review H3 |
+| [D-26](#d-26) | The shim's own descriptors are moved out of the way and protected | Review H4, L3 |
+| [D-27](#d-27) | Configuration reaches the shim resolved, once | Review M4, M5 |
+| [D-28](#d-28) | The wrapper runs the file it checked | Review M6 |
+| [D-29](#d-29) | Datagram sockets the proxy cannot carry are refused | Review M7 |
+| [D-30](#d-30) | The fd-table generation counter is removed | Review M8 |
+| [D-31](#d-31) | A forked child lets go of the parent's control connections | Review M9 (ii) |
+| [D-32](#d-32) | Limitations accepted for 1.0, and documented | Review M1–M3, M9 (i) |
+| [D-33](#d-33) | Diagnostics: rate-limited, errors-only under `-q`, never into a reused fd 2 | Review L4, L5 |
+| [D-34](#d-34) | A forked child binds its private socket again | Review L6 |
+| [D-35](#d-35) | Hidden symbols and hardening; the proxy name uses its first address | Review L7 |
 
 ---
 
@@ -820,7 +842,7 @@ A fifth hole was related: the start-up scan of inherited descriptors gave up sil
 **Why the suite missed them.** Every test client created its sockets with `socket()` and duplicated
 them with `dup`, and was compiled from this repository's Makefile without calling the fortified
 variants. The TST-02 symbol gate checked the symbols the requirements named, which is the list that
-was wrong. The new assertions each fail against the 1.0.0 shim: the leak test sends through all three
+was wrong. The new assertions each fail against the pre-review shim: the leak test sends through all three
 new descriptor routes, the fidelity test calls the fortified variants directly, and the lifecycle
 test proves the new descriptors are *proxied* by counting control connections. A round trip alone
 would not prove that, since an untracked socket round-trips directly.

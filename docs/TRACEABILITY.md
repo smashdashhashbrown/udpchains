@@ -25,25 +25,30 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 455 assertions across 15 groups, all passing.
+**Test totals:** 651 assertions across 17 groups (`tests/run.sh`), all passing, plus the 71-check
+symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
+from a run rather than editing it by hand.
 
 | Group | Assertions |
 |---|---|
 | unit-addr | 51 |
-| unit-config | 38 |
+| unit-config | 54 |
 | unit-socks5 | 83 |
-| unit-fdtable | 19 |
+| unit-fdtable | 22 |
+| unit-dns | 52 |
 | TST-01 hook matrix | 108 |
-| TST-05 fidelity | 93 |
+| TST-05 fidelity | 116 |
 | port switch (TFTP pattern) | 12 |
-| TST-06 lifecycle | 26 |
+| TST-06 lifecycle | 78 |
 | TST-07 threading | 9 |
-| FR-P-09 auth | 8 |
-| wrapper loadability | 7 |
-| TST-03 leak | 7 checks |
-| fault injection | 10 |
+| FR-P-09 auth | 15 |
+| D-22 resolve | 11 checks, over four programs making 99 assertions of their own |
+| wrapper loadability | 12 |
+| TST-03 leak | 9 checks |
+| fault injection | 17 |
 | TST-04 real tools | 2 run, 3 skipped (automated, against the fixture) |
-| TST-02 symbol check | 43 (build gate) |
+| NFR-04 latency benchmark | reported, not a gate (D-08) |
+| TST-02 symbol check | 71 (build gate, `make check`) |
 
 ---
 
@@ -52,9 +57,9 @@ inspection basis is recorded in the notes below.
 | ID | Pri | Design | Test | Status |
 |---|---|---|---|---|
 | FR-I-01 | M | §2.1 | TST-04, TST-01 | **Verified** |
-| FR-I-02 | M | §2.3 | TST-02, TST-01 | **Verified** — structural: all variants funnel through one send and one receive path; TST-02 asserts pairwise symmetry |
-| FR-I-03 | M | §2.3 | TST-02 | **Verified** — all 12 symbols exported |
-| FR-I-04 | M | §2.3, §3.3 | TST-02, TST-06 | **Verified** — includes `close_range` |
+| FR-I-02 | M | §2.3 | TST-02, TST-01, TST-05 | **Verified** — structural: all variants funnel through one send and one receive path; TST-02 asserts pairwise symmetry. A defect was found here in review (D-21): the fortified `__recvfrom_chk`, `__recv_chk` and `__read_chk`, which `_FORTIFY_SOURCE` programs call, bypassed the hooks and delivered the SOCKS header as payload. They are now hooked, and TST-05 covers each |
+| FR-I-03 | M | §2.3 | TST-02 | **Verified** — all 12 symbols exported, and only hooks are exported (D-35) |
+| FR-I-04 | M | §2.3, §3.3 | TST-02, TST-06, TST-03 | **Verified** — includes `close_range`. Review found three more routes (D-21): `fcntl(F_DUPFD)` duplicates, sockets received over `SCM_RIGHTS`, and sockets inherited without `/proc`, all untracked and sent directly. `fcntl`/`fcntl64` are now hooked, received sockets are adopted in `recvmsg`/`recvmmsg`, and a failed `dup2`/`dup3` no longer untracks its target. Later: `closefrom()` and the lifecycle calls of `syscall()` (D-23). TST-03 sends through each route with the proxy down |
 | FR-I-05 | M | §2.3, §3.1 | TST-05 | **Verified** — `getpeername` reports the app's destination, not the relay |
 | FR-I-06 | M | §2.2 | TST-05 | **Verified** — unix and TCP sockets pass through untouched |
 | FR-I-07 | M | §1, §4.1 | TST-02, TST-01 | **Verified** — TST-02 asserts `poll`/`select`/`epoll_wait`/`setsockopt` are **absent** |
@@ -98,7 +103,7 @@ inspection basis is recorded in the notes below.
 |---|---|---|---|---|
 | FR-L-01 | M | §3.1, §3.5 | TST-07, unit-fdtable | **Verified** — TST-07 under the real shim; unit-fdtable under TSan, which found and fixed a genuine race on the entry `family`/`type` fields |
 | FR-L-02 | M | §3.1, §3.3 | TST-06, unit-fdtable | **Verified** — a reused fd reports `ENOTCONN`, and a released entry keeps none of its state (the generation counter once cited here was never checked, and was removed in D-30; the per-call cookie check of D-23 is what catches a stale entry). A defect was found and fixed here on 2026-08-19 (D-17): release depends on interposing `close()`, and a program whose runtime closes by another route (dig via libuv: 4 of 64 closes reach the hook) stranded its entry, so the next socket on that descriptor number was refused with a spurious `EMFILE` and the association leaked. A non-`FREE` entry at claim time is now treated as stale and recycled |
-| FR-L-03 | M | §3.3 | TST-06, unit-fdtable | **Verified** — `dup` adds no control connection; association survives the original's close |
+| FR-L-03 | M | §3.3 | TST-06, unit-fdtable | **Verified** — `dup` adds no control connection; association survives the original's close. Covers `fcntl(F_DUPFD)` too since D-21; a duplicate that cannot be tracked is closed and the call fails with `EMFILE` |
 | FR-L-04 | M | §3.4 | TST-06 | **Verified** — a defect was found and fixed here: parent and child share one open file description, so the child re-pointing the socket also re-pointed the parent's. The child now gets a private socket. It binds the parent's address or port again, and if it cannot (the parent holds it), it stops declaring that address in `UDP ASSOCIATE` (D-34; TST-faults, under a proxy fixture that enforces the declared address) |
 | FR-L-05 | M | §3.2, §4.1 | TST-06 | **Verified** — every control connection carries `FD_CLOEXEC` |
 | FR-L-06 | S | §4.2, §6.4 | TST-03 | **Verified** — proxy failures surface on the application's send |
@@ -130,7 +135,7 @@ inspection basis is recorded in the notes below.
 
 | ID | Pri | Design | Test | Status |
 |---|---|---|---|---|
-| SEC-01 | M | §4.2, §6 | TST-03, capture | **Verified** — the core invariant. No path from a failed proxy attempt to a direct send. Confirmed at the **wire** on 2026-08-20 by `tests/test_failclosed_capture.sh`: with the proxy absent, refusing `UDP ASSOCIATE`, or the shim unconfigured, tcpdump captured **zero** packets, against a positive control that captured 11. TST-03 watches the destination, which cannot see a datagram that leaves this host for the wrong address; this can |
+| SEC-01 | M | §4.2, §6 | TST-03, capture | **Verified** — the core invariant. No path from a failed proxy attempt to a direct send. Confirmed at the **wire** on 2026-08-20 by `tests/test_failclosed_capture.sh`: with the proxy absent, refusing `UDP ASSOCIATE`, or the shim unconfigured, tcpdump captured **zero** packets, against a positive control that captured 11. TST-03 watches the destination, which cannot see a datagram that leaves this host for the wrong address; this can. Name lookups were a gap (D-22): glibc's resolver bypassed every hook. Since D-22 the capture script also checks them on the wire: on 2026-09-24, no packet asked for the looked-up name with the proxy down or no `dns` set, against a positive control that did. Every route by which a socket enters the process is covered by D-21 and D-23 |
 | SEC-02 | M | §9.4 | TST-03, capture | **Verified** — three scenarios (proxy absent, `UDP ASSOCIATE` refused, shim unconfigured) × 10 send paths: zero datagrams reach the destination, and zero appear on the wire. A control run proves the client would otherwise get through, at both observation points |
 | SEC-03 | M | §7.2 | inspection | **Verified** — `--password` is refused explicitly with a pointer to the file/environment route |
 | SEC-04 | S | §7.2 | unit-config, TST-auth | **Verified** — warns on a group- or world-writable config, and on a config holding `password =` that others can read; a readable password file is warned about once, by the wrapper (D-33) |
@@ -141,12 +146,12 @@ inspection basis is recorded in the notes below.
 
 | ID | Pri | Status |
 |---|---|---|
-| TST-01 | M | **Verified** — 108 cells green: 36 send×receive combinations across {connected, unconnected} × {IPv4, IPv6} |
+| TST-01 | M | **Verified** — 108 cells green: the 36 send×receive combinations over IPv4 and IPv6 (72), plus the three senders that name a destination run unconnected as well (36) |
 | TST-02 | M | **Verified** — build gate; also asserts the readiness calls are absent, and checks pairwise send/receive symmetry |
 | TST-03 | M | **Verified** — plus a wire-level companion, `tests/test_failclosed_capture.sh`, which is not part of `make test` because it needs `CAP_NET_RAW`. Its positive control aborts the run rather than reporting a pass from a capture that is silently seeing nothing |
 | TST-04 | M | **Verified** — the automated script runs against the **fixture** and reports 2 run, 3 skipped (`tftp` has no local server, `ntpdate` no reachable NTP server, `iperf3` not installed); a skip is not a pass, so the script alone never satisfied this. All five tools have now been run **by hand against the real `dtun` proxy** (2026-08-18/19): `nc -u`, TFTP 10 MB, `dig`, `iperf -u` rate sweep, `ntpdate -q`. See [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) for what each proves and the acceptance note below |
-| TST-05 | M | **Verified** — 76 assertions |
-| TST-06 | M | **Verified** — 26 assertions |
+| TST-05 | M | **Verified** — see the totals table at the top |
+| TST-06 | M | **Verified** — see the totals table at the top |
 | TST-07 | S | **Verified** — 8 threads × 25 iterations on separate fds, on one shared fd, and racing first use |
 | TST-08 | S | **Verified** — ASan/UBSan on the unit tests, TSan on the fd table, Valgrind memcheck on the integration tests, Helgrind on the threaded test. See `tests/run_sanitizers.sh` for why the work is split that way |
 
@@ -157,7 +162,7 @@ inspection basis is recorded in the notes below.
 | ADD-01 | D-05 R1 | §6.2 | TST-05 | **Verified** — multicast and broadcast fail `ENETUNREACH` with a specific diagnostic; IPv4 and IPv6 |
 | ADD-02 | D-05 R2 | §6.3 | unit-config | **Verified** — proxy locality is computed at config time; `strict_loopback` promotes the warning to an error |
 | ADD-03 | D-05 R4 | — | manual | **Verified** — README "What does not work" |
-| ADD-04 | D-06 | §9.1 | — | **Verified** — fixture with 8 fault-injection modes; 3 exercised by `test_faults.sh` |
+| ADD-04 | D-06 | §9.1 | — | **Verified** — fixture with fault-injection modes; `test_faults.sh` runs four scenarios, plus the D-33 diagnostics checks |
 | ADD-05 | D-10 | §7.1 | unit-config | **Verified** |
 | ADD-06 | D-12 | §5.4, §7.3 | TST-05, faults | **Verified** — includes the case where the proxy's real limit is smaller than the configured one |
 | ADD-07 | D-04 | — | manual | **Verified** — README documents unproxied resolver TCP fallback |

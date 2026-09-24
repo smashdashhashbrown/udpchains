@@ -280,6 +280,43 @@ int main(void)
 		           "a final 1023-byte line without a newline still parses");
 	}
 
+	TAP_GROUP("D4: comments are whole lines only");
+	{
+		const char *path;
+		int at = 0;
+
+		path = write_conf("inline.conf",
+		                  "proxy = 127.0.0.1:1080\n"
+		                  "username = alice\n"
+		                  "password = s3cret # the old one\n",
+		                  0600);
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &at), -1,
+		           "an inline comment after a value is an error");
+		TAP_EQ_INT(at, 3, "on the line that holds it");
+		TAP_OK(err != NULL && strstr(err, "password_file") != NULL,
+		       "and the message says where such a password belongs");
+
+		path = write_conf("inline-tab.conf", "proxy = 127.0.0.1:1080\t#x\n",
+		                  0600);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &(int){0}), -1,
+		           "after a tab too");
+
+		path = write_conf("inline-empty.conf", "dns_search = # none\n", 0600);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &(int){0}), -1,
+		           "and when it opens the value");
+
+		path = write_conf("hash-in-value.conf",
+		                  "username = alice\npassword = abc#def\n", 0600);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &(int){0}), 0,
+		           "a '#' inside a value is not a comment");
+		TAP_EQ_STR(layer.password, "abc#def", "and stays part of it");
+	}
+
 	{
 		char cmd[600];
 		snprintf(cmd, sizeof(cmd), "rm -rf %s", g_tmpdir);

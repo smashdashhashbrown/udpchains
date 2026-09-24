@@ -5,7 +5,8 @@ the choices behind this design and their rationale live in [`DECISIONS.md`](../D
 Requirement IDs are cited inline so [`TRACEABILITY.md`](TRACEABILITY.md) can map each one to a section
 here.
 
-**Status:** design agreed, no code written.
+**Status:** as built in 1.0.0. Where the first draft changed, the decision record that changed it is
+cited.
 
 ---
 
@@ -107,8 +108,8 @@ sockets are adopted by the `recvmsg`/`recvmmsg` hooks before the call returns. A
 be tracked is closed, never left to send directly (D-21).
 
 **FR-I-02 is structural, not a checklist item.** Send and receive hooks are implemented in pairs, and
-the internal implementation funnels every send variant into one `do_send(fd, iov, iovlen, dst,
-flags)` and every receive variant into one `do_recv(fd, iov, iovlen, src, flags)`. `send` is
+the internal implementation funnels every send variant into one `udpc_core_send()` and every
+receive variant into one `udpc_core_recv()` (`src/core.c`). `send` is
 `sendto` with a NULL destination; `write` is `send` with zero flags; `writev` is `sendmsg` with one
 iovec and no control data. This is what makes it structurally hard to ship the Proxando failure —
 a send path that works with a receive path that returns wrapped bytes (§0.3.2). There is no code path
@@ -150,8 +151,10 @@ Entry contents:
 | `family`, `type` | For the §2.2 predicate |
 
 `CLAIMING` exists so that a concurrent operation on an fd being set up neither observes a half-built
-entry nor treats it as absent. A hooked call that finds `CLAIMING` spins briefly, then passes through
-to the real function — never a lock, because a signal handler could be the one spinning.
+entry nor treats it as absent. A hooked call that finds `CLAIMING` does not wait: for that call the
+descriptor reads as untracked, and the call goes to the real function. Only a thread using a number
+that `socket()` or a `dup` call has not yet returned can see this. Never a lock, because a signal handler could be
+the one waiting.
 
 ### 3.2 The association object
 
@@ -159,11 +162,15 @@ Owns the SOCKS5 relationship for one application socket (D-13):
 
 | Field | Purpose |
 |---|---|
-| `control_fd` | TCP control connection, `FD_CLOEXEC` (FR-P-02, FR-L-05) |
-| `relay` | `BND.ADDR`/`BND.PORT` from the `UDP ASSOCIATE` reply (FR-P-01) |
-| `refcount` (atomic) | Descriptors sharing this association (FR-L-03) |
+| `conn` | The control connection — a shim-owned, close-on-exec descriptor (FR-P-02, FR-L-05, D-26) — and the relay's `BND.ADDR`/`BND.PORT` from the `UDP ASSOCIATE` reply (FR-P-01) |
+| `refcount` (atomic) | Descriptors sharing this association, plus readers holding a reference (FR-L-03, D-24); 0 on the free list |
 | `fork_generation` | Global generation at creation; stale ⇒ inherited across `fork` (§3.4) |
-| `state` | `NONE` / `ESTABLISHING` / `UP` / `DEAD` |
+| `last_used` (atomic) | When a datagram last used it, for the idle check before a send (FR-P-08) |
+| `next_free` | Free-list link (D-24) |
+
+There is no state field. An entry's `assoc` pointer is `NULL` (none yet), a sentinel meaning
+"being established", or the association. An association that turns out to be dead is detached from
+the entry and replaced on the next use.
 
 It owns **no data socket** — the application's fd is the data socket (FR-I-07).
 
@@ -234,8 +241,9 @@ association survives.
   signal handler that interrupted `malloc` can deadlock. The steady-state send and receive cannot.
 - Mutation path (`socket`, `close`, `dup*`, association establishment): CAS on entry state; block
   allocation via CAS on the top-level slot.
-- Association establishment is serialised per entry by the `ESTABLISHING` state, so two threads
-  sending on the same fresh fd produce one association, not two (FR-L-01).
+- Association establishment is serialised per entry by the "being established" sentinel in the
+  entry's `assoc` pointer, so two threads sending on the same fresh fd produce one association, not
+  two (FR-L-01).
 - Verified by TST-07 under TSan and ASan (D-07, D-08).
 
 ---
@@ -304,9 +312,11 @@ an error it must handle.
 
 ### 5.1 Send
 
-All variants funnel into `do_send` (§2.3). Buffers per D-11: the header is built in a small
+All variants funnel into `udpc_core_send` (§2.3). Buffers per D-11: the header is built in a small
 thread-local buffer and passed as the first `iovec` to the real `sendmsg`, with the application's
-buffers following. **The payload is never copied.** Scatter/gather (FR-F-10) is inherent.
+buffers following. **The payload is not copied,** with one exception: an application passing
+`IOV_MAX` buffers leaves no room for the header's, so the header and the first buffer are copied
+together into one. Scatter/gather (FR-F-10) is inherent.
 
 - Return value is the byte count the application supplied, never the wrapped length (FR-F-01).
 - Destination: the `sendto` argument if given; otherwise `app_dst` recorded by `connect()`
@@ -315,7 +325,7 @@ buffers following. **The payload is never copied.** Scatter/gather (FR-F-10) is 
 
 ### 5.2 Receive
 
-All variants funnel into `do_recv`. The wrapped datagram is read into a thread-local scratch buffer
+All variants funnel into `udpc_core_recv`. The wrapped datagram is read into a thread-local scratch buffer
 sized `max_datagram + 262`, the header parsed, and the payload copied into the application's iovecs
 (D-11 explains why receive copies and send does not).
 
@@ -339,7 +349,7 @@ sized `max_datagram + 262`, the header parsed, and the payload copied into the a
 
 ### 5.3 `sendmmsg` / `recvmmsg` (FR-F-09)
 
-Each message in the vector is processed independently through `do_send`/`do_recv`. The return value
+Each message in the vector is processed independently through `udpc_core_send`/`udpc_core_recv`. The return value
 is the count of messages processed, with per-message lengths written back into the `mmsghdr` array.
 Partial success is reported as the kernel does: if message *k* fails after *k* succeeded, return *k*;
 if the first fails, return `-1` with `errno` set. `errno` from a partial success is not clobbered.
@@ -384,13 +394,26 @@ DNS proxied as ordinary UDP (D-04) every lookup hits this path.
 
 | Condition | `errno` |
 |---|---|
-| Payload exceeds configured datagram limit | `EMSGSIZE` |
+| Payload exceeds configured datagram limit, or more than `IOV_MAX` buffers | `EMSGSIZE` |
 | Multicast/broadcast destination | `ENETUNREACH` |
-| Proxy unreachable / connection refused | `ECONNREFUSED` or `ENETUNREACH`, as the TCP connect reported |
-| `UDP ASSOCIATE` refused by proxy | `ECONNREFUSED` |
+| Proxy unreachable / connection refused | as the TCP connect reported: `ECONNREFUSED`, `ENETUNREACH`, … |
+| Handshake step exceeds `connect_timeout` | `ETIMEDOUT` |
+| Proxy closes the control connection mid-handshake | `ECONNRESET` |
+| Authentication refused, no acceptable method, or credentials the proxy rejects | `EACCES` |
+| `UDP ASSOCIATE` refused, by reply code (RFC 1928 §6): `0x02` not allowed | `EACCES` |
+| `0x03` network unreachable | `ENETUNREACH` |
+| `0x04` host unreachable | `EHOSTUNREACH` |
+| `0x05` connection refused, `0x01` general failure, or any other code | `ECONNREFUSED` |
+| `0x06` TTL expired | `ETIMEDOUT` |
+| `0x07` command not supported | `EOPNOTSUPP` |
+| `0x08` address type not supported | `EAFNOSUPPORT` |
 | Re-association failed after retry | as the underlying failure |
 | No destination and socket not connected | `EDESTADDRREQ` |
+| Address too short for its family / `NULL` buffer array | `EINVAL` / `EFAULT` |
 | Malformed reply from proxy | `EPROTO` |
+| Creating a non-UDP datagram socket (ICMP, UDP-Lite) | `EPROTONOSUPPORT` (D-29) |
+| A descriptor that cannot be tracked | `EMFILE` |
+| `close()` / `dup2()` on a shim-owned descriptor | `EBADF` / `EBUSY` (D-26) |
 
 A failure never falls through to a direct send (SEC-01).
 
@@ -443,8 +466,9 @@ debug level, no hex dumps. Lengths, addresses and header fields only.
 
 From §8 of the requirements, listed here because they constrain the design: statically-linked
 binaries, Go binaries, setuid/setgid targets, direct `syscall()` users, faithful ancillary data,
-GSO/GRO, QUIC performance, TCP proxying, proxy chains. Per D-04, resolver TCP fallback is also
-outside scope. The README states these plainly (acceptance criterion 6, D-05 R4).
+GSO/GRO, QUIC performance, TCP proxying, proxy chains. D-04 once put the resolver's TCP fallback
+outside scope as well; D-22 superseded that, and the shim's own resolver retries over SOCKS5
+`CONNECT` (§11). An application's own TCP DNS is still not proxied. The README states these plainly (acceptance criterion 6, D-05 R4).
 
 ---
 

@@ -65,15 +65,21 @@ UDPCHAINS_DNS=9.9.9.9 udpchains -p 127.0.0.1:1080 nc -u example.com 53
 | `UDPCHAINS_CONFIG` | config file path |
 | `UDPCHAINS_MAX_DATAGRAM` | maximum payload, default 8192 |
 | `UDPCHAINS_STRICT_LOOPBACK` | make the loopback warning below an error |
-| `UDPCHAINS_CONNECT_TIMEOUT` | proxy connect timeout in ms |
+| `UDPCHAINS_CONNECT_TIMEOUT` | proxy timeout in ms, default 5000, applied to each handshake step |
 | `UDPCHAINS_USERNAME`, `UDPCHAINS_PASSWORD_FILE` | credentials (see below) |
+| `UDPCHAINS_PASSWORD` | the password itself; inherited by everything the program starts, so prefer the file |
 | `UDPCHAINS_DNS` | resolver for name lookups, as a numeric `ip[:port]` — see [Name resolution](#name-resolution) |
 | `UDPCHAINS_DNS_TIMEOUT` | whole-lookup timeout in ms, default 5000 |
 | `UDPCHAINS_DNS_SEARCH` | search domains for single-label names; none by default |
 | `UDPCHAINS_HOSTS_FILE` | hosts file consulted before DNS, default `/etc/hosts` |
 | `UDPCHAINS_QUIET`, `UDPCHAINS_DEBUG` | as `-q` and `-v`; take a boolean (`1`/`0`, `yes`/`no`, `true`/`false`, `on`/`off`) |
+| `UDPCHAINS_LIB` | path to `libudpchains.so`, if not the installed one |
 
-Config file:
+`udpchains` also sets `UDPCHAINS_RESOLVED` and `UDPCHAINS_PASSWORD_CONFIG` for the program it runs,
+to pass on what it resolved (D-25, D-27). They are not meant to be set by hand.
+
+Config file: the first of `-f <file>`, `UDPCHAINS_CONFIG`, `~/.udpchains.conf` and
+`/etc/udpchains.conf` that exists. Only that one file is read.
 
 ```ini
 # ~/.udpchains.conf
@@ -82,6 +88,26 @@ dns = 9.9.9.9
 max_datagram = 8192
 strict_loopback = no
 ```
+
+| Key | Meaning | Default |
+|---|---|---|
+| `proxy` | `host:port` or `[v6]:port` of the SOCKS5 proxy | none — required |
+| `max_datagram` | largest payload, 1–65507 bytes | 8192 |
+| `strict_loopback` | make the loopback warning an error | `no` |
+| `connect_timeout` | ms, 1–600000, for each step of the proxy handshake | 5000 |
+| `dns` | resolver as numeric `ip[:port]`, queried through the proxy | none — lookups needing DNS fail |
+| `dns_timeout` | ms, 100–600000, for a whole lookup | 5000 |
+| `dns_search` | search domains for single-label names, space- or comma-separated | none |
+| `hosts_file` | hosts file consulted before DNS | `/etc/hosts` |
+| `username` | RFC 1929 username | none |
+| `password_file` | file holding the password; a relative path is relative to the current directory | none |
+| `password` | the password inline; the file then must not be readable by others | none |
+| `quiet`, `debug` | as `-q` and `-v` | `no` |
+
+Booleans take `1`/`0`, `yes`/`no`, `true`/`false` or `on`/`off`. **Comments are whole lines only,**
+starting with `#` or `;`. A `#` after a value (`proxy = 10.0.0.1:1080 # office`) is an error rather
+than being read as part of the value; a `#` inside a value (`abc#def`) is kept. A password that
+really contains " #" belongs in `password_file`. An unknown key is an error.
 
 Credentials are never accepted on the command line, because `argv` is visible in `ps`. Use a file or
 the environment:
@@ -148,6 +174,30 @@ What this changes, compared with running unproxied:
   shim proxies like any other datagram; on a `systemd-resolved` host that is `127.0.0.53`, which is
   resolved *at the proxy host* (see the loopback caveat below). Give such tools a resolver address
   explicitly (`dig @9.9.9.9 ...`).
+
+## Security considerations
+
+`udpchains` keeps a program's UDP from bypassing the proxy. It does not make the path to the proxy
+private.
+
+- **Credentials cross the network in cleartext.** RFC 1929 sends the username and password
+  unencrypted, so anyone on the path to a remote proxy can read them. Reach a remote proxy over a
+  VPN you trust, such as WireGuard, or use a proxy on this host. An SSH port forward is not enough:
+  it carries the TCP control connection, but not the UDP relay traffic.
+- **Datagrams to and from the proxy's relay are neither authenticated nor encrypted.** SOCKS5 has
+  no way to protect them. Anyone on that path can read them. Anyone who can send a packet that
+  appears to come from the relay's address can inject a datagram claiming any source, and the shim
+  reports that source to the program as the sender. Only the program's own protocol (DNSSEC, QUIC,
+  DTLS) protects against that.
+- **The proxy sees everything,** including every name looked up through `dns`. Use one you trust.
+- **UDP servers do not work through it.** A server's socket is pointed at the proxy's relay, so it
+  no longer receives datagrams sent to this host. Its clients cannot use the relay instead: its
+  address is known only to `udpchains`, and most proxies accept inbound datagrams only from hosts
+  the program has already sent to. This fails closed — nothing arrives directly either — but a
+  server that only receives looks healthy while receiving nothing.
+- **Raw sockets are not covered.** See below.
+
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## What does not work
 
@@ -308,6 +358,14 @@ Note that udpchains applies its own filter only for sockets the application has 
 only to match what the kernel does natively (D-15). An unconnected socket — which is what TFTP
 clients use, precisely because of the port switch — is not filtered by the shim at all.
 
+### How far it has been tested against real proxies
+
+The automated suite runs against an in-repo proxy fixture. Against a real proxy, 1.0.0 has been
+checked with one: `dtun`, running on the same host, with `nc -u`, TFTP, `dig`, `iperf` and
+`ntpdate` (see [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md)). **Not yet tested:** a
+proxy on another host, other proxies such as Dante, IPv6 destinations sent as `ATYP 0x04`, and name
+resolution through a real proxy. Reports from those setups are welcome.
+
 ### Not implemented in v1
 
 - SOCKS5 GSSAPI authentication (method `0x01`), and any method other than `0x00` and `0x02`. A proxy
@@ -330,9 +388,10 @@ parsed and stripped, so the application sees the true source address and its own
 
 Every send variant funnels into one send path and every receive variant into one receive path. That
 is deliberate: it makes it structurally hard to ship a version where a program can send successfully
-but read back data with the SOCKS header still attached. A 36-cell test matrix
-(`{sendto, send, write, writev, sendmsg, sendmmsg} × {recvfrom, recv, read, readv, recvmsg,
-recvmmsg}`) asserts byte-identical round-trips, across IPv4 and IPv6, connected and unconnected.
+but read back data with the SOCKS header still attached. A 108-cell test matrix
+asserts byte-identical round-trips for every pair of `{sendto, send, write, writev, sendmsg,
+sendmmsg} × {recvfrom, recv, read, readv, recvmsg, recvmmsg}` over IPv4 and IPv6, with the three
+senders that name a destination run both connected and unconnected.
 
 Per-descriptor state lives in a lock-free two-level radix table, with no allocation and no locks on
 the datagram path once a socket's association is up (see the signal-handler caveat above). Each intercepted call makes one extra system
@@ -350,6 +409,8 @@ memory (D-24).
 | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | every requirement mapped to design section and test |
 | [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | manual tests against a real proxy, and what each one proves |
 | [`CHANGELOG.md`](CHANGELOG.md) | what changed, and what is known not to work |
+| [`SECURITY.md`](SECURITY.md) | how to report a vulnerability |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to contribute, and the clean-room rule |
 
 ## Licence
 

@@ -84,10 +84,17 @@ None open.
   - There is no `SECURITY.md`.
   - There is no `CONTRIBUTING.md`, although D-01 requires contributors to state their work is not
     derived from GPL code.
+  - **Done, awaiting commit,** except CI, which was declined for 1.0.0. The CHANGELOG is one 1.0.0
+    entry dated 2026-09-24; tag `v1.0.0` when releasing. `SECURITY.md` uses GitHub private
+    vulnerability reporting, which must be enabled in the repository settings.
+    `CONTRIBUTING.md` carries the D-01 statement.
 - [ ] **D2** — interop is overstated. The CHANGELOG says "interop confirmed against a real SOCKS5
   proxy", but that was one proxy (`dtun`, co-located). No end-to-end run against a remote proxy has
   succeeded, and `ATYP 0x04` has never been tested against a real proxy. Add this to Known
   limitations, and test Dante plus one other UDP-capable proxy before 1.0.
+  - **Documentation done, awaiting commit:** the claim is narrowed in the CHANGELOG, and the README
+    and CHANGELOG list what is untested. The testing against Dante and a remote proxy is still
+    owed; see *Verification still owed*.
 - [ ] **D3** — security caveats are missing from the README and man page:
   - RFC 1929 credentials cross the network in cleartext.
   - The relay leg to a remote proxy is unauthenticated and unencrypted, so spoofed datagrams can
@@ -96,6 +103,8 @@ None open.
     now says what is passed instead.
   - UDP servers that only receive don't work through a proxy.
   - ~~The README's "No DNS leak" claim is false (C4).~~ Corrected with the D-22 implementation.
+  - **Done, awaiting commit:** a *Security considerations* section in the README and a SECURITY
+    section in the man page.
 - [ ] **D4** — the configuration reference is incomplete:
   - The README's environment table omits `UDPCHAINS_PASSWORD` and `_LIB`. (`_QUIET` and `_DEBUG`
     were added with L5.)
@@ -103,6 +112,8 @@ None open.
   - Nothing says inline `#` comments are unsupported.
   - `connect_timeout` applies per handshake step.
   - The man page cites `LD_PRELOAD(8)`, which does not exist (use `ld.so(8)`).
+  - **Done, awaiting commit.** Environment and key tables in the README and man page. An inline
+    `#` after whitespace is now an error (unit-tested); a `#` inside a value is kept.
 - [ ] **D5** — stale design docs:
   - DESIGN.md says "no code written".
   - DESIGN §3.1 says a CLAIMING entry "spins briefly, then passes through"; it passes through
@@ -112,6 +123,8 @@ None open.
   - The DESIGN §6.4 errno table does not match the code's reply-code mapping.
   - The DECISIONS.md index stops at D-15 (D-16 to D-21 are missing).
   - `src/config.h:57` still says FR-P-09 is deferred.
+  - **Done, awaiting commit.** All seven; also DESIGN §8 (the TCP fallback now exists), the man
+    page's LIMITATIONS, and a stale comment in `src/assoc.h`. The index runs to D-35.
 - [ ] **D6** — the numbers disagree:
   - The suite now prints 498 assertions; TRACEABILITY says 455.
   - TST-05 is listed as 93 and as 76 (it is now 101).
@@ -119,6 +132,8 @@ None open.
   - The matrix is called "36-cell" (README), 108 (CHANGELOG) and "36 × 4" (TRACEABILITY);
     the actual count is 108.
   - The TRACEABILITY rows need entries for D-21.
+  - **Done, awaiting commit.** The totals table is regenerated from a run (651 assertions, 17
+    groups, 71-check gate), and the per-test rows point at it rather than repeating numbers.
 - [ ] **D7** — overclaims to soften:
   - ~~"no syscalls on the datagram path … cannot deadlock" (M10; the send path also calls `poll()`
     after 1 s idle).~~ Removed from the README with D-23, which adds a `getsockopt` per call. The
@@ -126,6 +141,7 @@ None open.
   - The FR-L-02 generation guard (M8).
   - "fall back or fail" for GSO/GRO (M2).
   - "nothing breaks" for the D-17 fix (H1).
+  - **Done, awaiting commit:** the 1.0.0 CHANGELOG entry is rewritten without the claims.
 
 ## Verification still owed
 
@@ -134,6 +150,8 @@ None open.
   failed the two DNS leak checks on other programs' lookups, since the check counted every port-53
   packet on the host. `strace` showed the proxied process made no port-53 call, and the check now
   counts only packets carrying its own lookup name.
+- [ ] **D2 interop** — run the INTEROP-CHECKLIST against Dante and one other UDP-capable proxy, on
+  another host, including an `ATYP 0x04` destination. Combine with the C4 interop check below.
 - [ ] **C4 interop** — name resolution against a real proxy and resolver, INTEROP-CHECKLIST.md §11,
   including whether that proxy supports `CONNECT` for the TCP fallback.
 

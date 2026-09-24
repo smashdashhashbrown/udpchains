@@ -40,9 +40,10 @@ struct udpc_assoc {
 	struct udpc_assoc *next_free;
 };
 
-/* Global fork generation.  A pthread_atfork child handler bumps this and does
- * nothing else -- all real work is deferred off the handler, where
- * async-signal-safety constraints are tightest (FR-L-04, DESIGN.md 3.4). */
+/* Global fork generation.  A pthread_atfork child handler bumps this and closes
+ * the child's copies of the control connections (D-31); everything else is
+ * deferred off the handler, where async-signal-safety constraints are tightest
+ * (FR-L-04, DESIGN.md 3.4). */
 unsigned udpc_fork_generation(void);
 
 /* Registers the atfork handler.  Called once from shim initialisation. */

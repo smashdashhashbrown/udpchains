@@ -397,6 +397,20 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 			return -1;
 		}
 
+		/* D4: comments are whole lines only.  "key = value # note" would
+		 * otherwise make the note part of the value -- silently, for a
+		 * password.  A '#' inside a value ("abc#def") is fine; one after
+		 * whitespace, or opening the value, looks like a comment. */
+		if (*value == '#' || strstr(value, " #") != NULL ||
+		    strstr(value, "\t#") != NULL) {
+			*err = "'#' after a value is not a comment; comments must be "
+			       "on their own line (a password containing \" #\" "
+			       "belongs in password_file)";
+			*errline = lineno;
+			fclose(f);
+			return -1;
+		}
+
 		if (udpc_config_set(cfg, key, value, err) != 0) {
 			*errline = lineno;
 			fclose(f);

@@ -73,7 +73,9 @@ Maximum payload in bytes. Default 8192. Payloads above this fail with
 Promote the loopback\-destination warning to an error.
 .TP
 .B UDPCHAINS_CONNECT_TIMEOUT
-Proxy connect timeout in milliseconds.
+Timeout in milliseconds for each step of the proxy handshake, not for the
+whole of it.
+Default 5000.
 .TP
 .B UDPCHAINS_DNS
 Resolver for name lookups, as a numeric \fIip\fR, \fIip:port\fR or
@@ -109,18 +111,75 @@ is visible in
 Method
 .B 0x02
 is offered only when credentials are configured. GSSAPI is not implemented.
+.TP
+.B UDPCHAINS_PASSWORD
+The password itself.
+Everything the program starts inherits it; prefer
+.BR UDPCHAINS_PASSWORD_FILE .
+.TP
+.BR UDPCHAINS_QUIET ", " UDPCHAINS_DEBUG
+As
+.B \-q
+and
+.BR \-v .
+Each takes a boolean:
+.BR 1 / 0 ,
+.BR yes / no ,
+.BR true / false
+or
+.BR on / off .
+.PP
+.B udpchains
+sets
+.B UDPCHAINS_RESOLVED
+and
+.B UDPCHAINS_PASSWORD_CONFIG
+for the program it runs.
+They are not meant to be set by hand.
 .SH FILES
 .TP
 .I ~/.udpchains.conf
 .TQ
 .I /etc/udpchains.conf
 Configuration, as \fIkey = value\fR lines.
-The name-resolution keys are
+The first of
+.BR \-f ,
+.BR UDPCHAINS_CONFIG ,
+.I ~/.udpchains.conf
+and
+.I /etc/udpchains.conf
+that exists is read, and no other.
+.IP
+Keys:
+.BR proxy ,
+.BR max_datagram ,
+.BR strict_loopback ,
+.BR connect_timeout ,
 .BR dns ,
 .BR dns_timeout ,
-.B dns_search
+.BR dns_search ,
+.BR hosts_file ,
+.BR username ,
+.B password_file
+(relative to the current directory),
+.B password
+(inline; the file must then not be readable by others),
+.B quiet
 and
-.BR hosts_file .
+.BR debug .
+Each matches the environment variable of the same name.
+An unknown key is an error.
+.IP
+Comments are whole lines only, beginning with
+.B #
+or
+.BR ; .
+A
+.B #
+after a value, following whitespace, is an error rather than part of the
+value; a
+.B #
+inside a value is kept.
 .SH NAME RESOLUTION
 glibc's resolver makes its socket calls through internal functions that no
 preloaded library can see, so
@@ -171,6 +230,20 @@ The program could not be executed.
 .TP
 .B 127
 The program was not found.
+.SH SECURITY
+.B udpchains
+keeps a program's UDP from bypassing the proxy.
+It does not make the path to the proxy private.
+.PP
+RFC 1929 credentials cross the network in cleartext.
+Datagrams to and from the proxy's relay are neither authenticated nor
+encrypted: anyone on that path can read them, and a packet forged to appear
+to come from the relay can claim any source address.
+Reach a remote proxy over a VPN you trust, or use one on this host; an SSH
+port forward carries the control connection but not the UDP relay traffic.
+.PP
+Report vulnerabilities privately, as described in
+.IR SECURITY.md .
 .SH LIMITATIONS
 Cannot help statically\-linked binaries, Go binaries, or programs issuing raw
 syscalls: there is no libc call to interpose on. Refuses setuid, setgid and
@@ -193,6 +266,33 @@ reaches the proxy host's loopback, not this one.
 Ancillary data
 .RB ( msg_control )
 is returned empty.
+.PP
+UDP servers do not work: a server's socket is pointed at the proxy's relay,
+which its clients cannot reach.
+.PP
+.BR MSG_MORE ,
+.BR UDP_CORK ,
+GSO and GRO corrupt data rather than failing.
+The first send or receive on a socket blocks while the proxy handshake runs,
+even on a non\-blocking socket.
+.B strict_loopback
+is checked only when a socket's association is set up, and only for a
+connected socket.
+A socket shared with another process is re\-pointed for both.
+.PP
+After
+.BR fork (2),
+a child using an inherited socket is given a private one; if the parent still
+holds its bound port, the child sends from another port.
+A proxy given by hostname is reached at its first address only.
+A non\-NULL invalid pointer inside a message faults in the shim instead of
+returning
+.BR EFAULT .
+.PP
+Sending from a signal handler is safe only on a socket already in use.
+.PP
+Tested against one real proxy, on the same host.
+See the README for the full list, and what each limitation means in practice.
 .SH EXAMPLES
 .PP
 Resolve a name through the proxy.
