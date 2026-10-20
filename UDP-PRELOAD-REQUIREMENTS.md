@@ -142,7 +142,7 @@ out below (FR-P-05, FR-P-06).
 | FR-P-07 | M | When the application supplies a hostname the shim SHALL forward it as `ATYP=0x03` for proxy-side resolution rather than resolving locally. Where only an address is available (the normal UDP case) `ATYP=0x01`/`0x04` SHALL be used. | unit |
 | FR-P-08 | S | If the proxy has expired an idle association, the next send SHALL transparently re-associate rather than failing. | integration |
 | FR-P-09 | S | SOCKS5 username/password authentication (RFC 1929) SHALL be supported when configured. | unit |
-| FR-P-10 | C | Multiple proxies in a chain, as proxychains offers. Not required for v1; UDP chaining is only meaningful hop-by-hop and the complexity is disproportionate. | — |
+| FR-P-10 | C | Multiple proxies in a chain, as proxychains offers. Not required for v1; UDP chaining is only meaningful hop-by-hop and the complexity is disproportionate. **Planned after 1.0.0:** draft requirements, design impact and estimate in [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md). | — |
 
 ## 3. Functional requirements — Syscall fidelity
 
@@ -181,7 +181,7 @@ indistinguishable from an unhooked socket.
 | FR-C-01 | M | A wrapper executable SHALL provide `udpchains [-f config] <program> [args…]`, setting `LD_PRELOAD` and exec-ing the program. | integration |
 | FR-C-02 | M | Configuration SHALL be read from, in precedence order: command line, environment (`UDPCHAINS_PROXY`, `UDPCHAINS_CONFIG`), config file, built-in default. | unit |
 | FR-C-03 | M | An unparseable or missing configuration SHALL cause a clear diagnostic and refuse to run the program, rather than running it unproxied. | unit |
-| FR-C-04 | S | The config file SHALL accept a `proxychains.conf`-like `[ProxyList]` stanza so existing muscle memory transfers. | manual |
+| FR-C-04 | S | The config file SHALL accept a `proxychains.conf`-like `[ProxyList]` stanza so existing muscle memory transfers. Deferred with FR-P-10, whose chains it would list (FR-CH-14 in [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md)). | manual |
 | FR-C-05 | M | Diagnostics SHALL go to stderr with a recognizable prefix, at a verbosity set by `UDPCHAINS_QUIET`/`-q` and `UDPCHAINS_DEBUG`/`-v`. | manual |
 | FR-C-06 | S | At default verbosity the shim SHALL print one line per association established, naming the destination — so the operator can see that proxying is actually happening. | manual |
 
@@ -222,7 +222,7 @@ Documenting these prevents scope creep and sets user expectations honestly.
 | GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`) | Tier 3. Modern QUIC stacks use these; they will fall back or fail. |
 | QUIC performance | Even when functional, a UDP flow through a TCP-based tunnel inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery. |
 | TCP proxying | `proxychains-ng` already does this well. Composing the two is acceptable; reimplementing is not. |
-| Proxy chains (multi-hop UDP) | FR-P-10. Disproportionate complexity for v1. |
+| Proxy chains (multi-hop UDP) | FR-P-10. Disproportionate complexity for v1. Not a permanent non-goal: planned after 1.0.0, see [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md). |
 
 ## 9. Testing
 

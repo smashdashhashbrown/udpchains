@@ -447,7 +447,8 @@ welcome.
   **is** implemented — see above.
 - `proxychains.conf`-style `[ProxyList]` config. A `[ProxyList]` line produces a message pointing
   here rather than a generic parse error.
-- Proxy chains (multi-hop UDP).
+- Proxy chains (multi-hop UDP). Planned after 1.0.0; the draft requirements are in
+  [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md).
 - Loopback and multicast bypass. Deferred rather than dropped; see `DECISIONS.md` D-05.
 
 ## How it works
@@ -482,6 +483,7 @@ memory (D-24).
 | [`docs/DESIGN.md`](docs/DESIGN.md) | how it is built |
 | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | every requirement mapped to design section and test |
 | [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | manual tests against a real proxy, and what each one proves |
+| [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) | multi-hop UDP chains: draft requirements for after 1.0.0 |
 | [`CHANGELOG.md`](CHANGELOG.md) | what changed, and what is known not to work |
 | [`SECURITY.md`](SECURITY.md) | how to report a vulnerability |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to contribute, and the clean-room rule |

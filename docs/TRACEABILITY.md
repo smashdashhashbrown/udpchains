@@ -79,7 +79,7 @@ from a run rather than editing it by hand.
 | FR-P-07 | M | §4.3 | unit-socks5 | **Verified** — encode/decode of ATYP 0x03. Not reachable via the socket API (no libc UDP call takes a hostname); covered by unit test, as §4.3 notes |
 | FR-P-08 | S | §4.4 | faults | **Verified** — fixture expires an association; the shim re-associates before the send, so no datagram is lost |
 | FR-P-09 | S | §4.1 | unit-socks5, FR-P-09-auth | **Verified** — RFC 1929 implemented (D-20, superseding the D-08 deferral). `0x02` is offered only when credentials are configured; the sub-negotiation version byte is `0x01`, not SOCKS5's `0x05`, which the unit test asserts specifically. End-to-end against a fixture performing real authentication: correct credentials round-trip, and wrong or absent credentials deliver **nothing** rather than falling through to a direct send. A test asserts the password appears in no log on either side (NFR-05, SEC-03) |
-| FR-P-10 | C | — | — | **Deferred** — already a §8 non-goal |
+| FR-P-10 | C | — | — | **Deferred** — a §8 non-goal for v1, planned after 1.0.0 ([`FUTURE-UDP-CHAINS.md`](FUTURE-UDP-CHAINS.md)) |
 
 ## §3 Syscall fidelity
 
