@@ -93,7 +93,7 @@ TESTS    := $(OBJDIR)/test_config $(OBJDIR)/test_socks5 $(OBJDIR)/test_addr \
             $(OBJDIR)/bench_latency $(OBJDIR)/test_dns \
             $(OBJDIR)/test_resolve
 
-.PHONY: all clean test check install uninstall fixtures tests
+.PHONY: all clean test check install uninstall fixtures tests interop
 
 all: $(SHIM) $(WRAPPER)
 
@@ -184,6 +184,9 @@ $(OBJDIR)/leakclient: $(TESTDIR)/leakclient.c | $(OBJDIR)
 $(OBJDIR)/bench_latency: $(TESTDIR)/bench_latency.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $< $(LDFLAGS)
 
+$(OBJDIR)/interop_probe: $(TESTDIR)/interop/probe.c | $(OBJDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # TST-02 runs first and gates everything else: a missing receive hook must fail
 # the build, not merely a test.
 check: all
@@ -191,6 +194,12 @@ check: all
 
 test: all fixtures tests check
 	@$(TESTDIR)/run.sh
+
+# Interop against real third-party proxies (INTEROP-CHECKLIST.md 12).  Needs
+# Docker and downloads the proxies' images, so it is opt-in and never part of
+# `make test`, which needs only a C compiler (NFR-01).
+interop: all fixtures tests $(OBJDIR)/interop_probe
+	@$(TESTDIR)/interop/run.sh $(INTEROP_ARGS)
 
 install: all
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(MANDIR)

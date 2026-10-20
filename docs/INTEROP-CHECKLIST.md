@@ -470,6 +470,25 @@ Every container used `--network host`, so the proxies relayed to the fixtures on
 loopback. Each was black-box tested: only its configuration and its own documentation were read,
 never its source (D-01).
 
+### Running it again
+
+```sh
+make interop                                         # all seven, several minutes
+make interop INTEROP_ARGS="dante xray"               # some of them
+make interop INTEROP_ARGS="--long --internet"        # plus 75 s idle, and real names via 9.9.9.9
+```
+
+`tests/interop/run.sh` does everything below. It needs Docker, and pulls images pinned by
+digest: the versions in the table above. hev-socks5-server publishes no image, so its release
+binary is fetched and checked against the pinned checksum. It is opt-in and never part of
+`make test`, which needs only a C compiler. Logs go to `build/interop/`.
+
+The behaviours below are encoded as expectations. A proxy that truncates where this section says
+it does reports `expected`, not a failure. A result that differs from this section reports
+`FAIL`, whether udpchains broke or the proxy changed. To move a proxy to a newer version, change
+its digest in `run.sh`, run it, and update this section and the README's compatible-proxies table
+with whatever changed.
+
 ### What was run against each
 
 Each proxy got the same runs. The integration binaries from `make test` were pointed at the real

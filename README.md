@@ -159,7 +159,8 @@ gost at its default, and Xray. With `max_datagram` at or below the limit, an ove
 with `EMSGSIZE` instead.
 
 The configurations used, and the full results, are in
-[`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12. They were tested as black boxes:
+[`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12. `make interop` repeats the runs; it
+needs Docker, and checks each proxy's behaviour against this table. They were tested as black boxes:
 running a GPL-licensed proxy is fine, but reading its source while working on udpchains is not (see
 [`CONTRIBUTING.md`](CONTRIBUTING.md)).
 

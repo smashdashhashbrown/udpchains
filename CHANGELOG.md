@@ -180,6 +180,9 @@ Documented in full in the README's *Security considerations* and *What does not 
 
 - 656 assertions across 17 groups, plus a 71-check exported-symbol and hardening gate. Clean
   under ASan/UBSan, ThreadSanitizer, Valgrind memcheck and Helgrind.
+- **`make interop`** runs the integration tests against seven real SOCKS5 proxies in Docker,
+  pinned by digest, and checks each one's known behaviour (INTEROP-CHECKLIST.md §12). It is
+  opt-in, since it needs Docker and downloads images.
 - Every fix from the pre-release review has a test that fails, hangs or crashes against the code
   before it.
 - **Fail-closed on the wire.** `tests/test_failclosed_capture.sh`, run as root, captures with

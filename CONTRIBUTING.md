@@ -39,6 +39,12 @@ says which.
 `tcpdump`. It needs root, so it is not part of `make test`. Run it for any change to the send path,
 the resolver or descriptor tracking.
 
+`make interop` runs the integration tests against seven real SOCKS5 proxies in Docker (see
+[`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12). It needs Docker and downloads the
+proxies' images, so it is not part of `make test`. Run it for any change to the SOCKS5 client, the
+header codec or association handling. The proxies are black boxes: change their configuration in
+`tests/interop/run.sh`, but never read their source, for the reason above.
+
 ## What a change needs
 
 - **A test that fails without it.** For a bug, show it failing against the code before the fix.
