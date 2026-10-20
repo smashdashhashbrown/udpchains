@@ -109,11 +109,11 @@ None open.
   through each of the seven proxies, `getent` resolved through `9.9.9.9`, and the TCP fallback ran
   over each proxy's `CONNECT` against the fixture resolver. Not yet checked: with a remote proxy, or
   with `tcpdump` on this host.
-- [ ] **errno when the proxy is down** — found in the §12 runs. With no proxy listening, a send
+- [x] **errno when the proxy is down** — found in the §12 runs. With no proxy listening, a send
   failed with `ECONNRESET`, not the connect's own `ECONNREFUSED` that DESIGN.md §6.4 specifies,
   because the proxy-connect wait reported `POLLERR` as a reset without reading `SO_ERROR`. It
-  still failed closed. *Fixed, awaiting commit:* `connect_with_timeout` in `src/socks5.c` now
-  returns `SO_ERROR`, and `unit-socks5` has a test that fails without the fix.
+  still failed closed. `connect_with_timeout` in `src/socks5.c` now returns `SO_ERROR`, and
+  `unit-socks5` has a test that fails without the fix. (b31b583)
 
 ## Residuals recorded in D-21 (no fix planned yet)
 
