@@ -245,10 +245,10 @@ This section is the honest part. Read it before deciding whether this tool suits
 
 | | Why |
 |---|---|
-| **Statically-linked binaries** | No libc to interpose on. Unfixable by this approach. |
-| **Go binaries** | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. |
+| **Statically-linked binaries** | No libc to interpose on. Unfixable by this approach. A supervisor mode that does not use `LD_PRELOAD` is planned after 0.1.0 ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)). |
+| **Go binaries** | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. Planned with static binaries. |
 | **setuid/setgid binaries** | The loader ignores `LD_PRELOAD` for them. `udpchains` detects this and **refuses to run them** rather than running them unproxied. Binaries with file capabilities are refused for the same reason. |
-| **Programs sending through `syscall()` directly** | Same reason. `ptrace`-based interception is the only answer, and is out of scope. (Creating, duplicating and closing descriptors through `syscall()` *is* tracked, which is how libuv closes them; sends and receives through it are not.) |
+| **Programs sending through `syscall()` directly** | Same reason. Only interception at the system-call boundary can see them; planned with static binaries. (Creating, duplicating and closing descriptors through `syscall()` *is* tracked, which is how libuv closes them; sends and receives through it are not.) |
 | **`ping`, and other non-UDP datagram sockets** | An unprivileged `ping` uses an ICMP datagram socket, which SOCKS5 cannot carry. `udpchains` refuses to create one (`EPROTONOSUPPORT`, with a diagnostic) rather than send it directly or wrap it as UDP (D-29). UDP-Lite is refused the same way. |
 | **Programs using raw sockets** | `SOCK_RAW` is not intercepted, and SOCKS5 has no way to carry a raw IP packet. Such traffic goes **direct** — see the warning below. `nmap`, `traceroute` and similar tools are in this category. |
 
@@ -449,6 +449,9 @@ welcome.
   here rather than a generic parse error.
 - Proxy chains (multi-hop UDP). Planned after 0.1.0; the draft requirements are in
   [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md).
+- Static and Go binaries, and programs calling `syscall()` directly. Planned after 0.1.0, as a
+  supervisor mode; the draft requirements are in
+  [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md).
 - Loopback and multicast bypass. Deferred rather than dropped; see `DECISIONS.md` D-05.
 
 ## Comparison with similar tools
@@ -563,6 +566,7 @@ memory (D-24).
 | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | every requirement mapped to design section and test |
 | [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | manual tests against a real proxy, and what each one proves |
 | [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) | multi-hop UDP chains: draft requirements for after 0.1.0 |
+| [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md) | static and Go binaries, through a supervisor: draft requirements for after 0.1.0 |
 | [`CHANGELOG.md`](CHANGELOG.md) | what changed, and what is known not to work |
 | [`SECURITY.md`](SECURITY.md) | how to report a vulnerability |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to contribute, and the clean-room rule |

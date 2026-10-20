@@ -214,10 +214,10 @@ Documenting these prevents scope creep and sets user expectations honestly.
 
 | Non-goal | Rationale |
 |---|---|
-| Statically-linked binaries | No libc to interpose on. Unfixable by this approach. |
-| Go binaries | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. |
+| Statically-linked binaries | No libc to interpose on. Unfixable by this approach. Not a permanent non-goal: a supervisor mode that does not use `LD_PRELOAD` is planned after 0.1.0, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
+| Go binaries | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. Planned with static binaries, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
 | setuid/setgid binaries | The loader drops `LD_PRELOAD`. See SEC-06. |
-| Direct `syscall()` users | Same reason. `ptrace`-based interception is the only answer; out of scope. |
+| Direct `syscall()` users | Same reason. Only interception at the system-call boundary can see them; out of scope for v1. Planned with static binaries, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
 | Faithful ancillary data (`IP_PKTINFO`, `IP_RECVERR`, ECN) | Describes a socket the application does not actually own; no honest emulation exists. Returned empty (FR-F-11). |
 | GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`) | Tier 3. Modern QUIC stacks use these; they will fall back or fail. |
 | QUIC performance | Even when functional, a UDP flow through a TCP-based tunnel inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery. |
