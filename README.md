@@ -451,6 +451,85 @@ welcome.
   [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md).
 - Loopback and multicast bypass. Deferred rather than dropped; see `DECISIONS.md` D-05.
 
+## Comparison with similar tools
+
+Several open-source tools can send a single program's UDP through a SOCKS5 proxy. Each was built
+with different goals, and each does things udpchains does not:
+
+| Tool | Approach | Licence | Also does |
+|---|---|---|---|
+| [Dante `socksify`](https://www.inet.no/dante/) | `LD_PRELOAD` | BSD-style | TCP; a long-established, widely packaged client |
+| [proxychains-ng PR #570](https://github.com/rofl0r/proxychains-ng/pull/570) | `LD_PRELOAD` | GPL-2.0 | TCP; UDP through a **chain** of proxies. An open pull request, not yet in a release |
+| [Proxando](https://github.com/NULLhere/Proxando) | `LD_PRELOAD` | GPL-2.0 | TCP; proxychains-style configuration |
+| [graftcp](https://github.com/hmgle/graftcp) | `ptrace` | GPL-3.0 | TCP; **static and Go binaries**, which no `LD_PRELOAD` tool can reach; HTTP proxies |
+
+udpchains does UDP only, through one proxy, for dynamically linked programs.
+
+### UDP behaviour, measured
+
+On 2026-10-19 each tool ran the same tests in a Docker lab. A client, a SOCKS5 proxy (gost 3.3.1)
+and a server each had their own address. The server logged the source of every datagram and DNS
+query, so it could tell whether traffic came through the proxy or straight from the client. The
+same run with no tool at all was the control: there, every datagram arrived directly. Versions:
+`dante-client` 1.4.3 (Ubuntu 24.04), PR #570 at `04f6622`, Proxando at `c7ff4ac`, graftcp v0.8.3.
+
+| | udpchains | Dante `socksify` | PR #570 | Proxando | graftcp |
+|---|---|---|---|---|---|
+| Send × receive calls, IPv4: round trips through the proxy, of 54 | 54 | 35 | 0 | 20 | 24 |
+| The same, IPv6 | 54 | 0 | 0 | 20 | 23–24 |
+| `sendmmsg` | through the proxy | sent directly | — | sent directly | sent directly |
+| Sender address the program sees | the real sender | the real sender | — | the real sender | another address |
+| `dig` with its own resolver | through the proxy | no answer | through the proxy | no answer | through the proxy |
+| `getaddrinfo` | queried through the proxy | placeholder address | placeholder address | placeholder address | queried through the proxy |
+| Static Go binary | sent directly | sent directly | sent directly | sent directly | through the proxy |
+| With the proxy stopped, datagrams that reached the server directly | none | IPv6, `sendmmsg` | none | `sendto`, `sendmmsg` | `sendmmsg` |
+
+The 54 combinations are nine ways to send (`sendto`, `sendmsg` and `sendmmsg` with and without
+`connect`, plus `send`, `write` and `writev`) by six ways to receive (`recvfrom`, `recv`, `read`,
+`readv`, `recvmsg`, `recvmmsg`). Each counts only if the reply came back byte for byte, through the
+proxy. graftcp ran in its default `auto` mode and in `only_socks5`; the results matched, apart from
+an occasional cell that crashed, at most one per matrix, which is why its IPv6 figure is a range.
+The IPv4 figures were the same when each socket first exchanged a datagram before the test, and
+with the client built with `_FORTIFY_SOURCE`.
+
+The placeholder addresses come from the settings used here, Dante's `resolveprotocol: fake` and
+proxychains' `proxy_dns`. They are a design choice: the proxy resolves the name when the program
+connects to it over TCP.
+
+What lies behind the figures:
+
+- **Dante `socksify`** does not carry IPv6 UDP; its own log reports "unsupported af 10" and sends
+  directly. With IPv4, `recvmmsg` returns the 10-byte SOCKS header as part of the data, and
+  `sendmmsg` bypasses the proxy.
+- **PR #570** sends through the proxy, but a send call reports failure (`EINPROGRESS`, then
+  `EAGAIN`), even when the datagram is delivered. Programs that retry, such as `dig`, work; the test
+  client, which takes a failed send at its word, did not. `sendto` on a connected socket crashed
+  the client. It never sent anything directly. As an open pull request, it may change before release.
+- **Proxando** returns the SOCKS header as part of the data for `readv` and `recvmmsg`, refuses
+  `sendmsg` and `sendmmsg` on a connected socket (`EDESTADDRREQ`), and sends `sendmmsg` directly.
+  With the proxy stopped, `sendto` was sent directly.
+- **graftcp** reports an address other than the real sender's, and leaves `sendmmsg` to the
+  kernel; its README lists both as known gaps. With the proxy stopped, other sends report success
+  without being delivered. In its default `auto` mode it falls back to direct DNS by design;
+  `--select_proxy_mode only_socks5` stops that. It is the only one of the five that handles a
+  static Go binary.
+
+### Limits of this comparison
+
+- **It measures what udpchains was designed for.** The call matrix, the leak test and the
+  sender-address check come from udpchains' own requirements, and the tools' other strengths —
+  TCP, chains, static binaries, HTTP proxies, other platforms — were not measured.
+- **udpchains' authors wrote the tests and configured every tool,** from each tool's own
+  documentation. A configuration mistake would count against the other tool, not udpchains.
+- **One proxy, one host, one run per tool.** graftcp ran with Docker's seccomp filter disabled;
+  under the default filter it failed intermittently with ptrace errors, which looks environmental.
+- Corrections are welcome: open an issue with the configuration that does better.
+
+`make compare` reruns all of this ([`tests/compare/`](tests/compare/)). It needs Docker and
+Python 3, builds the other tools in its client image, and prints the figures above, with a
+control run that shows the lab detects traffic sent directly. Each tool's configuration is in
+`tests/compare/conf/`.
+
 ## How it works
 
 The shim interposes on libc's socket calls and **redirects the application's own descriptor to the
