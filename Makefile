@@ -93,7 +93,7 @@ TESTS    := $(OBJDIR)/test_config $(OBJDIR)/test_socks5 $(OBJDIR)/test_addr \
             $(OBJDIR)/bench_latency $(OBJDIR)/test_dns \
             $(OBJDIR)/test_resolve
 
-.PHONY: all clean test check install uninstall fixtures tests interop
+.PHONY: all clean test check install uninstall fixtures tests interop compare
 
 all: $(SHIM) $(WRAPPER)
 
@@ -200,6 +200,12 @@ test: all fixtures tests check
 # `make test`, which needs only a C compiler (NFR-01).
 interop: all fixtures tests $(OBJDIR)/interop_probe
 	@$(TESTDIR)/interop/run.sh $(INTEROP_ARGS)
+
+# udpchains beside other tools that proxy a program's UDP (README, "Comparison
+# with similar tools").  Needs Docker and Python 3, and builds its own copy of
+# udpchains from this tree inside the lab, so it is opt-in like `interop`.
+compare:
+	@$(TESTDIR)/compare/run.sh $(COMPARE_ARGS)
 
 install: all
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(MANDIR)

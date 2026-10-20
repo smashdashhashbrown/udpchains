@@ -45,6 +45,10 @@ proxies' images, so it is not part of `make test`. Run it for any change to the 
 header codec or association handling. The proxies are black boxes: change their configuration in
 `tests/interop/run.sh`, but never read their source, for the reason above.
 
+`make compare` runs udpchains beside the other UDP proxifiers in the README's comparison
+(`tests/compare/`). Two of them are built from GPL source inside its client image. The same rule
+applies: never open that source. If a build fails, read only the compiler's error messages.
+
 ## What a change needs
 
 - **A test that fails without it.** For a bug, show it failing against the code before the fix.

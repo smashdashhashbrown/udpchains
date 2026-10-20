@@ -1,0 +1,43 @@
+# The client: udpchains, built from this working tree, and the tools it is
+# compared with.  The build context is the repository root (run.sh sends only
+# src/, the Makefile and tests/compare/).
+
+FROM golang@sha256:0ecdc2a9f6156af6451080bfe3d8382a662fcc4e209608c6f919e643453514c1 AS gobuild
+COPY tests/compare/gocmp /src
+RUN cd /src && go mod init gocmp > /dev/null 2>&1 && CGO_ENABLED=0 go build -o /gocmp .
+
+FROM ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential git ca-certificates dante-client dnsutils libuv1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# graftcp: the release package, pinned by the checksum GitHub publishes for it.
+ADD --checksum=sha256:ad55ffba4a072f71c51a094455dd06edc316434fbc2784f88016575ed39fdba8 \
+    https://github.com/hmgle/graftcp/releases/download/v0.8.3/graftcp_v0.8.3_linux-amd64.deb /tmp/graftcp.deb
+RUN dpkg -i /tmp/graftcp.deb && rm /tmp/graftcp.deb
+
+# proxychains-ng PR #570 and Proxando publish no binaries, so they are built
+# from source.  Both are GPL: the source is built here and deleted, and must
+# never be opened (CONTRIBUTING.md, D-01).  Build output goes to a log nobody
+# reads unless a build fails.  PR #570 needs libuv's headers.
+RUN git clone -q https://github.com/hc-syn/proxychains-ng /b/pc && cd /b/pc \
+ && git checkout -q 04f66223a44d5cf24aadfa667056543f036d9912 \
+ && ./configure --prefix=/opt/pc570 > /b/pc.log 2>&1 && make >> /b/pc.log 2>&1 \
+ && make install >> /b/pc.log 2>&1 && rm -rf /b
+# Proxando's configure is committed without its executable bit.
+RUN git clone -q https://github.com/NULLhere/Proxando /b/px && cd /b/px \
+ && git checkout -q c7ff4ac8c00d8184eca877f1b10ff604cc43bd22 \
+ && sh ./configure --prefix=/opt/proxando > /b/px.log 2>&1 && make >> /b/px.log 2>&1 \
+ && mkdir -p /opt/proxando/bin /opt/proxando/lib \
+ && cp proxando proxando-daemon /opt/proxando/bin/ && cp lib_proxando.so /opt/proxando/lib/ \
+ && rm -rf /b
+
+COPY src /udpchains/src
+COPY Makefile /udpchains/
+RUN make -C /udpchains -s all
+
+COPY tests/compare/client.c /src/
+RUN cc -std=c11 -D_GNU_SOURCE -Wall -O0 -U_FORTIFY_SOURCE -o /usr/local/bin/client /src/client.c \
+ && cc -std=c11 -D_GNU_SOURCE -Wall -O2 -D_FORTIFY_SOURCE=2 -o /usr/local/bin/client-fortified /src/client.c
+COPY --from=gobuild /gocmp /usr/local/bin/gocmp
+COPY tests/compare/tools.sh /usr/local/bin/tools.sh

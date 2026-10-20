@@ -183,6 +183,9 @@ Documented in full in the README's *Security considerations* and *What does not 
 - **`make interop`** runs the integration tests against seven real SOCKS5 proxies in Docker,
   pinned by digest, and checks each one's known behaviour (INTEROP-CHECKLIST.md §12). It is
   opt-in, since it needs Docker and downloads images.
+- **`make compare`** runs the README's comparison with Dante `socksify`, proxychains-ng PR #570,
+  Proxando and graftcp in a Docker lab, judging each datagram by where the server saw it arrive
+  from. Also opt-in.
 - Every fix from the pre-release review has a test that fails, hangs or crashes against the code
   before it.
 - **Fail-closed on the wire.** `tests/test_failclosed_capture.sh`, run as root, captures with
