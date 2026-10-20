@@ -24,13 +24,12 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD="$ROOT/build"
 WRAPPER="$ROOT/udpchains"
 TMP=$(mktemp -d)
-PIDS=()
 FAIL=0
 
 cleanup() {
-	for pid in "${PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill "$pid" 2>/dev/null
-	done
+	# Fixtures are started inside $(...), a subshell, where a PID stored in a
+	# variable would never reach this shell.  Each one's PID goes to a file.
+	[ -f "$TMP/pids" ] && kill $(cat "$TMP/pids") 2>/dev/null
 	rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -39,7 +38,7 @@ start_echo() {
 	local name=$1; shift
 	: > "$TMP/$name.out"
 	"$BUILD/udpecho" --port 0 "$@" > "$TMP/$name.out" 2> "$TMP/$name.log" &
-	PIDS+=($!)
+	echo $! >> "$TMP/pids"
 	local i port=""
 	for ((i = 0; i < 100; i++)); do
 		port=$(awk '/^PORT/{print $2; exit}' "$TMP/$name.out" 2>/dev/null)
@@ -95,7 +94,7 @@ echo "# TST-03 scenario 2: proxy accepts TCP but refuses UDP ASSOCIATE"
 PROXY_OUT="$TMP/refuse.out"
 : > "$PROXY_OUT"
 "$BUILD/socks5d" --port 0 --refuse-associate --quiet > "$PROXY_OUT" 2>&1 &
-PIDS+=($!)
+echo $! >> "$TMP/pids"
 RPORT=""
 for ((i = 0; i < 100; i++)); do
 	RPORT=$(awk '/^PORT/{print $2; exit}' "$PROXY_OUT" 2>/dev/null)
@@ -136,7 +135,7 @@ echo "# TST-03 scenario 4: name lookups with the proxy down (D-22)"
 # was told to use must see nothing.
 : > "$TMP/dnsd.out"
 "$BUILD/dnsd" --port 0 > "$TMP/dnsd.out" 2> "$TMP/dnsd.log" &
-PIDS+=($!)
+echo $! >> "$TMP/pids"
 DPORT=""
 for ((i = 0; i < 100; i++)); do
 	DPORT=$(awk '/^PORT/{print $2; exit}' "$TMP/dnsd.out" 2>/dev/null)

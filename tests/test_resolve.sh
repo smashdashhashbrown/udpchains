@@ -20,9 +20,12 @@ WRAPPER="$3"
 PROBE="$4"
 
 TMP=$(mktemp -d)
-PIDS=""
 cleanup() {
-	for p in $PIDS; do kill "$p" 2>/dev/null || true; done
+	# Fixtures are started inside $(...), a subshell, where a PID stored in a
+	# variable would never reach this shell.  Each one's PID goes to a file.
+	if [ -f "$TMP/pids" ]; then
+		for p in $(cat "$TMP/pids"); do kill "$p" 2>/dev/null || true; done
+	fi
 	rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -36,7 +39,7 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else notok "$1 (got $2, want $3)"; f
 start() {
 	name=$1; shift
 	"$@" > "$TMP/$name.out" 2> "$TMP/$name.err" &
-	PIDS="$PIDS $!"
+	echo $! >> "$TMP/pids"
 	i=0
 	while [ $i -lt 200 ]; do
 		port=$(awk '/^PORT/{print $2; exit}' "$TMP/$name.out" 2>/dev/null || true)

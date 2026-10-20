@@ -14,15 +14,13 @@ BUILD="$ROOT/build"
 WRAPPER="$ROOT/udpchains"
 TMP=$(mktemp -d)
 
-PIDS=()
 FAILED=0
 RAN=0
 
 cleanup() {
-	local pid
-	for pid in "${PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill "$pid" 2>/dev/null
-	done
+	# Fixtures are started inside $(...), a subshell, where a PID stored in a
+	# variable would never reach this shell.  Each one's PID goes to a file.
+	[ -f "$TMP/pids" ] && kill $(cat "$TMP/pids") 2>/dev/null
 	rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -34,7 +32,7 @@ start_fixture() {
 	local out="$TMP/$name.out"
 	: > "$out"
 	"$@" > "$out" 2> "$TMP/$name.err" &
-	PIDS+=($!)
+	echo $! >> "$TMP/pids"
 	local i port=""
 	for ((i = 0; i < 100; i++)); do
 		port=$(awk '/^PORT/{print $2; exit}' "$out" 2>/dev/null)

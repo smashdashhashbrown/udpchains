@@ -19,9 +19,12 @@ UDPECHO="$2"
 WRAPPER="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"
 
 TMP=$(mktemp -d)
-PIDS=""
 cleanup() {
-	for p in $PIDS; do kill "$p" 2>/dev/null || true; done
+	# Fixtures are started inside $(...), a subshell, where a PID stored in a
+	# variable would never reach this shell.  Each one's PID goes to a file.
+	if [ -f "$TMP/pids" ]; then
+		for p in $(cat "$TMP/pids"); do kill "$p" 2>/dev/null || true; done
+	fi
 	rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -35,7 +38,7 @@ notok() { n=$((n + 1)); echo "not ok $n - $1"; fail=1; }
 start() {
 	name=$1; shift
 	"$@" > "$TMP/$name.out" 2>&1 &
-	PIDS="$PIDS $!"
+	echo $! >> "$TMP/pids"
 	i=0
 	while [ $i -lt 200 ]; do
 		port=$(awk '/^PORT/{print $2; exit}' "$TMP/$name.out" 2>/dev/null || true)

@@ -11,13 +11,12 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD="$ROOT/build"
 WRAPPER="$ROOT/udpchains"
 TMP=$(mktemp -d)
-PIDS=()
 FAIL=0
 
 cleanup() {
-	for pid in "${PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill "$pid" 2>/dev/null
-	done
+	# Fixtures are started inside $(...), a subshell, where a PID stored in a
+	# variable would never reach this shell.  Each one's PID goes to a file.
+	[ -f "$TMP/pids" ] && kill $(cat "$TMP/pids") 2>/dev/null
 	rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -36,7 +35,7 @@ start_proxy() {
 	local name=$1; shift
 	: > "$TMP/$name.out"
 	"$BUILD/socks5d" --port 0 "$@" > "$TMP/$name.out" 2> "$TMP/$name.err" &
-	PIDS+=($!)
+	echo $! >> "$TMP/pids"
 	wait_port "$TMP/$name.out"
 }
 
@@ -44,7 +43,7 @@ start_echo() {
 	local name=$1
 	: > "$TMP/$name.out"
 	"$BUILD/udpecho" --port 0 --quiet > "$TMP/$name.out" 2>&1 &
-	PIDS+=($!)
+	echo $! >> "$TMP/pids"
 	wait_port "$TMP/$name.out"
 }
 
