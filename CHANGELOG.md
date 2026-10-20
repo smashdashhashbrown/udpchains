@@ -9,7 +9,7 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) and mapped in
 [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
 
-## [0.1.0] — 2026-09-24
+## [0.1.0] — 2026-10-20
 
 First release.
 
