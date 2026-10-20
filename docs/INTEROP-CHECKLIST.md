@@ -24,7 +24,7 @@ Run everything with `-v` and keep the output. The per-datagram debug line names 
 | `iperf -u` rate sweep (§2) | ✅ passed 2026-08-18 — 0% loss to 15 Mbit/s; the cliff above it is the proxy's tunnel ceiling, attributed by kernel counters on both hosts. Closes the burst gap. A direct (unproxied) run to the same host saturated at ~17.5 Mbit/s, so the tunnel delivers ~94% of raw path capacity |
 | `ntpdate -q` (§4) | ✅ passed 2026-08-19 — stratum-2 offsets accepted. The only test so far run by a client that validates a reply's **source address** rather than just its port |
 | dual-stack → v4-mapped (§6a) | ✅ passed 2026-08-19 — `ATYP 0x01` with a 10-byte header from an `AF_INET6` socket. D-14 confirmed fixed against the real proxy, outbound direction |
-| Seven other proxies, on this host (§12) | ✅ run 2026-10-19 — Dante, 3proxy, gost, Xray, sing-box, hev-socks5-server and shadowsocks-rust. No proxy-specific udpchains defect; one general `errno` bug found. Found per-proxy datagram limits, above which the proxy silently truncates; four proxies that drop zero-length datagrams; and Dante port-restricted by default. Also covers `ATYP 0x04` to `::1`, the resolver's `CONNECT` fallback, and idle expiry |
+| Seven other proxies, on this host (§12) | ✅ run 2026-10-19 — Dante, 3proxy, gost, Xray, sing-box, hev-socks5-server and shadowsocks-rust. No proxy-specific udpchains defect; one general `errno` bug found and fixed. Found per-proxy datagram limits, above which the proxy silently truncates; four proxies that drop zero-length datagrams; and Dante port-restricted by default. Also covers `ATYP 0x04` to `::1`, the resolver's `CONNECT` fallback, and idle expiry |
 
 TFTP is **lockstep**: one block, wait for the ACK. It never has more than one datagram in flight, so
 despite the volume it says nothing about burst behaviour, receive-queue pressure, or batching. That
@@ -560,10 +560,11 @@ send after the silence went straight through.
 datagram reached the destination. With gost started again, the same socket re-associated and
 carried traffic again.
 
-One finding is about udpchains itself, though it is not a leak: with the proxy down, sends fail
-with `ECONNRESET`, where §6.4 of DESIGN.md says the `errno` should be the connect's own
-(`ECONNREFUSED`). This happens with no proxy listening at all, so it is not specific to any proxy.
-It is recorded in [`REVIEW-BACKLOG.md`](REVIEW-BACKLOG.md).
+One finding was about udpchains itself, though it was not a leak: with the proxy down, sends
+failed with `ECONNRESET`, where §6.4 of DESIGN.md says the `errno` should be the connect's own
+(`ECONNREFUSED`). It happened with no proxy listening at all, so it was not specific to any proxy.
+It is now fixed: the shim reads `SO_ERROR` once the connect's poll reports an error, and a test in
+`unit-socks5` covers it.
 
 ### What this does not show
 

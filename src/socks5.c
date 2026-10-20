@@ -370,7 +370,7 @@ static int read_all(int fd, uint8_t *buf, size_t len, int timeout_ms)
 static int connect_with_timeout(int fd, const struct sockaddr *sa, socklen_t len,
                                 int timeout_ms)
 {
-	int err = 0;
+	int err = 0, polled;
 	socklen_t elen = sizeof(err);
 
 	if (connect(fd, sa, len) == 0)
@@ -378,13 +378,22 @@ static int connect_with_timeout(int fd, const struct sockaddr *sa, socklen_t len
 	if (errno != EINPROGRESS)
 		return -1;
 
-	if (deadline_poll(fd, POLLOUT, timeout_ms) != 0)
+	/* A refused or unreachable connect shows up as POLLERR/POLLHUP, which
+	 * deadline_poll reports as ECONNRESET.  SO_ERROR holds the real reason,
+	 * and the caller is owed it (DESIGN.md 6.4): ECONNREFUSED for a proxy
+	 * that is not listening, not a reset that never happened. */
+	polled = deadline_poll(fd, POLLOUT, timeout_ms);
+	if (polled != 0 && errno != ECONNRESET)
 		return -1;
 
 	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0)
 		return -1;
 	if (err != 0) {
 		errno = err;
+		return -1;
+	}
+	if (polled != 0) {
+		errno = ECONNRESET;
 		return -1;
 	}
 	return 0;

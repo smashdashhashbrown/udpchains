@@ -13,7 +13,10 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include "config.h"
 #include "socks5.h"
 
 static void make_v4(struct sockaddr_in *sa, const char *ip, uint16_t port)
@@ -388,6 +391,42 @@ int main(void)
 		/* A NULL password means "no password", not a crash. */
 		an = udpc_socks_encode_userpass(b, sizeof(b), "carol", NULL);
 		TAP_EQ_INT(an, 3 + 5 + 0, "a NULL password is treated as empty");
+	}
+
+	TAP_GROUP("a proxy that is not listening: the connect's own errno");
+	{
+		/* A port bound but never listened on refuses connections, and
+		 * no other socket can take it while this one holds it.  The
+		 * refusal arrives as POLLERR after EINPROGRESS; it once came
+		 * back as ECONNRESET rather than what SO_ERROR held (DESIGN.md
+		 * 6.4).  Found against real proxies, INTEROP-CHECKLIST 12. */
+		struct udpc_config cfg;
+		struct udpc_socks_conn conn;
+		struct sockaddr_in held;
+		socklen_t hlen = sizeof(held);
+		int hold, e = 0;
+
+		hold = socket(AF_INET, SOCK_STREAM, 0);
+		make_v4(&held, "127.0.0.1", 0);
+		TAP_OK(hold >= 0 &&
+		       bind(hold, (struct sockaddr *)&held, sizeof(held)) == 0 &&
+		       getsockname(hold, (struct sockaddr *)&held, &hlen) == 0,
+		       "a port is reserved with nothing listening on it");
+
+		udpc_config_defaults(&cfg);
+		memcpy(&cfg.proxy, &held, sizeof(held));
+		cfg.proxy_is_local = true;
+
+		TAP_EQ_INT(udpc_socks_associate(&cfg, NULL, &conn, &e), -1,
+		           "UDP ASSOCIATE to it fails");
+		TAP_EQ_INT(e, ECONNREFUSED, "with ECONNREFUSED, not ECONNRESET");
+
+		e = 0;
+		TAP_EQ_INT(udpc_socks_connect(&cfg, (struct sockaddr *)&held, &e),
+		           -1, "CONNECT through it fails");
+		TAP_EQ_INT(e, ECONNREFUSED, "with ECONNREFUSED too");
+
+		close(hold);
 	}
 
 	TAP_DONE();

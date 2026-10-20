@@ -136,7 +136,7 @@ only `CONNECT`. These open-source proxies have been tested with it, each on the 
 client. The tests covered the full hook matrix, IPv6 destinations, name resolution including the
 TCP fallback over `CONNECT`, authentication, idle expiry, and the proxy dying mid-stream. None of
 them exposed a udpchains defect specific to that proxy. The runs did find one general `errno`
-bug, recorded in [`docs/REVIEW-BACKLOG.md`](docs/REVIEW-BACKLOG.md).
+bug, which is fixed.
 
 | Proxy | Version tested | Licence | UDP setup | Largest datagram it carries | Notes |
 |---|---|---|---|---|---|

@@ -89,6 +89,9 @@ record exists.
 - **`fork()`** — parent and child share one open file description, so a child re-pointing its
   socket also re-pointed the parent's. The child now gets a private socket (FR-L-04).
 - **A race on the entry `family`/`type` fields**, found by ThreadSanitizer.
+- **A proxy that was not listening was reported as `ECONNRESET`,** not the `ECONNREFUSED` the
+  connect returned. The poll that waits for the connect saw `POLLERR` and reported a reset
+  without reading `SO_ERROR`. Found by the seven-proxy runs (INTEROP-CHECKLIST.md §12).
 
 Found in a pre-release review, tracked in [`docs/REVIEW-BACKLOG.md`](docs/REVIEW-BACKLOG.md). Each
 was reproduced before it was fixed, and each fix has a test that fails without it.
@@ -175,7 +178,7 @@ Documented in full in the README's *Security considerations* and *What does not 
 
 ### Verification
 
-- 651 assertions across 17 groups, plus a 71-check exported-symbol and hardening gate. Clean
+- 656 assertions across 17 groups, plus a 71-check exported-symbol and hardening gate. Clean
   under ASan/UBSan, ThreadSanitizer, Valgrind memcheck and Helgrind.
 - Every fix from the pre-release review has a test that fails, hangs or crashes against the code
   before it.

@@ -25,7 +25,7 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 651 assertions across 17 groups (`tests/run.sh`), all passing, plus the 71-check
+**Test totals:** 656 assertions across 17 groups (`tests/run.sh`), all passing, plus the 71-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
@@ -33,7 +33,7 @@ from a run rather than editing it by hand.
 |---|---|
 | unit-addr | 51 |
 | unit-config | 54 |
-| unit-socks5 | 83 |
+| unit-socks5 | 88 |
 | unit-fdtable | 22 |
 | unit-dns | 52 |
 | TST-01 hook matrix | 108 |
