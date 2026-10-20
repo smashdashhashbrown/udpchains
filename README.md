@@ -129,6 +129,40 @@ credentials are configured, so a proxy that accepts either is not pushed into an
 exchange you did not ask for. If authentication fails, the send fails — there is no fallback to an
 unauthenticated or direct send.
 
+## Compatible proxies
+
+`udpchains` needs a SOCKS5 proxy that implements `UDP ASSOCIATE`; many SOCKS5 servers implement
+only `CONNECT`. These open-source proxies have been tested with it, each on the same host as the
+client. The tests covered the full hook matrix, IPv6 destinations, name resolution including the
+TCP fallback over `CONNECT`, authentication, idle expiry, and the proxy dying mid-stream. None of
+them exposed a udpchains defect specific to that proxy. The runs did find one general `errno`
+bug, recorded in [`docs/REVIEW-BACKLOG.md`](docs/REVIEW-BACKLOG.md).
+
+| Proxy | Version tested | Licence | UDP setup | Largest datagram it carries | Notes |
+|---|---|---|---|---|---|
+| [Dante](https://www.inet.no/dante/) | 1.4.3 | BSD-style | `udpassociate` and `udpreply` in `socks pass` rules | ≥ 65 497 | Port-restricted unless `udp.connectdst: no` is set |
+| [3proxy](https://github.com/3proxy/3proxy) | 1.0.1 | BSD-style | On in the `socks` service | 16 326 | Drops zero-length datagrams; a refused login gives `ECONNRESET` |
+| [gost](https://github.com/go-gost/gost) | 3.3.1 | MIT | `?udp=true` on the listener | 4 086 by default; ≥ 65 497 with `udpBufferSize=65535` | Raise `udpBufferSize` |
+| [Xray](https://github.com/XTLS/Xray-core) | 26.3.27 | MPL-2.0 | `"udp": true` on the `socks` inbound | 8 182 | Drops zero-length datagrams |
+| [sing-box](https://github.com/SagerNet/sing-box) | 1.14.3 | GPL-3.0 | On by default on the `socks` inbound | 16 122 | |
+| [hev-socks5-server](https://github.com/heiher/hev-socks5-server) | 2.13.1 | MIT | On by default | 1 490 | Drops zero-length datagrams |
+| [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) `sslocal` | 1.25.0 | MIT | `-U` on `sslocal` and on its `ssserver` | ≥ 65 000 | Drops zero-length datagrams; authentication not tested |
+
+Plus the reference proxy used during development. The datagram figures are payload bytes for an
+IPv4 destination. For an IPv6 destination the SOCKS header is 12 bytes longer, so the limit is
+12 bytes lower.
+
+**Set `max_datagram` no higher than your proxy's limit.** A proxy reads each datagram into a fixed
+buffer and silently truncates one that does not fit, so the program receives a shorter datagram
+and nothing reports an error. Three proxies above have a limit below the default of 8192: hev,
+gost at its default, and Xray. With `max_datagram` at or below the limit, an oversized send fails
+with `EMSGSIZE` instead.
+
+The configurations used, and the full results, are in
+[`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12. They were tested as black boxes:
+running a GPL-licensed proxy is fine, but reading its source while working on udpchains is not (see
+[`CONTRIBUTING.md`](CONTRIBUTING.md)).
+
 ## Name resolution
 
 `udpchains` resolves names itself, through the proxy. glibc's own resolver cannot be intercepted —
@@ -378,13 +412,32 @@ Note that udpchains applies its own filter only for sockets the application has 
 only to match what the kernel does natively (D-15). An unconnected socket — which is what TFTP
 clients use, precisely because of the port switch — is not filtered by the shim at all.
 
+Of the [compatible proxies](#compatible-proxies), Dante 1.4.3 is port-restricted by default, and
+`udp.connectdst: no` in `sockd.conf` lets these protocols through. The other six accepted a reply
+from a switched port with no setting.
+
+### Behaviour that depends on your proxy
+
+See [Compatible proxies](#compatible-proxies) for each proxy's figures.
+
+- **A datagram larger than the proxy's buffer arrives truncated,** with no error to anyone,
+  because the cut happens after udpchains has sent it. Set `max_datagram` no higher than the
+  proxy's limit, so that an oversized send fails with `EMSGSIZE` instead.
+- **Some proxies drop zero-length datagrams.** udpchains sends them, but nothing arrives. A
+  protocol that uses empty datagrams as keepalives will not work through those proxies.
+- **A refused login can look like a reset.** A proxy that closes the connection instead of
+  replying with a failure status, as 3proxy does, makes the send fail with `ECONNRESET` rather than
+  `EACCES`.
+
 ### How far it has been tested against real proxies
 
 The automated suite runs against an in-repo proxy fixture. Against a real proxy, 1.0.0 has been
-checked with one SOCKS5 proxy, running on the same host, with `nc -u`, TFTP, `dig`, `iperf` and
-`ntpdate` (see [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md)). **Not yet tested:** a
-proxy on another host, other proxies such as Dante, IPv6 destinations sent as `ATYP 0x04`, and name
-resolution through a real proxy. Reports from those setups are welcome.
+checked with the reference SOCKS5 proxy, running on the same host, with `nc -u`, TFTP, `dig`,
+`iperf` and `ntpdate`. It has also been checked against the seven proxies under
+[Compatible proxies](#compatible-proxies), each on the same host (see
+[`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12). **Not yet tested:** a proxy on
+another host, and an IPv6 destination beyond this host's loopback. Reports from those setups are
+welcome.
 
 ### Not implemented in v1
 

@@ -140,10 +140,18 @@ Documented in full in the README's *Security considerations* and *What does not 
 - **LSM denials may still leak** (D-19). The pre-`exec` loadability probe runs in the wrapper's
   security domain; if the target transitions to a confined domain on `exec`, the probe can pass
   while the target is denied and runs unproxied.
-- **Tested against one real proxy.** Interop was checked against one SOCKS5 proxy, on the same host, with
-  `nc -u`, TFTP (10 MB), `dig`, `iperf -u` and `ntpdate -q`. A proxy on another host, other proxies
-  such as Dante, `ATYP 0x04` destinations, and name resolution through a real proxy are untested.
-  See [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md).
+- **Tested against real proxies on the same host only.** Interop was checked against the
+  reference SOCKS5 proxy with `nc -u`, TFTP (10 MB), `dig`, `iperf -u` and `ntpdate -q`. It was
+  also checked against Dante 1.4.3, 3proxy 1.0.1, gost 3.3.1, Xray 26.3.27, sing-box 1.14.3,
+  hev-socks5-server 2.13.1 and shadowsocks-rust 1.25.0. These runs covered the hook matrix,
+  `ATYP 0x04` to `::1`, name resolution and its `CONNECT` fallback, authentication, idle expiry and
+  a proxy killed mid-stream. A proxy on another host, and a global IPv6 destination, are untested.
+  See [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12.
+- **Some proxies silently truncate datagrams below the default `max_datagram`:**
+  hev-socks5-server above 1 490 bytes, gost above 4 086 at its default buffer size, and Xray
+  above 8 182. Set `max_datagram` to the proxy's limit. 3proxy, Xray, hev-socks5-server and
+  shadowsocks-rust drop zero-length datagrams. Dante is port-restricted unless
+  `udp.connectdst: no` is set.
 - Cannot help statically-linked binaries, Go binaries, or programs issuing raw syscalls. UDP
   servers do not work through a proxy.
 - `MSG_MORE`, `UDP_CORK`, GSO and GRO corrupt data rather than failing. The first send or receive

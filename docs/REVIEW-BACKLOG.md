@@ -101,8 +101,18 @@ None open.
   counts only packets carrying its own lookup name. (7d1da61)
 - [ ] **D2 interop** — run the INTEROP-CHECKLIST against Dante and one other UDP-capable proxy, on
   another host, including an `ATYP 0x04` destination. Combine with the C4 interop check below.
+  *Partly done 2026-10-19 (INTEROP-CHECKLIST.md §12):* Dante and six other proxies were run on this
+  host, with `ATYP 0x04` to `::1`. No proxy-specific udpchains defect was found. What remains is
+  a proxy on another host.
 - [ ] **C4 interop** — name resolution against a real proxy and resolver, INTEROP-CHECKLIST.md §11,
-  including whether that proxy supports `CONNECT` for the TCP fallback.
+  including whether that proxy supports `CONNECT` for the TCP fallback. *Partly done 2026-10-19:*
+  through each of the seven proxies, `getent` resolved through `9.9.9.9`, and the TCP fallback ran
+  over each proxy's `CONNECT` against the fixture resolver. Not yet checked: with a remote proxy, or
+  with `tcpdump` on this host.
+- [ ] **errno when the proxy is down** — found in the §12 runs. With no proxy listening, a send
+  fails with `ECONNRESET`, not the connect's own `ECONNREFUSED` that DESIGN.md §6.4 specifies. The
+  proxy-connect wait (`src/socks5.c`, the `POLLERR | POLLHUP` branch) reports `ECONNRESET` without
+  reading `SO_ERROR`. It still fails closed. Fix the code or the table.
 
 ## Residuals recorded in D-21 (no fix planned yet)
 

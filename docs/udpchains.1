@@ -304,7 +304,12 @@ returning
 .PP
 Sending from a signal handler is safe only on a socket already in use.
 .PP
-Tested against one real proxy, on the same host.
+Tested against real proxies on the same host only: the reference proxy, Dante,
+3proxy, gost, Xray, sing-box, hev\-socks5\-server and shadowsocks\-rust.
+Some proxies silently truncate datagrams larger than their buffer, below the
+default
+.BR max_datagram ;
+set it no higher than the proxy's limit.
 See the README for the full list, and what each limitation means in practice.
 .SH EXAMPLES
 .PP

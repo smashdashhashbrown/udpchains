@@ -24,6 +24,7 @@ Run everything with `-v` and keep the output. The per-datagram debug line names 
 | `iperf -u` rate sweep (§2) | ✅ passed 2026-08-18 — 0% loss to 15 Mbit/s; the cliff above it is the proxy's tunnel ceiling, attributed by kernel counters on both hosts. Closes the burst gap. A direct (unproxied) run to the same host saturated at ~17.5 Mbit/s, so the tunnel delivers ~94% of raw path capacity |
 | `ntpdate -q` (§4) | ✅ passed 2026-08-19 — stratum-2 offsets accepted. The only test so far run by a client that validates a reply's **source address** rather than just its port |
 | dual-stack → v4-mapped (§6a) | ✅ passed 2026-08-19 — `ATYP 0x01` with a 10-byte header from an `AF_INET6` socket. D-14 confirmed fixed against the real proxy, outbound direction |
+| Seven other proxies, on this host (§12) | ✅ run 2026-10-19 — Dante, 3proxy, gost, Xray, sing-box, hev-socks5-server and shadowsocks-rust. No proxy-specific udpchains defect; one general `errno` bug found. Found per-proxy datagram limits, above which the proxy silently truncates; four proxies that drop zero-length datagrams; and Dante port-restricted by default. Also covers `ATYP 0x04` to `::1`, the resolver's `CONNECT` fallback, and idle expiry |
 
 TFTP is **lockstep**: one block, wait for the ACK. It never has more than one datagram in flight, so
 despite the volume it says nothing about burst behaviour, receive-queue pressure, or batching. That
@@ -142,6 +143,9 @@ udpchains iperf3 -u -c <host> -l 9000 -b 5M -t 10                # over it
 **Pass:** 8192 works; 9000 fails with `EMSGSIZE` rather than being silently dropped. If your proxy's
 real limit is below 8192, datagrams in between vanish silently — set `UDPCHAINS_MAX_DATAGRAM` to the
 proxy's actual limit. The association log line reports the configured value for exactly this reason.
+
+The limits of seven proxies are measured in §12. Three of them truncate below the default 8192:
+hev-socks5-server at 1 490, gost at 4 086 unless `udpBufferSize` is raised, and Xray at 8 182.
 
 ---
 
@@ -443,6 +447,223 @@ leak half of this.
 through the proxy's `CONNECT`. `dig +short TXT` of a large SPF record from outside the shim will
 find one. Then `getent ahosts` of a name with many A records. Record whether the proxy supports
 `CONNECT` at all: D-22 fails such lookups when it does not.
+
+---
+
+## 12. Other proxies, on this host (2026-10-19)
+
+Seven more SOCKS5 implementations, each run on the same host as the client. This covers proxy
+*diversity*: each was written by different people from the reference proxy and from each other.
+It does not cover a proxy on another host (§4b), which is still owed.
+
+| Proxy | Version | How it was run |
+|---|---|---|
+| Dante (`danted`) | 1.4.3 (Ubuntu 24.04 `dante-server`) | Docker, `ubuntu:24.04` plus the package |
+| 3proxy | 1.0.1 | Docker, `3proxy/3proxy` |
+| gost | 3.3.1 | Docker, `gogost/gost` |
+| Xray | 26.3.27 | Docker, `ghcr.io/xtls/xray-core`, `socks` inbound and `freedom` outbound |
+| sing-box | 1.14.3 | Docker, `ghcr.io/sagernet/sing-box`, `socks` inbound and `direct` outbound |
+| hev-socks5-server | 2.13.1 | Release binary for `linux-x86_64`, in an `alpine` container |
+| shadowsocks-rust | 1.25.0 | Docker, `sslocal` (SOCKS5, `-U`) in front of `ssserver` (`-U`), both on this host |
+
+Every container used `--network host`, so the proxies relayed to the fixtures on this host's
+loopback. Each was black-box tested: only its configuration and its own documentation were read,
+never its source (D-01).
+
+### What was run against each
+
+Each proxy got the same runs. The integration binaries from `make test` were pointed at the real
+proxy with `-p` instead of at `socks5d`, and the fixture echo and DNS servers stayed the
+destinations:
+
+- `test_matrix` (108 cells, IPv4 and IPv6), `test_fidelity`, `test_portswitch`, `test_lifecycle`,
+  `test_thread`, and `tests/test_realtools.sh` (`dig`, `nc -u`);
+- `test_resolve main` against `dnsd`, which counted 110 UDP queries arriving through the relay and
+  one TCP query through the proxy's `CONNECT`;
+- a size sweep of one datagram each of 0 to 65 497 bytes, with `max_datagram` at its default and at
+  65 507;
+- username/password authentication with each proxy that supports it (all but shadowsocks-rust's
+  `sslocal`): the right password passes the matrix, and a wrong password or no credentials
+  fails the send;
+- fail-closed: a steady sender at 10 datagrams a second, with the proxy container killed after 2 s.
+  Then the same with the proxy started again 3 s later (gost);
+- idle expiry (FR-P-08): a round-trip, 75 s of silence, then a round-trip on the same socket. Also
+  10 s of silence against a 4 s UDP timeout, where the proxy has a setting for one;
+- `dig @9.9.9.9` and `UDPCHAINS_DNS=9.9.9.9 getent ahosts example.org`, out to the internet
+  through the proxy.
+
+### Results
+
+| | Dante | 3proxy | gost | Xray | sing-box | hev | ss-rust |
+|---|---|---|---|---|---|---|---|
+| Matrix, 108 cells | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Lifecycle, threads, `dig`, `nc -u` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Fidelity | ✅ | zero-length ✗ | ✅ | zero-length ✗ | ✅ | zero-length ✗ | zero-length ✗ |
+| Port switch (TFTP pattern) | ✗ by default, ✅ with `udp.connectdst: no` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Largest payload delivered whole | ≥ 65 497 | 16 326 | 4 086 by default, ≥ 65 497 with `udpBufferSize=65535` | 8 182 | 16 122 | 1 490 | 65 000 |
+| Over `max_datagram`: `EMSGSIZE` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| IPv6 destination, `ATYP 0x04`, 22-byte header | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Resolver: UDP, and TCP fallback over `CONNECT` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Authentication: accepted / refused | ✅ / `EACCES` | ✅ / `ECONNRESET` | ✅ / `EACCES` | ✅ / `EACCES` | ✅ / `EACCES` | ✅ / `EACCES` | not tested |
+| Proxy killed: nothing arrives afterwards | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Idle 75 s | ✅ | ✅ | ✅ | ✅ | ✅ | ✅, re-associated | ✅ |
+| Idle 10 s against a 4 s UDP timeout | ✅, re-associated | — | — | ✅ | ✅, re-associated | ✅, re-associated | ✅ |
+| `dig @9.9.9.9`, `getent` through `9.9.9.9` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+Every ✗ is the proxy's own behaviour, and is explained below. The one udpchains defect the runs
+found is not specific to any proxy, and is described under *A killed proxy leaks nothing*.
+
+### What differs between proxies
+
+**Each proxy has its own largest datagram, and silently truncates anything bigger.** Each proxy
+reads the client's datagram into a fixed buffer. A datagram larger than that buffer is cut down to
+fit and forwarded, with no error to anyone. The receiver gets a shorter datagram, and the shim
+cannot detect it, because the cut happens after the datagram has left. The truncation was seen at
+the destination, not only in the echo:
+
+| Proxy | Largest IPv4 payload forwarded whole | Notes |
+|---|---|---|
+| hev-socks5-server | 1 490 | A 1 500-byte buffer, less the 10-byte header. 1 478 for an IPv6 destination |
+| gost, default | 4 086 | `udpBufferSize` defaults to 4 096. Set `udpBufferSize=65535` and nothing was cut |
+| Xray | 8 182 | 8 192 less the header, so the default `max_datagram` of 8 192 is 10 bytes too large |
+| sing-box | 16 122 back, 16 374 out | the return direction is the smaller |
+| 3proxy | 16 326 | |
+| Dante, gost (65 535), shadowsocks-rust | ≥ 65 000 | 65 497 also passed, except through shadowsocks-rust, where it got no reply. Its encrypted framing between `sslocal` and `ssserver` probably pushes that datagram past the 65 507 limit |
+
+**Set `max_datagram` no higher than the proxy's limit** (D-12). Then an oversized send fails with
+`EMSGSIZE` instead of arriving truncated. With the default 8 192, hev, gost at its default and Xray
+will truncate. This is what §3 warns about, and it is now measured.
+
+**Zero-length datagrams** (FR-F-06) are dropped by 3proxy, Xray, hev and shadowsocks-rust. The
+shim sends the 10-byte header-only datagram, and nothing reaches the destination. Dante, gost and
+sing-box forward it. A protocol that uses empty datagrams as keepalives will not work through the
+four that drop them.
+
+**Dante 1.4.3 is port-restricted by default.** Its debug log shows it `connect()`ing its outbound
+UDP socket to the first destination, so the kernel discards a reply from any other port, and the
+TFTP pattern fails exactly as the README's inbound-policy table predicts. With
+`udp.connectdst: no` in `sockd.conf`, the reply from the switched port is delivered and
+`test_portswitch` passes all 12 checks. The six other proxies accepted it by default.
+
+**3proxy closes the connection on an authentication failure,** rather than replying with a
+failure status, so a wrong password or a missing one fails the send with `ECONNRESET`, not
+`EACCES`. As §6.4 of DESIGN.md says, `ECONNRESET` is what a proxy closing mid-handshake gives. It
+also gives no diagnostic naming authentication as the cause.
+
+**Idle expiry differs, and both kinds work.** Dante (`timeout.io.udp`), hev (its default 60 s,
+or `udp-read-write-timeout`) and sing-box (`udp_timeout`) close the control connection when the
+association goes idle. The shim saw that before the next send and re-associated (FR-P-08). Xray
+(`policy.levels.0.connIdle`) and shadowsocks-rust (`--udp-timeout`) kept the association, and the
+send after the silence went straight through.
+
+**A killed proxy leaks nothing.** In all seven cases, every send after the kill failed and no
+datagram reached the destination. With gost started again, the same socket re-associated and
+carried traffic again.
+
+One finding is about udpchains itself, though it is not a leak: with the proxy down, sends fail
+with `ECONNRESET`, where §6.4 of DESIGN.md says the `errno` should be the connect's own
+(`ECONNREFUSED`). This happens with no proxy listening at all, so it is not specific to any proxy.
+It is recorded in [`REVIEW-BACKLOG.md`](REVIEW-BACKLOG.md).
+
+### What this does not show
+
+- **A proxy on another host.** Each relay was on this host's loopback, so §4b, D-16's `BND.ADDR`
+  substitution and the loopback guard were not exercised.
+- **A global IPv6 destination.** The `ATYP 0x04` runs were to `::1`, through each proxy's IPv6
+  loopback. This host has no global IPv6 address.
+- **Throughput.** No rate sweep (§2) was run against these proxies.
+
+### Configurations used
+
+Dante, `sockd.conf`. For the authenticated instance, `socksmethod: username`, with a system user
+added in the container:
+
+```
+logoutput: stderr
+internal: 127.0.0.1 port = 11080
+external: lo
+external: ens33
+external.rotation: route
+clientmethod: none
+socksmethod: none
+user.privileged: root
+user.unprivileged: nobody
+client pass {
+	from: 0/0
+	to: 0/0
+}
+socks pass {
+	from: 0/0
+	to: 0/0
+	command: bind connect udpassociate
+	log: error
+}
+socks pass {
+	from: 0/0
+	to: 0/0
+	command: udpreply
+	log: error
+}
+```
+
+Add `udp.connectdst: no` at the top for the port-switch case, or `timeout.io.udp: 4` for the
+idle case. Each rule keyword must be on its own line; Dante 1.4.3 rejects `log:` on the same line
+as `command:`.
+
+3proxy, `3proxy.cfg` (`auth strong`, `users alice:CL:<password>` and `allow alice` for the
+authenticated instance):
+
+```
+log
+auth none
+allow *
+socks -p11081 -i127.0.0.1
+```
+
+gost. UDP is off unless `udp=true` is given:
+
+```sh
+gost -L 'socks5://127.0.0.1:11082?udp=true&udpBufferSize=65535'
+gost -L 'socks5://alice:<password>@127.0.0.1:12082?udp=true&udpBufferSize=65535'
+```
+
+Xray. UDP is off unless `"udp": true` is set:
+
+```json
+{"inbounds": [{"listen": "127.0.0.1", "port": 11083, "protocol": "socks",
+   "settings": {"auth": "noauth", "udp": true, "ip": "127.0.0.1"}}],
+ "outbounds": [{"protocol": "freedom"}]}
+```
+
+For authentication, `"auth": "password", "accounts": [{"user": "alice", "pass": "<password>"}]`.
+
+sing-box. The `socks` inbound carries UDP with no extra setting:
+
+```json
+{"inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": 11084}],
+ "outbounds": [{"type": "direct"}]}
+```
+
+For authentication, `"users": [{"username": "alice", "password": "<password>"}]`.
+
+hev-socks5-server, `main.yml` (`auth: {username: alice, password: <password>}` for the
+authenticated instance):
+
+```yaml
+main:
+  workers: 4
+  port: 11085
+  listen-address: '127.0.0.1'
+misc:
+  log-level: warn
+```
+
+shadowsocks-rust. `-U` enables UDP on both ends:
+
+```sh
+ssserver -s 127.0.0.1:18388 -m aes-256-gcm -k <key> -U
+sslocal  -b 127.0.0.1:11086 -s 127.0.0.1:18388 -m aes-256-gcm -k <key> -U
+```
 
 ## Reporting a failure
 

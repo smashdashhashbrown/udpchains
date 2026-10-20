@@ -72,7 +72,7 @@ from a run rather than editing it by hand.
 |---|---|---|---|---|
 | FR-P-01 | M | §4.1 | TST-01, TST-04 | **Verified** |
 | FR-P-02 | M | §3.2, §4.1 | TST-06 | **Verified** — 8 open/associate/close cycles leak no control connections |
-| FR-P-03 | M | §4.3 | unit-socks5, TST-05 | **Verified** — all three ATYP forms, byte-level against RFC 1928 §7. An interop defect was found and fixed here (D-14): a v4-mapped IPv6 destination was emitted as ATYP 0x04 rather than ATYP 0x01, which a real proxy silently failed to deliver. Re-confirmed against the reference proxy on 2026-08-19 by two independent checks in one run — the logged ATYP byte and the 10-byte wire overhead, the latter being unforgeable by a mislabelled encoding. The 16-byte ATYP 0x04 form remains fixture-only. A second interop defect was found here on 2026-08-19 (D-16): a loopback `BND.ADDR` from a REMOTE proxy was taken literally, pointing the application socket at this host's loopback, so every datagram was silently discarded |
+| FR-P-03 | M | §4.3 | unit-socks5, TST-05 | **Verified** — all three ATYP forms, byte-level against RFC 1928 §7. An interop defect was found and fixed here (D-14): a v4-mapped IPv6 destination was emitted as ATYP 0x04 rather than ATYP 0x01, which a real proxy silently failed to deliver. Re-confirmed against the reference proxy on 2026-08-19 by two independent checks in one run — the logged ATYP byte and the 10-byte wire overhead, the latter being unforgeable by a mislabelled encoding. The 16-byte ATYP 0x04 form was sent to `::1` through seven real proxies on 2026-10-19 (INTEROP-CHECKLIST.md §12); a destination beyond loopback is still untested. A second interop defect was found here on 2026-08-19 (D-16): a loopback `BND.ADDR` from a REMOTE proxy was taken literally, pointing the application socket at this host's loopback, so every datagram was silently discarded |
 | FR-P-04 | M | §4.3, §5.2 | unit-socks5, faults | **Verified** — fixture injects `FRAG=1`; datagram is discarded, never delivered |
 | FR-P-05 | M | §4.1 | TST-05, TST-06 | **Verified** — `0.0.0.0:0` unless a concrete `bind()` |
 | FR-P-06 | M | §1, §4.1 | TST-07 | **Verified** — automatic: the app's fd is the only data socket. TST-07 confirms one association from an 8-way race |
@@ -212,5 +212,7 @@ correct, and the remaining items below are worth the same suspicion.
    proxy that binds a routable relay; the shim side is done.
 3. **A genuine IPv6 destination against a real proxy.** The v4-mapped half of D-14 was confirmed against
    the real proxy on 2026-08-19 (`ATYP 0x01`, 10-byte header, from an `AF_INET6` socket), but this
-   host has no global IPv6 address, so the 16-byte `ATYP 0x04` form is still exercised only against
-   the fixture — the same position D-14 was in before it was found.
+   host has no global IPv6 address. On 2026-10-19 the 16-byte `ATYP 0x04` form was sent to `::1`
+   through seven real proxies on this host, with a 22-byte header, and all seven delivered the
+   datagram and its reply ([`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) §12). What remains is a
+   destination beyond loopback.
