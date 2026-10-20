@@ -142,7 +142,7 @@ out below (FR-P-05, FR-P-06).
 | FR-P-07 | M | When the application supplies a hostname the shim SHALL forward it as `ATYP=0x03` for proxy-side resolution rather than resolving locally. Where only an address is available (the normal UDP case) `ATYP=0x01`/`0x04` SHALL be used. | unit |
 | FR-P-08 | S | If the proxy has expired an idle association, the next send SHALL transparently re-associate rather than failing. | integration |
 | FR-P-09 | S | SOCKS5 username/password authentication (RFC 1929) SHALL be supported when configured. | unit |
-| FR-P-10 | C | Multiple proxies in a chain, as proxychains offers. Not required for v1; UDP chaining is only meaningful hop-by-hop and the complexity is disproportionate. **Planned after 1.0.0:** draft requirements, design impact and estimate in [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md). | — |
+| FR-P-10 | C | Multiple proxies in a chain, as proxychains offers. Not required for v1; UDP chaining is only meaningful hop-by-hop and the complexity is disproportionate. **Planned after 0.1.0:** draft requirements, design impact and estimate in [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md). | — |
 
 ## 3. Functional requirements — Syscall fidelity
 
@@ -222,7 +222,7 @@ Documenting these prevents scope creep and sets user expectations honestly.
 | GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`) | Tier 3. Modern QUIC stacks use these; they will fall back or fail. |
 | QUIC performance | Even when functional, a UDP flow through a TCP-based tunnel inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery. |
 | TCP proxying | `proxychains-ng` already does this well. Composing the two is acceptable; reimplementing is not. |
-| Proxy chains (multi-hop UDP) | FR-P-10. Disproportionate complexity for v1. Not a permanent non-goal: planned after 1.0.0, see [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md). |
+| Proxy chains (multi-hop UDP) | FR-P-10. Disproportionate complexity for v1. Not a permanent non-goal: planned after 0.1.0, see [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md). |
 
 ## 9. Testing
 

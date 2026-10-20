@@ -45,7 +45,7 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-29](#d-29) | Datagram sockets the proxy cannot carry are refused | Review M7 |
 | [D-30](#d-30) | The fd-table generation counter is removed | Review M8 |
 | [D-31](#d-31) | A forked child lets go of the parent's control connections | Review M9 (ii) |
-| [D-32](#d-32) | Limitations accepted for 1.0, and documented | Review M1–M3, M9 (i) |
+| [D-32](#d-32) | Limitations accepted for 0.1.0, and documented | Review M1–M3, M9 (i) |
 | [D-33](#d-33) | Diagnostics: rate-limited, errors-only under `-q`, never into a reused fd 2 | Review L4, L5 |
 | [D-34](#d-34) | A forked child binds its private socket again | Review L6 |
 | [D-35](#d-35) | Hidden symbols and hardening; the proxy name uses its first address | Review L7 |
@@ -1269,7 +1269,7 @@ children exist. The cost is one `close` per live association on each `fork`.
 ---
 
 ## D-32
-### Limitations accepted for 1.0, and documented
+### Limitations accepted for 0.1.0, and documented
 
 **Date:** 2026-09-24 · **Status:** Accepted · Review items M1, M2, M3, and M9 part (i).
 

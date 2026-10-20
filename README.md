@@ -432,7 +432,7 @@ See [Compatible proxies](#compatible-proxies) for each proxy's figures.
 
 ### How far it has been tested against real proxies
 
-The automated suite runs against an in-repo proxy fixture. Against a real proxy, 1.0.0 has been
+The automated suite runs against an in-repo proxy fixture. Against a real proxy, 0.1.0 has been
 checked with the reference SOCKS5 proxy, running on the same host, with `nc -u`, TFTP, `dig`,
 `iperf` and `ntpdate`. It has also been checked against the seven proxies under
 [Compatible proxies](#compatible-proxies), each on the same host (see
@@ -447,7 +447,7 @@ welcome.
   **is** implemented — see above.
 - `proxychains.conf`-style `[ProxyList]` config. A `[ProxyList]` line produces a message pointing
   here rather than a generic parse error.
-- Proxy chains (multi-hop UDP). Planned after 1.0.0; the draft requirements are in
+- Proxy chains (multi-hop UDP). Planned after 0.1.0; the draft requirements are in
   [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md).
 - Loopback and multicast bypass. Deferred rather than dropped; see `DECISIONS.md` D-05.
 
@@ -562,7 +562,7 @@ memory (D-24).
 | [`docs/DESIGN.md`](docs/DESIGN.md) | how it is built |
 | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | every requirement mapped to design section and test |
 | [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | manual tests against a real proxy, and what each one proves |
-| [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) | multi-hop UDP chains: draft requirements for after 1.0.0 |
+| [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) | multi-hop UDP chains: draft requirements for after 0.1.0 |
 | [`CHANGELOG.md`](CHANGELOG.md) | what changed, and what is known not to work |
 | [`SECURITY.md`](SECURITY.md) | how to report a vulnerability |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to contribute, and the clean-room rule |

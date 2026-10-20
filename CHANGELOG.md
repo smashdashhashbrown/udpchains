@@ -9,7 +9,7 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) and mapped in
 [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
 
-## [1.0.0] — 2026-09-24
+## [0.1.0] — 2026-09-24
 
 First release.
 
@@ -199,4 +199,4 @@ Documented in full in the README's *Security considerations* and *What does not 
   the delta between the same binary run with and without the shim. Inside the 100 µs budget, and
   an upper bound since the proxy hop is not separable.
 
-[1.0.0]: https://github.com/smashdashhashbrown/udpchains/releases/tag/v1.0.0
+[0.1.0]: https://github.com/smashdashhashbrown/udpchains/releases/tag/v0.1.0

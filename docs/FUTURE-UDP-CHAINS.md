@@ -1,7 +1,7 @@
 # Future requirement — multi-hop UDP chains (FR-P-10)
 
-**Status:** deferred from v1. Planned for a release after 1.0.0. Nothing here is implemented.
-**Written:** 2026-10-19, against the 1.0.0 candidate (`aa30ddf`). Line counts and file references
+**Status:** deferred from v1. Planned for a release after 0.1.0. Nothing here is implemented.
+**Written:** 2026-10-19, against the 0.1.0 candidate (`aa30ddf`). Line counts and file references
 are as of that commit; recheck them before starting.
 
 This is FR-P-10 worked out far enough to start from: what the feature is, who it is for, draft
@@ -71,7 +71,7 @@ not done without it.
 
 | ID | Pri | Requirement | Verify |
 |---|---|---|---|
-| FR-CH-01 | M | The configuration SHALL accept an ordered list of proxies. A list of one SHALL behave exactly as 1.0.0 does: same wire bytes, same errors, same diagnostics. | integration |
+| FR-CH-01 | M | The configuration SHALL accept an ordered list of proxies. A list of one SHALL behave exactly as 0.1.0 does: same wire bytes, same errors, same diagnostics. | integration |
 | FR-CH-02 | M | **Strict chains only.** If any hop cannot be reached, negotiated or associated, the call SHALL fail with an `errno`. There SHALL be no mode that skips a dead hop (proxychains' `dynamic_chain`, `random_chain`): it silently changes the path (D-05). | integration |
 | FR-CH-03 | M | Hop k (k ≥ 2) SHALL be reached by SOCKS5 `CONNECT` through hops 1 to k-1, and negotiated inside that tunnel, each hop with its own credentials. Credentials SHALL NOT be accepted on the command line (SEC-03), and the wrapper SHALL pass on where each password is, never the password (D-25). | integration |
 | FR-CH-04 | M | The address of hop k (k ≥ 2) SHALL be sent to hop k-1 as given, a name as `ATYP 0x03`, and SHALL NOT be resolved on this host. A local lookup leaks which proxies are in use, and an internal name may resolve only inside the remote network. | integration |
@@ -126,13 +126,13 @@ locally), D-31 (fork), and FR-P-05 (declared address; for hops 2 to n it is alwa
 - **Tests:** about as much again: unit tests for the codec, fixup and configuration; the existing
   integration tests run through fixture chains; fault and leak scenarios; interop chains.
 - **Documents:** the five decision records, a DESIGN.md section, README, man page, TRACEABILITY.
-- **Time:** about two to three focused weeks, to the 1.0.0 standard: a failing test for each
+- **Time:** about two to three focused weeks, to the 0.1.0 standard: a failing test for each
   change, the sanitisers, interop.
 
 ## 7. Suggested order
 
 1. The decision records. Move §4 into the requirements document.
-2. Configuration and its handoff to the shim, where a chain of one is exactly 1.0.0, with the
+2. Configuration and its handoff to the shim, where a chain of one is exactly 0.1.0, with the
    whole suite green. A safe point to stop.
 3. Chain setup in `socks5.c`, unit-tested against chained fixtures.
 4. The n-layer codec in `core.c` and the association lifecycle. Then the matrix through two hops.

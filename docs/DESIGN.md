@@ -5,7 +5,7 @@ the choices behind this design and their rationale live in [`DECISIONS.md`](../D
 Requirement IDs are cited inline so [`TRACEABILITY.md`](TRACEABILITY.md) can map each one to a section
 here.
 
-**Status:** as built in 1.0.0. Where the first draft changed, the decision record that changed it is
+**Status:** as built in 0.1.0. Where the first draft changed, the decision record that changed it is
 cited.
 
 ---

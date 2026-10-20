@@ -1,4 +1,4 @@
-# Release review backlog — `udpchains` 1.0.0
+# Release review backlog — `udpchains` 0.1.0
 
 Open findings from the pre-release review of 2026-09-23, on branch `release_1.0.0_review`. Each item
 keeps the ID it was given in the review so discussions and commits can refer to it.
@@ -36,7 +36,7 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
   blocks. (da42f4e, with D-26)
 - [x] **M1–M3, M9 (i)** — `strict_loopback` checked only at setup; `MSG_MORE`/`UDP_CORK`/GSO/GRO
   corrupt data; the first send blocks during the handshake; a socket shared with another process
-  is re-pointed. Accepted for 1.0 and documented in the README. (dba3c76, D-32)
+  is re-pointed. Accepted for 0.1.0 and documented in the README. (dba3c76, D-32)
 - [x] **M4** — the shim re-read the default config files. (dba3c76, D-27)
 - [x] **M5** — the wrapper exported the proxy's hostname, not its address. (dba3c76, D-27)
 - [x] **M6** — the setuid check and the exec could look at different files. (dba3c76, D-28)
@@ -59,9 +59,9 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
   cannot bind. (8eb4c80, D-34)
 - [x] **L7** — only hooks are exported, and the library is hardened; first-address-only is
   documented, not fixed. (8eb4c80, D-35)
-- [x] **D1** — release setup: the CHANGELOG is one 1.0.0 entry, `SECURITY.md` (GitHub private
+- [x] **D1** — release setup: the CHANGELOG is one 0.1.0 entry, `SECURITY.md` (GitHub private
   vulnerability reporting) and `CONTRIBUTING.md` (the D-01 statement) exist. CI was declined for
-  1.0.0. (749b973)
+  0.1.0. (749b973)
 - [x] **D2** — the interop claim is narrowed to the one co-located proxy tested, and what is
   untested is listed; the testing itself is under *Verification still owed*. (749b973)
 - [x] **D3** — security considerations in the README and man page. (749b973)
@@ -70,7 +70,7 @@ Tick an item when its fix is committed, and cite the commit, for example `(a7ec5
 - [x] **D5** — DESIGN.md, the decision index and the man page's limitations match the code.
   (749b973)
 - [x] **D6** — traceability totals regenerated from a run; D-21 traced. (749b973)
-- [x] **D7** — the overclaims removed with the 1.0.0 CHANGELOG rewrite. (749b973)
+- [x] **D7** — the overclaims removed with the 0.1.0 CHANGELOG rewrite. (749b973)
 
 ## Critical
 

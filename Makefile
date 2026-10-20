@@ -10,7 +10,7 @@ BINDIR  ?= $(PREFIX)/bin
 LIBDIR  ?= $(PREFIX)/lib
 MANDIR  ?= $(PREFIX)/share/man/man1
 
-VERSION := 1.0.0
+VERSION := 0.1.0
 
 WARNINGS := -Wall -Wextra -Werror \
             -Wshadow -Wpointer-arith -Wcast-qual -Wstrict-prototypes \
