@@ -1,7 +1,7 @@
 # udpchains
 
-An `LD_PRELOAD` shim that routes a dynamically-linked program's **UDP** traffic through a SOCKS5
-proxy supporting `UDP ASSOCIATE` — transparently, without modifying or recompiling the program.
+Routes a dynamically linked program's **UDP** through a SOCKS5 proxy that supports
+`UDP ASSOCIATE`, using `LD_PRELOAD`. The program is not modified or recompiled.
 
 ```
 udpchains -p 127.0.0.1:1080 dig @9.9.9.9 example.com
@@ -9,31 +9,21 @@ udpchains -p 127.0.0.1:1080 dig @9.9.9.9 example.com
 
 ## Why
 
-`proxychains` is the standard tool for forcing an unmodified program through a proxy, and it is
-**TCP-only**. Programs that use UDP get no proxying — and, critically, no error either: the traffic
-silently goes direct. Any workflow that assumes "I ran it under proxychains, therefore it went
-through the proxy" is wrong for UDP.
+`proxychains` proxies TCP only. Under it, a program's UDP is sent directly, with no error.
 
-`udpchains` carries UDP, and **fails closed**: if a datagram cannot be proxied, the call fails with
-an appropriate `errno`. It never falls back to sending directly. There is a test for exactly this —
-with the proxy stopped, zero packets reach the destination by any of the send paths it exercises.
-A few routes the shim cannot see are listed under
-[Traffic it deliberately refuses](#traffic-it-deliberately-refuses).
+`udpchains` proxies UDP and **fails closed**: a datagram that cannot be proxied fails with an
+`errno`, and is never sent directly. A test checks that, with the proxy stopped, no packet
+reaches the destination by any send path it covers. The routes the shim cannot see are listed
+under [Traffic that bypasses the shim](#traffic-that-bypasses-the-shim).
 
 ## Build and install
 
-No dependencies beyond a C compiler. Linux, glibc ≥ 2.34.
+Linux, glibc 2.34 or later, a C compiler. No other dependencies.
 
 ```sh
 make
 sudo make install          # bin/udpchains, lib/libudpchains.so, man1/udpchains.1
-man udpchains
-```
-
-Run the suite:
-
-```sh
-make test                  # unit + integration, against an in-repo fixture proxy
+make test                  # unit and integration tests, against an in-repo fixture proxy
 tests/run_sanitizers.sh    # ASan/UBSan, TSan, Valgrind, Helgrind
 ```
 
@@ -44,538 +34,364 @@ udpchains [options] <program> [args...]
 
   -f <file>    config file
   -p <addr>    proxy as host:port or [v6]:port
-  -q           quiet: errors only
-  -v           verbose: protocol steps (never payload)
+  -q           errors only
+  -v           protocol steps (never payload)
 ```
 
-Configuration is read from, in precedence order: command line, environment, config file. **There is
-no built-in default proxy** — if none is configured, `udpchains` prints a diagnostic and refuses to
-run the program rather than running it unproxied.
-
-**Set a DNS resolver too, if the program looks up names.** Name lookups go through the proxy to the
-resolver named by `dns` (`UDPCHAINS_DNS`), and there is no default. Without one, the program still
-runs, but any lookup that needs DNS fails. See [Name resolution](#name-resolution).
+- Precedence: command line, then environment, then config file.
+- **There is no default proxy.** Without one, `udpchains` refuses to run the program.
+- **There is no default DNS resolver.** Without `dns`, the program runs, but lookups that need
+  DNS fail. See [Name resolution](#name-resolution).
 
 ```sh
-udpchains -p 127.0.0.1:1080 dig @9.9.9.9 example.com              # no dns needed: dig asks 9.9.9.9 itself
+udpchains -p 127.0.0.1:1080 dig @9.9.9.9 example.com              # dig queries 9.9.9.9 itself
 UDPCHAINS_DNS=9.9.9.9 udpchains -p 127.0.0.1:1080 nc -u example.com 53
 ```
 
-| Environment | Meaning |
-|---|---|
-| `UDPCHAINS_PROXY` | `host:port` of the SOCKS5 proxy |
-| `UDPCHAINS_CONFIG` | config file path |
-| `UDPCHAINS_MAX_DATAGRAM` | maximum payload, default 8192 |
-| `UDPCHAINS_STRICT_LOOPBACK` | make the loopback warning below an error |
-| `UDPCHAINS_CONNECT_TIMEOUT` | proxy timeout in ms, default 5000, applied to each handshake step |
-| `UDPCHAINS_USERNAME`, `UDPCHAINS_PASSWORD_FILE` | credentials (see below) |
-| `UDPCHAINS_PASSWORD` | the password itself; inherited by everything the program starts, so prefer the file |
-| `UDPCHAINS_DNS` | resolver for name lookups, as a numeric `ip[:port]` — see [Name resolution](#name-resolution) |
-| `UDPCHAINS_DNS_TIMEOUT` | whole-lookup timeout in ms, default 5000 |
-| `UDPCHAINS_DNS_SEARCH` | search domains for single-label names; none by default |
-| `UDPCHAINS_HOSTS_FILE` | hosts file consulted before DNS, default `/etc/hosts` |
-| `UDPCHAINS_QUIET`, `UDPCHAINS_DEBUG` | as `-q` and `-v`; take a boolean (`1`/`0`, `yes`/`no`, `true`/`false`, `on`/`off`) |
-| `UDPCHAINS_LIB` | path to `libudpchains.so`, if not the installed one |
+### Configuration
 
-`udpchains` also sets `UDPCHAINS_RESOLVED` and `UDPCHAINS_PASSWORD_CONFIG` for the program it runs,
-to pass on what it resolved (D-25, D-27). They are not meant to be set by hand.
-
-Config file: the first of `-f <file>`, `UDPCHAINS_CONFIG`, `~/.udpchains.conf` and
-`/etc/udpchains.conf` that exists. Only that one file is read.
+The config file is the first of these that exists: `-f <file>`, `UDPCHAINS_CONFIG`,
+`~/.udpchains.conf`, `/etc/udpchains.conf`. Only that file is read.
 
 ```ini
-# ~/.udpchains.conf
 proxy = 127.0.0.1:1080
 dns = 9.9.9.9
-max_datagram = 8192
-strict_loopback = no
 ```
 
-| Key | Meaning | Default |
-|---|---|---|
-| `proxy` | `host:port` or `[v6]:port` of the SOCKS5 proxy | none — required |
-| `max_datagram` | largest payload, 1–65507 bytes | 8192 |
-| `strict_loopback` | make the loopback warning an error | `no` |
-| `connect_timeout` | ms, 1–600000, for each step of the proxy handshake | 5000 |
-| `dns` | resolver as numeric `ip[:port]`, queried through the proxy | none — lookups needing DNS fail |
-| `dns_timeout` | ms, 100–600000, for a whole lookup | 5000 |
-| `dns_search` | search domains for single-label names, space- or comma-separated | none |
-| `hosts_file` | hosts file consulted before DNS | `/etc/hosts` |
-| `username` | RFC 1929 username | none |
-| `password_file` | file holding the password; a relative path is relative to the current directory | none |
-| `password` | the password inline; the file then must not be readable by others | none |
-| `quiet`, `debug` | as `-q` and `-v` | `no` |
+| Key | Environment | Meaning | Default |
+|---|---|---|---|
+| `proxy` | `UDPCHAINS_PROXY` | SOCKS5 proxy, `host:port` or `[v6]:port` | none; required |
+| `dns` | `UDPCHAINS_DNS` | resolver, numeric `ip[:port]`, queried through the proxy | none |
+| `max_datagram` | `UDPCHAINS_MAX_DATAGRAM` | largest payload, 1–65507 bytes | 8192 |
+| `connect_timeout` | `UDPCHAINS_CONNECT_TIMEOUT` | ms per proxy handshake step, 1–600000 | 5000 |
+| `dns_timeout` | `UDPCHAINS_DNS_TIMEOUT` | ms per lookup, 100–600000 | 5000 |
+| `dns_search` | `UDPCHAINS_DNS_SEARCH` | search domains for single-label names, space- or comma-separated | none |
+| `hosts_file` | `UDPCHAINS_HOSTS_FILE` | hosts file read before DNS | `/etc/hosts` |
+| `strict_loopback` | `UDPCHAINS_STRICT_LOOPBACK` | make the loopback warning an error | `no` |
+| `username` | `UDPCHAINS_USERNAME` | RFC 1929 username | none |
+| `password_file` | `UDPCHAINS_PASSWORD_FILE` | file holding the password; relative to the current directory | none |
+| `password` | `UDPCHAINS_PASSWORD` | the password itself (see below) | none |
+| `quiet`, `debug` | `UDPCHAINS_QUIET`, `UDPCHAINS_DEBUG` | as `-q` and `-v` | `no` |
+| — | `UDPCHAINS_CONFIG` | config file path | — |
+| — | `UDPCHAINS_LIB` | path to `libudpchains.so`, if not the installed one | — |
 
-Booleans take `1`/`0`, `yes`/`no`, `true`/`false` or `on`/`off`. **Comments are whole lines only,**
-starting with `#` or `;`. A `#` after a value (`proxy = 10.0.0.1:1080 # office`) is an error rather
-than being read as part of the value; a `#` inside a value (`abc#def`) is kept. A password that
-really contains " #" belongs in `password_file`. An unknown key is an error.
+- Booleans: `1`/`0`, `yes`/`no`, `true`/`false`, `on`/`off`.
+- Comments are whole lines starting with `#` or `;`. A `#` after a value
+  (`proxy = 10.0.0.1:1080 # office`) is an error. A `#` inside a value (`abc#def`) is kept, so
+  put a password containing ` #` in `password_file`.
+- An unknown key is an error.
+- `udpchains` sets `UDPCHAINS_RESOLVED` and `UDPCHAINS_PASSWORD_CONFIG` for the program it runs.
+  Do not set them by hand.
 
-Credentials are never accepted on the command line, because `argv` is visible in `ps`. Use a file or
-the environment:
+### Authentication
 
-```sh
-UDPCHAINS_USERNAME=alice UDPCHAINS_PASSWORD_FILE=~/.udpchains.pw \
-    udpchains -p proxy.example:1080 dig @9.9.9.9 example.com
-```
+RFC 1929 username/password is supported.
 
-The password itself never enters the environment of the program you run, or of anything it
-starts: `udpchains` passes on *where* the password is — the password file, or the config file that
-holds `password =` — and the shim reads it from there (D-25). The one exception is a password you
-put in `UDPCHAINS_PASSWORD` yourself, which is inherited as you set it. Prefer a file.
+- Credentials are not accepted on the command line, which `ps` shows. Use a file or the
+  environment:
 
-RFC 1929 username/password authentication is supported. Method `0x02` is offered **only** when
-credentials are configured, so a proxy that accepts either is not pushed into an authenticated
-exchange you did not ask for. If authentication fails, the send fails — there is no fallback to an
-unauthenticated or direct send.
+  ```sh
+  UDPCHAINS_USERNAME=alice UDPCHAINS_PASSWORD_FILE=~/.udpchains.pw \
+      udpchains -p proxy.example:1080 dig @9.9.9.9 example.com
+  ```
+
+- The password is not put in the program's environment. `udpchains` passes on where it is (the
+  password file, or the config file), and the shim reads it there. A password set in
+  `UDPCHAINS_PASSWORD` is inherited by everything the program starts; prefer a file.
+- A config file containing `password =` must not be readable by others.
+- Username/password is offered to the proxy only when credentials are configured.
+- If authentication fails, the send fails. There is no unauthenticated or direct fallback.
 
 ## Compatible proxies
 
-`udpchains` needs a SOCKS5 proxy that implements `UDP ASSOCIATE`; many SOCKS5 servers implement
-only `CONNECT`. These open-source proxies have been tested with it, each on the same host as the
-client. The tests covered the full hook matrix, IPv6 destinations, name resolution including the
-TCP fallback over `CONNECT`, authentication, idle expiry, and the proxy dying mid-stream. None of
-them exposed a udpchains defect specific to that proxy. The runs did find one general `errno`
-bug, which is fixed.
+The proxy must implement `UDP ASSOCIATE`; many SOCKS5 servers implement only `CONNECT`. Each proxy
+below was tested on the same host as the client, covering the full call matrix, IPv6
+destinations, name resolution with its TCP fallback, authentication, idle expiry, and the proxy
+dying mid-stream. No proxy-specific udpchains defect was found.
 
-| Proxy | Version tested | Licence | UDP setup | Largest datagram it carries | Notes |
+| Proxy | Version | Licence | UDP setup | Largest datagram | Notes |
 |---|---|---|---|---|---|
-| [Dante](https://www.inet.no/dante/) | 1.4.3 | BSD-style | `udpassociate` and `udpreply` in `socks pass` rules | ≥ 65 497 | Port-restricted unless `udp.connectdst: no` is set |
+| [Dante](https://www.inet.no/dante/) | 1.4.3 | BSD-style | `udpassociate` and `udpreply` in `socks pass` rules | ≥ 65 497 | Port-restricted unless `udp.connectdst: no` |
 | [3proxy](https://github.com/3proxy/3proxy) | 1.0.1 | BSD-style | On in the `socks` service | 16 326 | Drops zero-length datagrams; a refused login gives `ECONNRESET` |
-| [gost](https://github.com/go-gost/gost) | 3.3.1 | MIT | `?udp=true` on the listener | 4 086 by default; ≥ 65 497 with `udpBufferSize=65535` | Raise `udpBufferSize` |
+| [gost](https://github.com/go-gost/gost) | 3.3.1 | MIT | `?udp=true` on the listener | 4 086; ≥ 65 497 with `udpBufferSize=65535` | |
 | [Xray](https://github.com/XTLS/Xray-core) | 26.3.27 | MPL-2.0 | `"udp": true` on the `socks` inbound | 8 182 | Drops zero-length datagrams |
 | [sing-box](https://github.com/SagerNet/sing-box) | 1.14.3 | GPL-3.0 | On by default on the `socks` inbound | 16 122 | |
 | [hev-socks5-server](https://github.com/heiher/hev-socks5-server) | 2.13.1 | MIT | On by default | 1 490 | Drops zero-length datagrams |
-| [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) `sslocal` | 1.25.0 | MIT | `-U` on `sslocal` and on its `ssserver` | ≥ 65 000 | Drops zero-length datagrams; authentication not tested |
+| [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) `sslocal` | 1.25.0 | MIT | `-U` on `sslocal` and `ssserver` | ≥ 65 000 | Drops zero-length datagrams; authentication not tested |
 
-Plus the reference proxy used during development. The datagram figures are payload bytes for an
-IPv4 destination. For an IPv6 destination the SOCKS header is 12 bytes longer, so the limit is
-12 bytes lower.
-
-**Set `max_datagram` no higher than your proxy's limit.** A proxy reads each datagram into a fixed
-buffer and silently truncates one that does not fit, so the program receives a shorter datagram
-and nothing reports an error. Three proxies above have a limit below the default of 8192: hev,
-gost at its default, and Xray. With `max_datagram` at or below the limit, an oversized send fails
-with `EMSGSIZE` instead.
-
-The configurations used, and the full results, are in
-[`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12. `make interop` repeats the runs; it
-needs Docker, and checks each proxy's behaviour against this table. They were tested as black boxes:
-running a GPL-licensed proxy is fine, but reading its source while working on udpchains is not (see
-[`CONTRIBUTING.md`](CONTRIBUTING.md)).
+- Also tested: the reference proxy used during development.
+- Datagram limits are payload bytes to an IPv4 destination. To IPv6 they are 12 bytes lower.
+- **Set `max_datagram` no higher than the proxy's limit.** A proxy silently truncates a datagram
+  larger than its buffer. With `max_datagram` at or below the limit, an oversized send fails with
+  `EMSGSIZE` instead. hev, gost at its default, and Xray are below the default of 8192.
+- Configurations and full results: [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12.
+  `make interop` repeats the runs (needs Docker). Proxies are tested as black boxes; do not read
+  GPL source while working on udpchains ([`CONTRIBUTING.md`](CONTRIBUTING.md)).
 
 ## Name resolution
 
-`udpchains` resolves names itself, through the proxy. glibc's own resolver cannot be intercepted —
-since glibc 2.34 it makes its socket calls through internal functions no preload can see — so a
-program resolving a name through `getaddrinfo`, `gethostbyname`, `getnameinfo` or `res_query` would
-otherwise send that lookup straight to the host's resolver, however carefully every datagram was
-proxied. The shim answers these calls before glibc's resolver runs (D-22):
+glibc's resolver cannot be intercepted, so the shim answers `getaddrinfo`, `gethostbyname`,
+`getnameinfo` and `res_query` itself, in this order:
 
-1. a numeric address answers itself;
-2. `localhost` and `*.localhost` are loopback;
-3. the hosts file (`/etc/hosts`);
-4. a DNS query to the resolver named by `dns`, **sent through the proxy** — over UDP, and repeated
-   over TCP with SOCKS5 `CONNECT` if the answer is too large for a datagram.
+1. a numeric address;
+2. `localhost` and `*.localhost` (loopback);
+3. the hosts file;
+4. a DNS query to the `dns` resolver, **through the proxy**: over UDP, then over TCP with SOCKS5
+   `CONNECT` if the answer is truncated.
 
-**Configure a resolver.** There is no default, for the same reason there is no default proxy: the
-tool does not choose where your traffic goes. Without `dns`, any lookup that needs DNS fails with
-`EAI_FAIL` and one diagnostic. Numeric addresses and the hosts file still work.
-
-```sh
-udpchains -p proxy.example:1080 ...        # with dns = 9.9.9.9 in the config file, or
-UDPCHAINS_DNS=9.9.9.9 udpchains -p ...     # in the environment
-```
-
-The resolver must be given as a numeric address; a name would need resolving first. It sees
-queries arriving from the proxy, not from this host. If the proxy is unreachable, or the resolver
-does not answer, lookups fail with `EAI_AGAIN` — they are never retried directly.
-
-**Search domains are not applied** unless you ask: `/etc/resolv.conf` is not read at all. Its
-`search` line usually names a local domain (`localdomain`, a corporate suffix) that means nothing to
-a remote resolver, and appending it sends internal names there. Set `dns_search = example.com` to
-have single-label names tried with those suffixes.
-
-What this changes, compared with running unproxied:
-
-- **Only `files` and DNS.** The other sources on your `hosts:` line in `/etc/nsswitch.conf` —
-  mDNS (`.local` names), `systemd-resolved`, `myhostname` — are skipped, because each resolves
-  through a local daemon the shim cannot proxy. Your own hostname resolves only if it is in
-  `/etc/hosts`.
-- **Address order** is simpler than glibc's RFC 6724 sort: IPv6 first only when this host has a
-  usable IPv6 address.
-- **Not supported, and refused rather than resolved directly:** non-ASCII names (`AI_IDN`) fail with
-  `EAI_IDN_ENCODE`, and `getaddrinfo_a` fails with `EAI_SYSTEM`.
-- **Programs with their own resolver** — `dig`, `host`, curl built with c-ares, Node — do not use
-  these calls. Their queries are ordinary UDP to the nameserver in `/etc/resolv.conf`, which the
-  shim proxies like any other datagram; on a `systemd-resolved` host that is `127.0.0.53`, which is
-  resolved *at the proxy host* (see the loopback caveat below). Give such tools a resolver address
-  explicitly (`dig @9.9.9.9 ...`).
+- `dns` has no default. Without it, lookups that need DNS fail with `EAI_FAIL`. Numeric addresses
+  and the hosts file still work.
+- `dns` must be a numeric address. The resolver sees queries from the proxy, not this host.
+- If the proxy or resolver does not answer, lookups fail with `EAI_AGAIN`. They are not retried
+  directly.
+- `/etc/resolv.conf` is not read, so its search domains are not applied. Set `dns_search` to apply
+  some.
+- Only the hosts file and DNS are used. Other `hosts:` sources in `/etc/nsswitch.conf`, such as mDNS
+  (`.local`), `systemd-resolved` and `myhostname`, are skipped. The local hostname resolves only if
+  it is in `/etc/hosts`.
+- Address order: IPv6 first only when this host has a usable IPv6 address (simpler than glibc's
+  RFC 6724 sort).
+- Refused: non-ASCII names (`AI_IDN`, `EAI_IDN_ENCODE`) and `getaddrinfo_a` (`EAI_SYSTEM`).
+- Programs with their own resolver (`dig`, `host`, curl built with c-ares, Node) send ordinary
+  UDP to the nameserver in `/etc/resolv.conf`, which is proxied. Their TCP fallback is not. On a
+  `systemd-resolved` host that nameserver is `127.0.0.53`, which is resolved at the proxy host;
+  give such tools a resolver explicitly (`dig @9.9.9.9`).
 
 ## Security considerations
 
-`udpchains` keeps a program's UDP from bypassing the proxy. It does not make the path to the proxy
-private.
+`udpchains` keeps UDP from bypassing the proxy. It does not protect the path to the proxy.
 
-- **Credentials cross the network in cleartext.** RFC 1929 sends the username and password
-  unencrypted, so anyone on the path to a remote proxy can read them. Reach a remote proxy over a
-  VPN you trust, such as WireGuard, or use a proxy on this host. An SSH port forward is not enough:
-  it carries the TCP control connection, but not the UDP relay traffic.
-- **Datagrams to and from the proxy's relay are neither authenticated nor encrypted.** SOCKS5 has
-  no way to protect them. Anyone on that path can read them. Anyone who can send a packet that
-  appears to come from the relay's address can inject a datagram claiming any source, and the shim
-  reports that source to the program as the sender. Only the program's own protocol (DNSSEC, QUIC,
-  DTLS) protects against that.
-- **The proxy sees everything,** including every name looked up through `dns`. Use one you trust.
-- **UDP servers do not work through it.** A server's socket is pointed at the proxy's relay, so it
-  no longer receives datagrams sent to this host. Its clients cannot use the relay instead: its
-  address is known only to `udpchains`, and most proxies accept inbound datagrams only from hosts
-  the program has already sent to. This fails closed — nothing arrives directly either — but a
-  server that only receives looks healthy while receiving nothing.
-- **A few routes bypass the shim:** raw sockets, `io_uring`, `sendfile`/`splice`, stdio on a UDP
-  socket, and sockets taken from another process with `pidfd_getfd`. See below.
+- **Credentials are sent in cleartext** (RFC 1929). For a remote proxy, use a trusted VPN such as
+  WireGuard, or a proxy on this host. An SSH port forward carries the TCP control connection but
+  not the UDP relay traffic.
+- **Relay datagrams are neither encrypted nor authenticated.** Anyone on the path can read them. A
+  spoofed packet from the relay's address can claim any source, and the program is told that
+  source. Only the program's own protocol (DNSSEC, QUIC, DTLS) protects against this.
+- **The proxy sees all traffic,** including every name looked up through `dns`.
+- **UDP servers do not work.** The server's socket is pointed at the relay, so it receives nothing
+  sent to this host. Nothing arrives directly either, but a receive-only server looks healthy.
+- **Some routes bypass the shim.** See [below](#traffic-that-bypasses-the-shim).
 
 To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## What does not work
 
-This section is the honest part. Read it before deciding whether this tool suits your problem.
+### Programs it cannot help
 
-### Programs it cannot help at all
-
-| | Why |
+| Program | Reason |
 |---|---|
-| **Statically-linked binaries** | No libc to interpose on. Unfixable by this approach. A supervisor mode that does not use `LD_PRELOAD` is planned after 0.1.0 ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)). |
-| **Go binaries** | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. Planned with static binaries. |
-| **setuid/setgid binaries** | The loader ignores `LD_PRELOAD` for them. `udpchains` detects this and **refuses to run them** rather than running them unproxied. Binaries with file capabilities are refused for the same reason. |
-| **Programs sending through `syscall()` directly** | Same reason. Only interception at the system-call boundary can see them; planned with static binaries. (Creating, duplicating and closing descriptors through `syscall()` *is* tracked, which is how libuv closes them; sends and receives through it are not.) |
-| **`ping`, and other non-UDP datagram sockets** | An unprivileged `ping` uses an ICMP datagram socket, which SOCKS5 cannot carry. `udpchains` refuses to create one (`EPROTONOSUPPORT`, with a diagnostic) rather than send it directly or wrap it as UDP (D-29). UDP-Lite is refused the same way. |
-| **Programs using raw sockets** | `SOCK_RAW` is not intercepted, and SOCKS5 has no way to carry a raw IP packet. Such traffic goes **direct** — see the warning below. `nmap`, `traceroute` and similar tools are in this category. |
+| Statically linked binaries | No libc to interpose on. Planned after 0.1.0 as a supervisor mode ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)). |
+| Go binaries | Go makes system calls directly, not through libc. Planned with static binaries. |
+| Programs sending through `syscall()` | Same reason. Planned with static binaries. Creating, duplicating and closing descriptors through `syscall()` is tracked; sends and receives are not. |
+| setuid, setgid and file-capability binaries | The loader ignores `LD_PRELOAD` for them. `udpchains` refuses to run them. |
+| `ping` (ICMP datagram sockets), UDP-Lite | SOCKS5 cannot carry them. Socket creation fails with `EPROTONOSUPPORT`. |
+| Raw sockets (`nmap`, `traceroute`) | Not intercepted; traffic is sent **directly**. See below. |
 
-### Traffic it deliberately refuses
+### Traffic that bypasses the shim
 
-**There is no bypass in v1.** Every intercepted datagram is either proxied or fails. That is what
-makes the leak test meaningful — a bypass rule set would need its own list of expected direct
-traffic, and that list is exactly where a leak hides.
+Every intercepted datagram is proxied or fails; there is no bypass list. These are not
+intercepted:
 
-> **Exceptions, and they are real ones.** The first is **raw sockets.** The shim intercepts
-> `SOCK_DGRAM` in `AF_INET`/`AF_INET6` and nothing else. A program that opens a `SOCK_RAW` socket gets unproxied
-> network access, with no diagnostic and nothing in the logs — the shim never sees it. SOCKS5 cannot
-> express a raw IP packet, so there is no honest way to proxy it, but "cannot proxy" should mean
-> "refuse", and today it means "pass through". Raw sockets need `CAP_NET_RAW`, so this is not
-> reachable by an ordinary unprivileged program — but if you are relying on this tool to guarantee
-> that a **privileged** process cannot reach the network directly, it does not. Deferred rather than
-> dropped; refusing raw socket creation the way multicast and broadcast sends already fail is the
-> obvious v2 change.
->
-> The others are routes by which a program can send on a UDP socket without calling any function
-> the shim interposes on. On a socket not yet used through the shim, each sends **directly**, with
-> no diagnostic; on one already pointed at the relay, the data arrives there without a header and
-> is lost (D-21):
->
-> - **`io_uring`.** Sends submitted through an `io_uring` ring go straight to the kernel. Event
->   loops increasingly use it.
-> - **`sendfile` and `splice`** onto a UDP socket.
-> - **stdio on a UDP socket** (`fdopen`, then `fwrite`): glibc writes through internal calls.
->   Reading that way (`fread`) returns the SOCKS header as data.
-> - **`pidfd_getfd`**, which copies a socket out of another process. The copy is never tracked,
->   so even ordinary sends on it go directly.
->
-> None of these needs root (`pidfd_getfd` needs permission to trace the other process). They are
-> unusual for UDP, but if you rely on this tool to guarantee that a program cannot reach the
-> network directly, check that it uses none of them.
+- **Raw sockets** (`SOCK_RAW`). Sent directly, with no diagnostic. Requires `CAP_NET_RAW`, so
+  unprivileged programs cannot do this, but a privileged process can reach the network directly.
+- **`io_uring`**, **`sendfile`/`splice`** onto a UDP socket, and **stdio** on a UDP socket
+  (`fdopen` then `fwrite`). On a socket not yet used through the shim, these send directly. On one
+  already pointed at the relay, the data arrives without a header and is lost. `fread` on such a
+  socket returns the SOCKS header as data.
+- **Sockets copied from another process with `pidfd_getfd`.** Not tracked; every send goes
+  directly.
 
-Consequences you will actually notice:
+None of these needs root (`pidfd_getfd` needs permission to trace the other process).
 
-- **Local UDP services break or reach the wrong host.** `127.0.0.1` in a SOCKS5 request is resolved
-  *at the proxy*, so a datagram addressed to a local daemon is delivered to the **proxy host's**
-  loopback. With a proxy on the same machine this works and looks correct; with a remote proxy it
-  fails, or worse, succeeds against a different machine's daemon. `udpchains` warns when it sees a
-  loopback destination and the proxy is not local; `strict_loopback` turns that warning into an
-  error. Affected: statsd/DogStatsD on 8125, syslog over UDP, a local `chrony`, and
-  `systemd-resolved` at `127.0.0.53`.
+### Refused or limited traffic
 
-- **Service discovery hard-fails.** mDNS (5353), SSDP (1900), LLMNR, DHCP broadcast, NetBIOS. SOCKS5
-  cannot express a multicast or broadcast destination, so these fail with `ENETUNREACH` and a
-  diagnostic naming the reason. Note that `setsockopt(SO_BROADCAST)` and `IP_ADD_MEMBERSHIP` still
-  *succeed* — those are not hooked — and the subsequent send is what fails.
+- **Loopback destinations are resolved at the proxy host.** A datagram to `127.0.0.1` reaches the
+  proxy host's loopback: correct with a local proxy, wrong with a remote one. Affects statsd
+  (8125), syslog over UDP, a local `chrony`, and `systemd-resolved` (`127.0.0.53`). A warning is
+  printed when the proxy is not local; `strict_loopback` makes it an error, but is checked only
+  when a connected socket's association is set up. An unconnected `sendto()` to loopback, or a
+  `connect()` to loopback after the socket has sent, is not caught.
+- **Multicast and broadcast fail** with `ENETUNREACH`: mDNS (5353), SSDP (1900), LLMNR, DHCP,
+  NetBIOS. `setsockopt(SO_BROADCAST)` and `IP_ADD_MEMBERSHIP` still succeed; the send fails.
+- **Payloads over `max_datagram` fail** with `EMSGSIZE`, including loopback traffic that could
+  otherwise carry 64 KB.
+- **TCP is not proxied**, except the shim's own DNS fallback. `proxychains-ng` can be combined
+  with `udpchains` for TCP.
 
-- **The datagram size ceiling applies everywhere**, including to loopback traffic that would
-  otherwise carry up to 64 KB. Payloads over `max_datagram` (default 8192) fail with `EMSGSIZE`
-  rather than being silently dropped or fragmented.
+### Behaviour that differs from an unproxied program
 
-### Behaviour that is deliberately approximate
-
-- **Name lookups go through the proxy, but only as far as libc's API.** See
-  [Name resolution](#name-resolution). A program with its own resolver sends ordinary UDP, which
-  is proxied, but its TCP fallback for large answers is TCP and is not.
-
-- **The proxy's own hostname is resolved directly, once,** by `udpchains` itself, if you configure
-  it by name rather than by address. Every program it starts is then given that address, not the
-  name, so none of them looks it up again (D-27). Configure a numeric address if even the one
-  lookup matters to you.
-
-- **Configuration is resolved once, by `udpchains`.** The programs it runs use exactly what it
-  resolved, and do not read the config files themselves (D-27). Only a program started with
-  `LD_PRELOAD` directly, without `udpchains`, reads them.
-
-- **Ancillary data (`msg_control`) is returned empty.** `IP_PKTINFO`, `IP_RECVERR`, ECN and friends
-  would describe a socket the application does not actually own, and there is no honest emulation.
-  A program that depends on them will misbehave, and the cause will not be obvious — this is the
-  most likely source of a confusing failure.
-
-- **A socket closed by a route no hook sees keeps its association until the number is touched
-  again.** `close()`, `close_range()`, `closefrom()` and `syscall(SYS_close)` all release a socket's
-  state at once. `fclose()` on an `fdopen()`ed socket, and anything issuing the raw system call,
-  do not. Every intercepted call checks that its descriptor is still the socket the shim tracked
-  (D-23), so whatever the kernel puts at that number next is never mistaken for it. But a number
-  that is never used again holds its association until the program exits.
-
-- **The shim's own descriptors sit at 768 and up** (lower if your file limit is under 1024): the
-  proxy connections, and the resolver's sockets. The program cannot close them. `close()` on one
-  fails with `EBADF`, a close-all loop or `close_range` goes around them, and `dup2()` onto one
-  fails with `EBUSY` (D-26). They are close-on-exec.
-
-- **After `fork()`, a child that keeps using an inherited UDP socket gets a fresh socket.** The child
-  must not share the parent's association, and parent and child share one open file description, so
-  the child's socket is replaced with a private one. `O_NONBLOCK`, close-on-exec and a concrete
-  `bind()` are carried over; other socket options are not. The child drops its copies of the
-  parent's proxy connections at fork, so the parent's associations end when the parent closes them
-  (D-31).
-
-- **A socket shared with another process is re-pointed.** When a socket inherited across `exec`, or
-  passed over a Unix socket, is also still held by another process, the shim's first use points it
-  at a new proxy relay, and that redirects the other holder's traffic too. There is no safe general
-  fix: the shim cannot tell who else holds a socket (D-32). Avoid sharing a UDP socket between a
-  proxied and an unproxied process.
-
-- **`strict_loopback` is checked when a socket's association is set up, and only for a connected
-  socket.** An unconnected `sendto()` to loopback, or a `connect()` to loopback after the socket has
-  already sent, is not caught, and goes to the *proxy host's* loopback (D-32).
-
-- **The first send or receive on a socket blocks while the proxy handshake runs,** even on a
-  non-blocking socket, which can stall an event loop. `connect_timeout` applies to each step of the
-  handshake rather than to the whole, and a send whose association cannot be set up tries once more
-  before failing (D-32).
-
-- **Sending from a signal handler is safe only on a socket already in use.** The steady-state path
-  takes no locks and allocates nothing. But a socket's first send, a thread's first datagram, and
-  `socket()`, `dup()` and `close()` all allocate or free memory, so doing any of those inside a
-  signal handler that interrupted `malloc` can deadlock.
-
+- **Ancillary data** (`msg_control`: `IP_PKTINFO`, `IP_RECVERR`, ECN) is returned empty.
 - **`MSG_MORE`, `UDP_CORK`, GSO and GRO (`UDP_SEGMENT`, `UDP_GRO`) corrupt data.** They are not
-  refused. Each call is sent with its own SOCKS header, so a datagram built up over several calls
-  arrives with a header in its middle, and a coalesced receive is misread (D-32). Modern QUIC stacks
-  use GSO/GRO; their encryption rejects the damage, so QUIC fails rather than delivering garbage,
-  but a plain UDP program does not. Even when QUIC works, a UDP flow through a TCP-based tunnel
-  inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery.
+  refused. Each call gets its own SOCKS header. QUIC rejects the damaged datagrams; plain UDP
+  programs do not.
+- **QUIC** through a TCP-based tunnel performs poorly even when it works.
+- **The first send or receive blocks** during the proxy handshake, even on a non-blocking socket.
+  `connect_timeout` applies to each handshake step. A failed association setup is retried once.
+- **Signal handlers:** sending is safe only on a socket already in use. A socket's first send, a
+  thread's first datagram, `socket()`, `dup()` and `close()` allocate memory and can deadlock if
+  the signal interrupted `malloc`.
+- **After `fork()`,** a child using an inherited socket gets a new socket. `O_NONBLOCK`,
+  close-on-exec and a specific `bind()` are kept; other socket options are not. If the parent
+  still holds the port, the child sends from another port and warns once.
+- **A socket shared with another process** (inherited across `exec`, or passed over a Unix socket)
+  is redirected for both processes on first use.
+- **A socket closed without a hook seeing it** (`fclose()` on an `fdopen()`ed socket, a raw
+  `close` system call) keeps its association until its descriptor number is used again, or the
+  program exits. `close()`, `close_range()`, `closefrom()` and `syscall(SYS_close)` release it at
+  once.
+- **The shim's own descriptors are at 768 and up** (lower if the file limit is under 1024). The
+  program cannot close them: `close()` gives `EBADF`, `close_range` skips them, `dup2()` onto one
+  gives `EBUSY`. They are close-on-exec.
+- **The proxy's hostname is resolved directly, once,** by `udpchains`. Use a numeric address to
+  avoid that lookup. Only the first address is used.
+- **Configuration is read once,** by `udpchains`. A program started with `LD_PRELOAD` directly
+  reads the config files itself.
+- **A non-`NULL` invalid pointer** inside a message faults in the shim instead of returning
+  `EFAULT`. A `NULL` `msg_iov`, a short address, or more than `IOV_MAX` buffers give the kernel's
+  `errno`.
+- **Warnings** are rate-limited to once a second, with a count of those suppressed, and are not
+  written if descriptor 2 is no longer the original stderr.
 
-- **A proxy given by hostname is reached at its first address only.** If the name resolves to
-  several, the others are not tried when the first fails (D-35). Configure the address you want
-  numerically.
+### Behaviour that depends on the proxy
 
-- **A forked child cannot always keep its parent's bound port.** A child using an inherited socket
-  binds its private replacement to the same address and port, but while the parent still holds the
-  port that fails. The child then sends from another port, and warns once (D-34).
-
-- **A bad pointer inside a message crashes, as it would without the shim.** A `NULL` `msg_iov`, a
-  too-short address, or more than `IOV_MAX` buffers fail with the `errno` the kernel gives. The
-  shim copies a message before the kernel sees it, so a non-`NULL` pointer to unmapped memory
-  faults inside the shim instead of returning `EFAULT`.
-
-- **Warnings are rate-limited and go only to the original stderr.** A repeated warning (a refused
-  multicast send, an oversized inbound datagram) prints at most once a second, with a count of those
-  held back. If the program closes stderr and something else takes descriptor 2, the shim stays
-  silent rather than write into it (D-33). `-q` prints errors only.
-
-- **TCP is not proxied.** `proxychains-ng` already does that well. Composing the two is fine.
-
-### Protocols that depend on your proxy's inbound policy
-
-Some protocols have the server reply from a **different port** than the one it was addressed on —
-TFTP most visibly, and also SIP/RTP and various game protocols. Whether these work is decided by the
-proxy, not by udpchains:
+Some protocols reply from a different port than the one addressed: TFTP, SIP/RTP, some games.
 
 | Proxy inbound policy | Result |
 |---|---|
-| Port-restricted — only accept from an `address:port` already sent to | These protocols **fail**. The reply is dropped at the proxy and never reaches the shim. |
-| Address-restricted — accept from any port at a host already sent to | They work. This is the usual middle ground. |
-| Association-scoped — accept anything once associated | They work, but the relay is effectively open. |
+| Port-restricted: accepts only from an `address:port` already sent to | These protocols fail. The send succeeds and nothing arrives. |
+| Address-restricted: accepts any port at a host already sent to | They work. |
+| Association-scoped: accepts anything | They work; the relay is open. |
 
-A port-restricted proxy is a defensible choice: it stops the relay being used as an open reflector,
-and RFC 1928 does not require otherwise. But the failure is invisible from the client side — the
-send succeeds, the association stays healthy, and nothing arrives. If a protocol like this hangs
-after the first exchange, check the **proxy's** logs for dropped inbound datagrams before suspecting
-the shim. `udpchains -v` will show the request leaving with the correct destination and `ATYP`, which
-is usually enough to place the fault at the far end.
+- Dante 1.4.3 is port-restricted by default (`udp.connectdst: no` in `sockd.conf` changes it). The
+  other six tested proxies accept a reply from a different port.
+- udpchains filters by peer only on `connect()`ed sockets, as the kernel does. Unconnected sockets
+  are not filtered.
+- If such a protocol hangs after the first exchange, check the proxy's logs. `udpchains -v` shows
+  each request's destination and `ATYP`.
+- A datagram larger than the proxy's buffer is truncated without error (see
+  [Compatible proxies](#compatible-proxies)).
+- Some proxies drop zero-length datagrams.
+- A proxy that closes the connection on a refused login, as 3proxy does, gives `ECONNRESET`
+  instead of `EACCES`.
 
-Note that udpchains applies its own filter only for sockets the application has `connect()`-ed, and
-only to match what the kernel does natively (D-15). An unconnected socket — which is what TFTP
-clients use, precisely because of the port switch — is not filtered by the shim at all.
+### Testing against real proxies
 
-Of the [compatible proxies](#compatible-proxies), Dante 1.4.3 is port-restricted by default, and
-`udp.connectdst: no` in `sockd.conf` lets these protocols through. The other six accepted a reply
-from a switched port with no setting.
+The automated suite uses an in-repo fixture proxy. 0.1.0 was also tested on the same host against
+the reference proxy (`nc -u`, TFTP, `dig`, `iperf`, `ntpdate`) and against the seven
+[compatible proxies](#compatible-proxies). **Untested:** a proxy on another host, and an IPv6
+destination beyond this host's loopback.
 
-### Behaviour that depends on your proxy
+### Not implemented
 
-See [Compatible proxies](#compatible-proxies) for each proxy's figures.
-
-- **A datagram larger than the proxy's buffer arrives truncated,** with no error to anyone,
-  because the cut happens after udpchains has sent it. Set `max_datagram` no higher than the
-  proxy's limit, so that an oversized send fails with `EMSGSIZE` instead.
-- **Some proxies drop zero-length datagrams.** udpchains sends them, but nothing arrives. A
-  protocol that uses empty datagrams as keepalives will not work through those proxies.
-- **A refused login can look like a reset.** A proxy that closes the connection instead of
-  replying with a failure status, as 3proxy does, makes the send fail with `ECONNRESET` rather than
-  `EACCES`.
-
-### How far it has been tested against real proxies
-
-The automated suite runs against an in-repo proxy fixture. Against a real proxy, 0.1.0 has been
-checked with the reference SOCKS5 proxy, running on the same host, with `nc -u`, TFTP, `dig`,
-`iperf` and `ntpdate`. It has also been checked against the seven proxies under
-[Compatible proxies](#compatible-proxies), each on the same host (see
-[`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12). **Not yet tested:** a proxy on
-another host, and an IPv6 destination beyond this host's loopback. Reports from those setups are
-welcome.
-
-### Not implemented in v1
-
-- SOCKS5 GSSAPI authentication (method `0x01`), and any method other than `0x00` and `0x02`. A proxy
-  selecting one is refused with a diagnostic naming what is supported. Username/password (RFC 1929)
-  **is** implemented — see above.
-- `proxychains.conf`-style `[ProxyList]` config. A `[ProxyList]` line produces a message pointing
-  here rather than a generic parse error.
-- Proxy chains (multi-hop UDP). Planned after 0.1.0; the draft requirements are in
-  [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md).
-- Static and Go binaries, and programs calling `syscall()` directly. Planned after 0.1.0, as a
-  supervisor mode; the draft requirements are in
-  [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md).
-- Loopback and multicast bypass. Deferred rather than dropped; see `DECISIONS.md` D-05.
+- SOCKS5 authentication methods other than none (`0x00`) and username/password (`0x02`),
+  including GSSAPI (`0x01`). A proxy selecting one is refused with a diagnostic.
+- `proxychains.conf`-style `[ProxyList]` configuration. A `[ProxyList]` line is an error that
+  says so.
+- Proxy chains (multi-hop UDP). Planned after 0.1.0
+  ([`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md)).
+- Static and Go binaries and `syscall()` users. Planned after 0.1.0
+  ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)).
+- Loopback and multicast bypass. Deferred ([`DECISIONS.md`](DECISIONS.md) D-05).
 
 ## Comparison with similar tools
 
-Several open-source tools can send a single program's UDP through a SOCKS5 proxy. Each was built
-with different goals, and each does things udpchains does not:
-
 | Tool | Approach | Licence | Also does |
 |---|---|---|---|
-| [Dante `socksify`](https://www.inet.no/dante/) | `LD_PRELOAD` | BSD-style | TCP; a long-established, widely packaged client |
-| [proxychains-ng PR #570](https://github.com/rofl0r/proxychains-ng/pull/570) | `LD_PRELOAD` | GPL-2.0 | TCP; UDP through a **chain** of proxies. An open pull request, not yet in a release |
+| [Dante `socksify`](https://www.inet.no/dante/) | `LD_PRELOAD` | BSD-style | TCP |
+| [proxychains-ng PR #570](https://github.com/rofl0r/proxychains-ng/pull/570) | `LD_PRELOAD` | GPL-2.0 | TCP; UDP through a chain of proxies. Unmerged pull request |
 | [Proxando](https://github.com/NULLhere/Proxando) | `LD_PRELOAD` | GPL-2.0 | TCP; proxychains-style configuration |
-| [graftcp](https://github.com/hmgle/graftcp) | `ptrace` | GPL-3.0 | TCP; **static and Go binaries**, which no `LD_PRELOAD` tool can reach; HTTP proxies |
+| [graftcp](https://github.com/hmgle/graftcp) | `ptrace` | GPL-3.0 | TCP; static and Go binaries; HTTP proxies |
 
 udpchains does UDP only, through one proxy, for dynamically linked programs.
 
 ### UDP behaviour, measured
 
-On 2026-10-19 each tool ran the same tests in a Docker lab. A client, a SOCKS5 proxy (gost 3.3.1)
-and a server each had their own address. The server logged the source of every datagram and DNS
-query, so it could tell whether traffic came through the proxy or straight from the client. The
-same run with no tool at all was the control: there, every datagram arrived directly. Versions:
-`dante-client` 1.4.3 (Ubuntu 24.04), PR #570 at `04f6622`, Proxando at `c7ff4ac`, graftcp v0.8.3.
+Measured 2026-10-19 in a Docker lab: client, SOCKS5 proxy (gost 3.3.1) and server on separate
+addresses. The server logged the source of every datagram and DNS query. A control run with no
+tool showed every datagram arriving directly. Versions: `dante-client` 1.4.3 (Ubuntu 24.04),
+PR #570 at `04f6622`, Proxando at `c7ff4ac`, graftcp v0.8.3.
 
 | | udpchains | Dante `socksify` | PR #570 | Proxando | graftcp |
 |---|---|---|---|---|---|
-| Send × receive calls, IPv4: round trips through the proxy, of 54 | 54 | 35 | 0 | 20 | 24 |
+| IPv4 send × receive round trips through the proxy, of 54 | 54 | 35 | 0 | 20 | 24 |
 | The same, IPv6 | 54 | 0 | 0 | 20 | 23–24 |
 | `sendmmsg` | through the proxy | sent directly | — | sent directly | sent directly |
 | Sender address the program sees | the real sender | the real sender | — | the real sender | another address |
 | `dig` with its own resolver | through the proxy | no answer | through the proxy | no answer | through the proxy |
 | `getaddrinfo` | queried through the proxy | placeholder address | placeholder address | placeholder address | queried through the proxy |
 | Static Go binary | sent directly | sent directly | sent directly | sent directly | through the proxy |
-| With the proxy stopped, datagrams that reached the server directly | none | IPv6, `sendmmsg` | none | `sendto`, `sendmmsg` | `sendmmsg` |
+| Proxy stopped: datagrams that reached the server directly | none | IPv6, `sendmmsg` | none | `sendto`, `sendmmsg` | `sendmmsg` |
 
-The 54 combinations are nine ways to send (`sendto`, `sendmsg` and `sendmmsg` with and without
-`connect`, plus `send`, `write` and `writev`) by six ways to receive (`recvfrom`, `recv`, `read`,
-`readv`, `recvmsg`, `recvmmsg`). Each counts only if the reply came back byte for byte, through the
-proxy. graftcp ran in its default `auto` mode and in `only_socks5`; the results matched, apart from
-an occasional cell that crashed, at most one per matrix, which is why its IPv6 figure is a range.
-The IPv4 figures were the same when each socket first exchanged a datagram before the test, and
-with the client built with `_FORTIFY_SOURCE`.
+- The 54 combinations: `sendto`, `sendmsg`, `sendmmsg` (each with and without `connect`),
+  `send`, `write`, `writev` × `recvfrom`, `recv`, `read`, `readv`, `recvmsg`, `recvmmsg`. A cell
+  counts only if the reply came back byte for byte through the proxy.
+- IPv4 results were the same with a warmed-up socket and with `_FORTIFY_SOURCE`.
+- graftcp ran in `auto` and `only_socks5` modes with the same results, except for at most one
+  crashed cell per matrix (hence the IPv6 range).
+- Placeholder addresses come from Dante's `resolveprotocol: fake` and proxychains' `proxy_dns`,
+  where the proxy resolves the name on TCP connect.
 
-The placeholder addresses come from the settings used here, Dante's `resolveprotocol: fake` and
-proxychains' `proxy_dns`. They are a design choice: the proxy resolves the name when the program
-connects to it over TCP.
+Per tool:
 
-What lies behind the figures:
+- **Dante `socksify`:** IPv6 UDP is sent directly (its log: "unsupported af 10"). `recvmmsg`
+  returns the 10-byte SOCKS header as data. `sendmmsg` bypasses the proxy.
+- **PR #570:** datagrams reach the proxy, but sends report failure (`EINPROGRESS`, then `EAGAIN`).
+  Programs that retry, such as `dig`, work. `sendto` on a connected socket crashed the client.
+  Nothing was sent directly.
+- **Proxando:** `readv` and `recvmmsg` return the SOCKS header as data. `sendmsg` and `sendmmsg`
+  on a connected socket fail with `EDESTADDRREQ`. `sendmmsg` is sent directly. With the proxy
+  stopped, `sendto` was sent directly.
+- **graftcp:** reports another address as the sender and does not handle `sendmmsg`, both listed in
+  its README. With the proxy stopped, other sends report success without delivery. `auto` mode
+  falls back to direct DNS; `--select_proxy_mode only_socks5` prevents it. The only tool here
+  that handles a static Go binary.
 
-- **Dante `socksify`** does not carry IPv6 UDP; its own log reports "unsupported af 10" and sends
-  directly. With IPv4, `recvmmsg` returns the 10-byte SOCKS header as part of the data, and
-  `sendmmsg` bypasses the proxy.
-- **PR #570** sends through the proxy, but a send call reports failure (`EINPROGRESS`, then
-  `EAGAIN`), even when the datagram is delivered. Programs that retry, such as `dig`, work; the test
-  client, which takes a failed send at its word, did not. `sendto` on a connected socket crashed
-  the client. It never sent anything directly. As an open pull request, it may change before release.
-- **Proxando** returns the SOCKS header as part of the data for `readv` and `recvmmsg`, refuses
-  `sendmsg` and `sendmmsg` on a connected socket (`EDESTADDRREQ`), and sends `sendmmsg` directly.
-  With the proxy stopped, `sendto` was sent directly.
-- **graftcp** reports an address other than the real sender's, and leaves `sendmmsg` to the
-  kernel; its README lists both as known gaps. With the proxy stopped, other sends report success
-  without being delivered. In its default `auto` mode it falls back to direct DNS by design;
-  `--select_proxy_mode only_socks5` stops that. It is the only one of the five that handles a
-  static Go binary.
+Limits:
 
-### Limits of this comparison
+- The tests come from udpchains' own requirements. TCP, chains, static binaries, HTTP proxies and
+  other platforms were not measured.
+- udpchains' authors wrote the tests and configured every tool from its documentation.
+- One proxy, one host, one run per tool. graftcp ran with Docker's seccomp filter disabled; with
+  it, graftcp failed intermittently with ptrace errors.
+- Corrections are welcome as issues with a better configuration.
 
-- **It measures what udpchains was designed for.** The call matrix, the leak test and the
-  sender-address check come from udpchains' own requirements, and the tools' other strengths —
-  TCP, chains, static binaries, HTTP proxies, other platforms — were not measured.
-- **udpchains' authors wrote the tests and configured every tool,** from each tool's own
-  documentation. A configuration mistake would count against the other tool, not udpchains.
-- **One proxy, one host, one run per tool.** graftcp ran with Docker's seccomp filter disabled;
-  under the default filter it failed intermittently with ptrace errors, which looks environmental.
-- Corrections are welcome: open an issue with the configuration that does better.
-
-`make compare` reruns all of this ([`tests/compare/`](tests/compare/)). It needs Docker and
-Python 3, builds the other tools in its client image, and prints the figures above, with a
-control run that shows the lab detects traffic sent directly. Each tool's configuration is in
-`tests/compare/conf/`.
+`make compare` reruns the comparison ([`tests/compare/`](tests/compare/); needs Docker and
+Python 3). Tool configurations are in `tests/compare/conf/`.
 
 ## How it works
 
-The shim interposes on libc's socket calls and **redirects the application's own descriptor to the
-proxy's relay**. There is no shadow socket, which is why `poll`, `select`, `epoll` and every socket
-option keep working untouched — they are not hooked, and must not be.
-
-On first use of a UDP socket the shim opens a TCP control connection to the proxy, negotiates, and
-issues `UDP ASSOCIATE`. Outbound datagrams get an RFC 1928 §7 header prepended; inbound ones have it
-parsed and stripped, so the application sees the true source address and its own byte counts.
-
-Every send variant funnels into one send path and every receive variant into one receive path. That
-is deliberate: it makes it structurally hard to ship a version where a program can send successfully
-but read back data with the SOCKS header still attached. A 108-cell test matrix
-asserts byte-identical round-trips for every pair of `{sendto, send, write, writev, sendmsg,
-sendmmsg} × {recvfrom, recv, read, readv, recvmsg, recvmmsg}` over IPv4 and IPv6, with the three
-senders that name a destination run both connected and unconnected.
-
-Per-descriptor state lives in a lock-free two-level radix table, with no allocation and no locks on
-the datagram path once a socket's association is up (see the signal-handler caveat above). Each intercepted call makes one extra system
-call, a `getsockopt`, to confirm its descriptor is still the socket the shim recorded (D-23).
-Associations are type-stable, so a thread reading one while another tears it down reads valid
-memory (D-24).
+- The shim interposes on libc's socket calls, for `SOCK_DGRAM` sockets in `AF_INET` and `AF_INET6`
+  only, and points the program's own UDP socket at the proxy's relay. There is no second socket, so
+  `poll`, `select`, `epoll` and socket options work unchanged and are not hooked.
+- On a socket's first use, the shim opens a TCP control connection to the proxy and issues
+  `UDP ASSOCIATE`. Outgoing datagrams get an RFC 1928 §7 header; incoming ones have it checked and
+  removed, so the program sees the real sender and its own byte counts.
+- All send calls share one send path and all receive calls one receive path. A 108-cell test
+  matrix checks byte-identical round trips for `{sendto, send, write, writev, sendmsg, sendmmsg}` ×
+  `{recvfrom, recv, read, readv, recvmsg, recvmmsg}` over IPv4 and IPv6, connected and
+  unconnected.
+- Per-descriptor state is in a lock-free radix table. Once a socket's association is up, the
+  datagram path takes no locks and allocates nothing. Each intercepted call makes one
+  `getsockopt` to confirm its descriptor is still the tracked socket.
 
 ## Documentation
 
 | | |
 |---|---|
-| [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) | the requirements baseline |
-| [`DECISIONS.md`](DECISIONS.md) | every design decision, with consequences and revisit conditions |
-| [`docs/DESIGN.md`](docs/DESIGN.md) | how it is built |
-| [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | every requirement mapped to design section and test |
-| [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | manual tests against a real proxy, and what each one proves |
-| [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) | multi-hop UDP chains: draft requirements for after 0.1.0 |
-| [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md) | static and Go binaries, through a supervisor: draft requirements for after 0.1.0 |
-| [`CHANGELOG.md`](CHANGELOG.md) | what changed, and what is known not to work |
-| [`SECURITY.md`](SECURITY.md) | how to report a vulnerability |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to contribute, and the clean-room rule |
+| [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) | requirements |
+| [`DECISIONS.md`](DECISIONS.md) | design decisions (D-nn) |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | design |
+| [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | requirements mapped to design and tests |
+| [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | tests against real proxies |
+| [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) | planned: multi-hop UDP chains |
+| [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md) | planned: static and Go binaries |
+| [`CHANGELOG.md`](CHANGELOG.md) | changes and known limitations |
+| [`SECURITY.md`](SECURITY.md) | reporting a vulnerability |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributing, and the clean-room rule |
 
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE).
+MIT; see [`LICENSE`](LICENSE).
 
-Implemented clean-room from RFC 1928 §7 and the relevant man pages. `proxychains-ng` and `Proxando`
-are cited in the requirements as evidence about their *behaviour*; no code was taken from either, and
-contributions must not derive from them — both are GPL-2.0, and doing so would silently relicense
-this project.
+Written clean-room from RFC 1928, RFC 1929 and the Linux man pages. No code was taken from
+`proxychains-ng` or `Proxando` (both GPL-2.0), and contributions must not derive from them.
