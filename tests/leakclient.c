@@ -9,6 +9,10 @@
  * destination anyway, with no diagnostic (baseline §0.3.1).
  *
  * usage: leakclient <ip> <port> [-6]
+ *        leakclient raw
+ *
+ * The second form tries to open raw and packet sockets, which reach the network
+ * below UDP, and prints what each attempt returned (D-36).
  */
 #define _GNU_SOURCE 1
 
@@ -20,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -104,12 +109,146 @@ static int pass_fd(int fd)
 	return got;
 }
 
+/* glibc's public aliases for write and send, which a program can call. */
+ssize_t __write(int fd, const void *buf, size_t len);
+ssize_t __send(int fd, const void *buf, size_t len, int flags);
+
+/* A socket connected by syscall(SYS_connect), which the connect() hook never
+ * saw.  Before D-36 the kernel socket was then really connected to the
+ * destination, and every route that writes without a hook sent there. */
+static int sysconnected(void)
+{
+	int fd = mksock(0);
+
+	if (fd >= 0)
+		syscall(SYS_connect, fd, (struct sockaddr *)&g_dst, g_dstlen);
+	return fd;
+}
+
+/* The routes around the send hooks (D-36). */
+static void try_unhooked_routes(void)
+{
+	struct msghdr m;
+	struct iovec v = { g_payload, 4 };
+	FILE *tf = tmpfile(), *f;
+	int fd, p[2];
+
+	fd = mksock(0);
+	if (fd >= 0) {
+		record("syscall(SYS_sendto)",
+		       syscall(SYS_sendto, fd, g_payload, 4, 0,
+		               (struct sockaddr *)&g_dst, g_dstlen));
+		memset(&m, 0, sizeof(m));
+		m.msg_name = &g_dst;
+		m.msg_namelen = g_dstlen;
+		m.msg_iov = &v;
+		m.msg_iovlen = 1;
+		record("syscall(SYS_sendmsg)", syscall(SYS_sendmsg, fd, &m, 0));
+		close(fd);
+	}
+
+	if ((fd = sysconnected()) >= 0) {
+		record("syscall(SYS_connect)+syscall(SYS_write)",
+		       syscall(SYS_write, fd, g_payload, 4));
+		record("syscall(SYS_connect)+write", write(fd, g_payload, 4));
+		record("syscall(SYS_connect)+dprintf", dprintf(fd, "%s", g_payload));
+		if (tf != NULL) {
+			off_t off = 0;
+
+			fputs(g_payload, tf);
+			fflush(tf);
+			record("syscall(SYS_connect)+sendfile",
+			       sendfile(fd, fileno(tf), &off, 4));
+		}
+		if (pipe(p) == 0) {
+			if (write(p[1], g_payload, 4) == 4)
+				record("syscall(SYS_connect)+splice",
+				       splice(p[0], NULL, fd, NULL, 4, 0));
+			close(p[0]);
+			close(p[1]);
+		}
+		record("syscall(SYS_connect)+pwritev2", pwritev2(fd, &v, 1, -1, 0));
+		record("syscall(SYS_connect)+__write", __write(fd, g_payload, 4));
+		record("syscall(SYS_connect)+__send", __send(fd, g_payload, 4, 0));
+		f = fdopen(fd, "w");
+		if (f == NULL) {
+			record("syscall(SYS_connect)+fdopen", -1);
+			close(fd);
+		} else {
+			fputs(g_payload, f);
+			record("syscall(SYS_connect)+fdopen", fflush(f) == 0 ? 4 : -1);
+			fclose(f);
+		}
+	}
+	if (tf != NULL)
+		fclose(tf);
+
+	/* A copy of one of our own sockets, taken with pidfd_getfd: a new
+	 * number that no socket(), dup or SCM_RIGHTS hook created. */
+#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
+	{
+		int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+
+		fd = mksock(0);
+		if (pidfd >= 0 && fd >= 0) {
+			int copy = (int)syscall(SYS_pidfd_getfd, pidfd, fd, 0);
+
+			if (copy >= 0) {
+				record("sendto-via-pidfd_getfd",
+				       sendto(copy, g_payload, 4, 0,
+				              (struct sockaddr *)&g_dst, g_dstlen));
+				close(copy);
+			}
+		}
+		if (fd >= 0)
+			close(fd);
+		if (pidfd >= 0)
+			close(pidfd);
+	}
+#endif
+}
+
+static void try_raw(void)
+{
+	static const struct {
+		const char *name;
+		int domain, type, protocol;
+	} kinds[] = {
+		{ "AF_INET/SOCK_RAW", AF_INET, SOCK_RAW, IPPROTO_UDP },
+		{ "AF_INET6/SOCK_RAW", AF_INET6, SOCK_RAW, IPPROTO_UDP },
+		{ "AF_PACKET/SOCK_RAW", AF_PACKET, SOCK_RAW, 0 },
+		{ "AF_PACKET/SOCK_DGRAM", AF_PACKET, SOCK_DGRAM, 0 },
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(kinds) / sizeof(*kinds); i++) {
+		int fd;
+
+		errno = 0;
+		fd = socket(kinds[i].domain, kinds[i].type, kinds[i].protocol);
+		printf("RAW %s %s\n", kinds[i].name, fd >= 0 ? "opened" : strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		errno = 0;
+		fd = (int)syscall(SYS_socket, kinds[i].domain, kinds[i].type,
+		                  kinds[i].protocol);
+		printf("RAW syscall %s %s\n", kinds[i].name,
+		       fd >= 0 ? "opened" : strerror(errno));
+		if (fd >= 0)
+			close(fd);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	const char *ip;
 	int port;
 	int i;
 
+	if (argc == 2 && strcmp(argv[1], "raw") == 0) {
+		try_raw();
+		return 0;
+	}
 	if (argc < 3) {
 		fprintf(stderr, "usage: leakclient <ip> <port> [-6]\n");
 		return 2;
@@ -255,6 +394,8 @@ int main(int argc, char **argv)
 			close(fd);
 		}
 	}
+
+	try_unhooked_routes();
 
 	printf("SUMMARY sent_ok=%d send_failed=%d\n", g_sent_ok, g_send_failed);
 	return 0;

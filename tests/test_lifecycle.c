@@ -6,6 +6,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -335,17 +336,29 @@ static void t_scm_rights_adopted(void)
 	close(got);
 }
 
+/* Closes fd by a route no hook sees: libc's own close(), looked up in libc
+ * rather than by name, so the shim's close() is never reached.  This stands in
+ * for the routes a program can really take -- a system call made without libc,
+ * or one of glibc's internal closes. */
+static int unhooked_close(int fd)
+{
+	void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+	int (*real_close)(int) = NULL;
+
+	if (libc != NULL)
+		*(void **)&real_close = dlsym(libc, "close");
+	return real_close != NULL ? real_close(fd) : -1;
+}
+
 /* D-23: a descriptor closed by a route no hook sees leaves its entry behind.
- * fclose() on an fdopen()ed socket is one: glibc closes through an internal
- * function.  The number is then free, and whatever the kernel puts there next
- * must not be treated as the old UDP socket. */
+ * The number is then free, and whatever the kernel puts there next must not
+ * be treated as the old UDP socket. */
 static void t_stale_entry_not_hijacked(void)
 {
 	struct sockaddr_in la;
 	socklen_t ll = sizeof(la);
 	int lst, fd, stale, cli, srv, before;
 	char buf[16];
-	FILE *f;
 
 	TAP_GROUP("D-23: a stale entry does not take over the next descriptor");
 
@@ -359,13 +372,11 @@ static void t_stale_entry_not_hijacked(void)
 
 	fd = udp4();
 	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
-	TAP_OK(roundtrip(fd, "pre-fclose"), "the UDP socket works");
+	TAP_OK(roundtrip(fd, "pre-close"), "the UDP socket works");
 	before = count_tcp_sockets(NULL);
 
 	stale = fd;
-	f = fdopen(fd, "r+");
-	TAP_OK(f != NULL && fclose(f) == 0,
-	       "fclose(fdopen(fd)) closes it by a route no hook sees");
+	TAP_EQ_INT(unhooked_close(fd), 0, "it is closed by a route no hook sees");
 
 	cli = socket(AF_INET, SOCK_STREAM, 0);
 	TAP_EQ_INT(cli, stale, "a TCP socket is given the same number");

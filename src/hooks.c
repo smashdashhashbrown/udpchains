@@ -16,11 +16,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <netinet/udp.h>
 #include <poll.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -29,17 +32,25 @@
 
 #include "addr.h"
 #include "assoc.h"
+#include "config.h"
 #include "core.h"
 #include "fdtable.h"
 #include "guard.h"
 #include "log.h"
 #include "real.h"
+#include "scratch.h"
 #include "shim.h"
 
 /* D-35: the shim is built with -fvisibility=hidden, so nothing it defines is
  * exported unless marked.  Every non-static function from here on is a hook,
  * and must be exported. */
 #pragma GCC visibility push(default)
+
+/* Hooks defined below that glibc declares only in newer headers, or not at
+ * all, but that syscall() routes to before their definitions. */
+#ifdef SYS_pidfd_getfd
+int pidfd_getfd(int pidfd, int targetfd, unsigned int flags);
+#endif
 
 /* --- helpers --------------------------------------------------------------- */
 
@@ -54,31 +65,43 @@ static bool is_intercepted_kind(int domain, int type)
 	return domain == AF_INET || domain == AF_INET6;
 }
 
+/* D-36: raw and packet sockets reach the network below UDP, where SOCKS5 cannot
+ * follow.  SOCK_PACKET is the obsolete packet interface in AF_INET. */
+static bool is_raw_kind(int domain, int type)
+{
+	int base = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+	if (domain == AF_PACKET)
+		return true;
+	return (domain == AF_INET || domain == AF_INET6) &&
+	       (base == SOCK_RAW || base == SOCK_PACKET);
+}
+
 /* --- adoption of descriptors socket() never saw ---------------------------- */
 
 /* A UDP socket can enter this process without passing through the socket()
  * hook or a dup: inherited across exec, or received from another process as
  * SCM_RIGHTS ancillary data.  Nothing would intercept its traffic and it would
  * go direct -- the silent leak this project exists to prevent (SEC-01).  Such
- * descriptors are adopted into the table as they arrive.
+ * descriptors are adopted into the table as they arrive.  So is one copied out
+ * of another process with pidfd_getfd (D-36).
  *
- * Returns 0 if fd was adopted or is not a socket we intercept, and -1 if it is
- * one but cannot be tracked. */
+ * Returns udpc_fd_adopt's result: negative if fd was closed. */
 /* An untrackable UDP socket is closed rather than left in the application's
  * hands, where it would send unproxied -- the same choice the socket() hook
  * makes, and the only fail-closed one.  So is a datagram socket for a protocol
  * SOCKS5 cannot carry (D-29). */
-static void adopt_or_close(int fd, const char *how)
+static int adopt_or_close(int fd, const char *how)
 {
 	int rc = udpc_fd_adopt(fd);
 
 	if (rc > 0)
 		udpc_debug("adopted %s UDP descriptor %d", how, fd);
 	if (rc >= 0)
-		return;
+		return rc;
 	if (rc == UDPC_ADOPT_UNPROXIABLE)
-		udpc_err("%s descriptor %d is a non-UDP datagram socket (ICMP or "
-		         "UDP-Lite), which SOCKS5 cannot carry; closing it rather "
+		udpc_err("%s descriptor %d is a raw, packet, ICMP or UDP-Lite "
+		         "socket, which SOCKS5 cannot carry; closing it rather "
 		         "than leaving it unproxied",
 		         how, fd);
 	else
@@ -86,6 +109,7 @@ static void adopt_or_close(int fd, const char *how)
 		         "than leaving it unproxied",
 		         how, fd);
 	REAL_CLOSE(fd);
+	return rc;
 }
 
 static void adopt_inherited(int fd)
@@ -234,6 +258,19 @@ int socket(int domain, int type, int protocol)
 {
 	struct udpc_fdent *e;
 	int fd;
+
+	/* D-36: a raw or packet socket would send directly, below anything the
+	 * shim can wrap.  EPERM is what a program without CAP_NET_RAW already
+	 * gets, so programs take the fallback they would take unprivileged. */
+	if (!UDPC_IN_SHIM() && is_raw_kind(domain, type)) {
+		udpc_warn("refusing a raw socket (%s): it reaches the network "
+		          "below UDP, where SOCKS5 cannot follow, and udpchains "
+		          "sends nothing directly",
+		          domain == AF_PACKET ? "AF_PACKET" :
+		          domain == AF_INET6 ? "AF_INET6" : "AF_INET");
+		errno = EPERM;
+		return -1;
+	}
 
 	/* D-29: a datagram socket in AF_INET/AF_INET6 that is not UDP -- ICMP
 	 * "ping" sockets, UDP-Lite -- carries a protocol SOCKS5 cannot relay.
@@ -544,10 +581,12 @@ int fcntl64(int fd, int cmd, ...)
 
 /* syscall() is how some runtimes reach the kernel without libc's wrappers --
  * libuv closes descriptors this way, which is what stranded dig's table entries
- * (D-17, D-23).  The descriptor-lifecycle calls are routed to the hooks above,
- * so a socket created, duplicated or closed through syscall() is tracked like
- * any other.  Everything else, including sends and receives, goes straight to
- * the kernel: data calls through syscall() are unsupported, as the README says.
+ * (D-17, D-23).  Every call a hook exists for is routed to that hook: the
+ * descriptor lifecycle, and since D-36 the socket calls and sends and receives
+ * too, so a UDP socket used through syscall() is proxied like any other.
+ * Everything else goes straight to the kernel.  A program that makes its own
+ * system calls without libc's syscall() -- Go, inline assembly -- is beyond
+ * any preload.
  *
  * Six arguments are read whatever the call, as glibc's own syscall() does; no
  * Linux system call takes more. */
@@ -585,6 +624,62 @@ long syscall(long number, ...)
 			return fcntl((int)a0, (int)a1, (void *)(uintptr_t)a2);
 		case SYS_socket:
 			return socket((int)a0, (int)a1, (int)a2);
+		case SYS_connect:
+			return connect((int)a0, (const struct sockaddr *)a1,
+			               (socklen_t)a2);
+		case SYS_bind:
+			return bind((int)a0, (const struct sockaddr *)a1,
+			            (socklen_t)a2);
+		case SYS_getpeername:
+			return getpeername((int)a0, (struct sockaddr *)a1,
+			                   (socklen_t *)a2);
+		case SYS_getsockname:
+			return getsockname((int)a0, (struct sockaddr *)a1,
+			                   (socklen_t *)a2);
+		case SYS_sendto:
+			return sendto((int)a0, (const void *)a1, (size_t)a2,
+			              (int)a3, (const struct sockaddr *)a4,
+			              (socklen_t)a5);
+		case SYS_sendmsg:
+			return sendmsg((int)a0, (const struct msghdr *)a1, (int)a2);
+		case SYS_sendmmsg:
+			return sendmmsg((int)a0, (struct mmsghdr *)a1, (unsigned)a2,
+			                (int)a3);
+		case SYS_write:
+			return write((int)a0, (const void *)a1, (size_t)a2);
+		case SYS_writev:
+			return writev((int)a0, (const struct iovec *)a1, (int)a2);
+		case SYS_recvfrom:
+			return recvfrom((int)a0, (void *)a1, (size_t)a2, (int)a3,
+			                (struct sockaddr *)a4, (socklen_t *)a5);
+		case SYS_recvmsg:
+			return recvmsg((int)a0, (struct msghdr *)a1, (int)a2);
+		case SYS_recvmmsg:
+			return recvmmsg((int)a0, (struct mmsghdr *)a1, (unsigned)a2,
+			                (int)a3, (struct timespec *)a4);
+		case SYS_read:
+			return read((int)a0, (void *)a1, (size_t)a2);
+		case SYS_readv:
+			return readv((int)a0, (const struct iovec *)a1, (int)a2);
+#if __SIZEOF_LONG__ == 8
+		/* The offset is split across two arguments; on a 64-bit
+		 * kernel the first holds all of it. */
+		case SYS_pwritev2:
+			return pwritev2((int)a0, (const struct iovec *)a1, (int)a2,
+			                (off_t)a3, (int)a5);
+		case SYS_preadv2:
+			return preadv2((int)a0, (const struct iovec *)a1, (int)a2,
+			               (off_t)a3, (int)a5);
+#endif
+		case SYS_sendfile:
+			return sendfile((int)a0, (int)a1, (off_t *)a2, (size_t)a3);
+		case SYS_splice:
+			return splice((int)a0, (loff_t *)a1, (int)a2, (loff_t *)a3,
+			              (size_t)a4, (unsigned)a5);
+#ifdef SYS_pidfd_getfd
+		case SYS_pidfd_getfd:
+			return pidfd_getfd((int)a0, (int)a1, (unsigned)a2);
+#endif
 		default:
 			break;
 		}
@@ -676,6 +771,35 @@ static bool iovlen_ok(const struct msghdr *m)
 	return true;
 }
 
+/* D-36: a UDP_SEGMENT control message asks the kernel to split one buffer into
+ * many datagrams (GSO).  Each would need its own SOCKS header, and the kernel
+ * cannot add them, so the request is refused rather than sent as one garbled
+ * datagram.  Other ancillary data on send is ignored (FR-F-11). */
+static struct udpc_ratelimit g_rl_gso;
+
+static bool refuse_gso(int fd, const struct msghdr *m)
+{
+	struct cmsghdr *c;
+	char note[80];
+	unsigned n;
+
+	if (m->msg_control == NULL || m->msg_controllen < sizeof(struct cmsghdr))
+		return false;
+	for (c = CMSG_FIRSTHDR(m); c != NULL;
+	     c = CMSG_NXTHDR((struct msghdr *)(uintptr_t)m, c))
+		if (c->cmsg_level == SOL_UDP && c->cmsg_type == UDP_SEGMENT)
+			break;
+	if (c == NULL)
+		return false;
+	if ((n = udpc_ratelimit(&g_rl_gso)) != 0)
+		udpc_warn("refusing UDP_SEGMENT on descriptor %d: each datagram "
+		          "needs its own SOCKS header, which the kernel cannot "
+		          "add%s",
+		          fd, udpc_ratelimit_note(n, note, sizeof(note)));
+	errno = EOPNOTSUPP;
+	return true;
+}
+
 /* --- send hooks (FR-I-03) -------------------------------------------------- */
 
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
@@ -735,7 +859,7 @@ ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
 	 * actually own (§8 of the requirements).  It is ignored rather than
 	 * forwarded, since forwarding relay-relative values would be worse than
 	 * dropping them. */
-	if (!iovlen_ok(msg))
+	if (!iovlen_ok(msg) || refuse_gso(fd, msg))
 		return -1;
 	if (msg->msg_controllen > 0)
 		udpc_debug("fd %d: ignoring %zu bytes of ancillary data on send",
@@ -763,7 +887,7 @@ int sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
 	 * return k; if the first fails, return -1. */
 	for (i = 0; i < vlen; i++) {
 		struct msghdr *m = &msgvec[i].msg_hdr;
-		ssize_t n = !iovlen_ok(m) ? -1
+		ssize_t n = !iovlen_ok(m) || refuse_gso(fd, m) ? -1
 		          : udpc_core_send(fd, e, m->msg_iov, (int)m->msg_iovlen,
 		                           (const struct sockaddr *)m->msg_name,
 		                           m->msg_namelen, flags);
@@ -973,4 +1097,281 @@ int recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
 		}
 	}
 	return (int)vlen;
+}
+
+/* --- routes around the send and receive hooks (D-36) ----------------------- */
+
+/* These calls move data through a descriptor without passing through any of the
+ * send or receive hooks above: the kernel does the work (sendfile, splice), or
+ * glibc does it through internal calls (stdio).  On a UDP socket the data would
+ * go out without a SOCKS header -- directly, if the kernel socket has a
+ * destination of its own, or to the relay to be discarded.  Where the call can
+ * be carried out through the shim, it is; where it cannot, it is refused. */
+
+static struct udpc_ratelimit g_rl_unhookable;
+
+static int refuse_unhookable(int fd, const char *what)
+{
+	char note[80];
+	unsigned n = udpc_ratelimit(&g_rl_unhookable);
+
+	if (n != 0)
+		udpc_warn("refusing %s on UDP descriptor %d: it sends without "
+		          "passing through udpchains, so the data could not be "
+		          "proxied%s",
+		          what, fd, udpc_ratelimit_note(n, note, sizeof(note)));
+	errno = EINVAL;
+	return -1;
+}
+
+ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+{
+	if (udpc_intercept(out_fd) != NULL)
+		return refuse_unhookable(out_fd, "sendfile");
+	return REAL_SENDFILE(out_fd, in_fd, offset, count);
+}
+
+ssize_t sendfile64(int out_fd, int in_fd, off64_t *offset, size_t count)
+{
+	if (udpc_intercept(out_fd) != NULL)
+		return refuse_unhookable(out_fd, "sendfile");
+	return REAL_SENDFILE64(out_fd, in_fd, offset, count);
+}
+
+/* Refused in both directions: splicing out of a UDP socket would hand the
+ * program the SOCKS header as data. */
+ssize_t splice(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len,
+               unsigned int flags)
+{
+	if (udpc_intercept(fd_in) != NULL)
+		return refuse_unhookable(fd_in, "splice");
+	if (udpc_intercept(fd_out) != NULL)
+		return refuse_unhookable(fd_out, "splice");
+	return REAL_SPLICE(fd_in, off_in, fd_out, off_out, len, flags);
+}
+
+/* A stream on a UDP socket reads and writes through glibc's internal calls,
+ * which no hook sees.  Refusing the stream is the only point at which stdio
+ * can be stopped. */
+FILE *fdopen(int fd, const char *mode)
+{
+	if (udpc_intercept(fd) != NULL) {
+		refuse_unhookable(fd, "a stdio stream (fdopen)");
+		return NULL;
+	}
+	return REAL_FDOPEN(fd, mode);
+}
+
+/* pwritev2 and preadv2 with an offset of -1 act on the current position, which
+ * on a socket makes them writev and readv.  Any other offset is ESPIPE on a
+ * socket, as it is unhooked. */
+static ssize_t pwritev2_common(udpc_pwritev2_fn real, int fd, const struct iovec *iov,
+                               int iovcnt, off_t offset, int flags)
+{
+	if (udpc_intercept(fd) == NULL)
+		return real(fd, iov, iovcnt, offset, flags);
+	if (offset != -1) {
+		errno = ESPIPE;
+		return -1;
+	}
+	if (flags != 0) {
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+	return writev(fd, iov, iovcnt);
+}
+
+static ssize_t preadv2_common(udpc_preadv2_fn real, int fd, const struct iovec *iov,
+                              int iovcnt, off_t offset, int flags)
+{
+	if (udpc_intercept(fd) == NULL)
+		return real(fd, iov, iovcnt, offset, flags);
+	if (offset != -1) {
+		errno = ESPIPE;
+		return -1;
+	}
+	if (flags != 0) {
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+	return readv(fd, iov, iovcnt);
+}
+
+ssize_t pwritev2(int fd, const struct iovec *iov, int iovcnt, off_t offset, int flags)
+{
+	return pwritev2_common(REAL_PWRITEV2, fd, iov, iovcnt, offset, flags);
+}
+
+ssize_t pwritev64v2(int fd, const struct iovec *iov, int iovcnt, off64_t offset,
+                    int flags)
+{
+	return pwritev2_common(REAL_PWRITEV64V2, fd, iov, iovcnt, offset, flags);
+}
+
+ssize_t preadv2(int fd, const struct iovec *iov, int iovcnt, off_t offset, int flags)
+{
+	return preadv2_common(REAL_PREADV2, fd, iov, iovcnt, offset, flags);
+}
+
+ssize_t preadv64v2(int fd, const struct iovec *iov, int iovcnt, off64_t offset,
+                   int flags)
+{
+	return preadv2_common(REAL_PREADV64V2, fd, iov, iovcnt, offset, flags);
+}
+
+/* dprintf formats into a stream glibc writes through an internal call.  On a
+ * UDP socket the output is formatted here instead, into this thread's scratch
+ * buffer, and sent through the shim as one datagram. */
+int __vsnprintf_chk(char *s, size_t maxlen, int flag, size_t slen,
+                    const char *fmt, va_list ap);
+int __dprintf_chk(int fd, int flag, const char *fmt, ...);
+int __vdprintf_chk(int fd, int flag, const char *fmt, va_list ap);
+
+static int dprintf_through_shim(int fd, struct udpc_fdent *e, int flag,
+                                const char *fmt, va_list ap)
+{
+	const struct udpc_config *cfg = udpc_shim_config();
+	struct udpc_tls *tls;
+	struct iovec iov;
+	ssize_t sent;
+	int n;
+
+	if (cfg == NULL) {
+		errno = udpc_shim_failure_errno();
+		return -1;
+	}
+	tls = udpc_tls_get(cfg->max_datagram + UDPC_SOCKS_HDR_MAX);
+	if (tls == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	n = flag > 0 ? __vsnprintf_chk((char *)tls->buf, tls->buflen, flag,
+	                               tls->buflen, fmt, ap)
+	             : vsnprintf((char *)tls->buf, tls->buflen, fmt, ap);
+	if (n < 0)
+		return -1;
+	if ((size_t)n >= tls->buflen) {
+		errno = EMSGSIZE;
+		return -1;
+	}
+	iov.iov_base = tls->buf;
+	iov.iov_len = (size_t)n;
+	sent = udpc_core_send(fd, e, &iov, 1, NULL, 0, 0);
+	return sent < 0 ? -1 : (int)sent;
+}
+
+int vdprintf(int fd, const char *fmt, va_list ap)
+{
+	struct udpc_fdent *e = udpc_intercept(fd);
+
+	if (e == NULL)
+		return REAL_VDPRINTF(fd, fmt, ap);
+	return dprintf_through_shim(fd, e, 0, fmt, ap);
+}
+
+int __vdprintf_chk(int fd, int flag, const char *fmt, va_list ap)
+{
+	struct udpc_fdent *e = udpc_intercept(fd);
+
+	if (e == NULL)
+		return REAL_VDPRINTF_CHK(fd, flag, fmt, ap);
+	return dprintf_through_shim(fd, e, flag, fmt, ap);
+}
+
+int dprintf(int fd, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vdprintf(fd, fmt, ap);
+	va_end(ap);
+	return n;
+}
+
+int __dprintf_chk(int fd, int flag, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = __vdprintf_chk(fd, flag, fmt, ap);
+	va_end(ap);
+	return n;
+}
+
+#ifdef SYS_pidfd_getfd
+/* A socket copied out of another process is a new descriptor here, like one
+ * received over SCM_RIGHTS, and is adopted the same way.  Made through
+ * syscall() rather than glibc's wrapper, which is newer than the 2.34 floor
+ * (NFR-01a). */
+int pidfd_getfd(int pidfd, int targetfd, unsigned int flags)
+{
+	int fd = (int)REAL_SYSCALL(SYS_pidfd_getfd, (long)pidfd, (long)targetfd,
+	                           (long)flags, 0L, 0L, 0L);
+	int rc;
+
+	if (fd < 0 || UDPC_IN_SHIM())
+		return fd;
+	rc = adopt_or_close(fd, "copied");
+	if (rc < 0) {
+		/* Closed: as socket() fails for each of these. */
+		errno = rc == UDPC_ADOPT_UNTRACKABLE ? EMFILE : EPERM;
+		return -1;
+	}
+	return fd;
+}
+#endif
+
+/* glibc also exports some calls under a second, underscored name, kept for old
+ * binaries.  A program can link against these directly, so each is the hook by
+ * another name.  (glibc's own internal calls bind inside libc and never reach
+ * here.) */
+ssize_t __write(int fd, const void *buf, size_t len);
+ssize_t __read(int fd, void *buf, size_t len);
+ssize_t __send(int fd, const void *buf, size_t len, int flags);
+int __connect(int fd, const struct sockaddr *addr, socklen_t addrlen);
+int __close(int fd);
+int __dup2(int oldfd, int newfd);
+int __fcntl(int fd, int cmd, ...);
+
+ssize_t __write(int fd, const void *buf, size_t len)
+{
+	return write(fd, buf, len);
+}
+
+ssize_t __read(int fd, void *buf, size_t len)
+{
+	return read(fd, buf, len);
+}
+
+ssize_t __send(int fd, const void *buf, size_t len, int flags)
+{
+	return send(fd, buf, len, flags);
+}
+
+int __connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	return connect(fd, addr, addrlen);
+}
+
+int __close(int fd)
+{
+	return close(fd);
+}
+
+int __dup2(int oldfd, int newfd)
+{
+	return dup2(oldfd, newfd);
+}
+
+int __fcntl(int fd, int cmd, ...)
+{
+	va_list ap;
+	void *arg;
+
+	va_start(ap, cmd);
+	arg = va_arg(ap, void *);
+	va_end(ap);
+	return fcntl(fd, cmd, arg);
 }

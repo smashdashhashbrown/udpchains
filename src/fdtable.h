@@ -104,11 +104,12 @@ struct udpc_fdent *udpc_fd_lookup(int fd);
 struct udpc_fdent *udpc_fd_lookup_verified(int fd);
 
 /* Adopts fd if it is an AF_INET/AF_INET6 UDP socket the table does not yet
- * track -- one inherited across exec, received over SCM_RIGHTS, or found behind
- * a stale entry.  Returns 1 if adopted and 0 if it is not a datagram socket in
- * those families.  A negative return means the caller must not let it through:
- * UDPC_ADOPT_UNTRACKABLE for a UDP socket the table cannot hold, and
- * UDPC_ADOPT_UNPROXIABLE for a datagram socket that is not UDP (D-29). */
+ * track -- one inherited across exec, received over SCM_RIGHTS, copied with
+ * pidfd_getfd, or found behind a stale entry.  Returns 1 if adopted and 0 if it
+ * is not a datagram socket in those families.  A negative return means the
+ * caller must not let it through: UDPC_ADOPT_UNTRACKABLE for a UDP socket the
+ * table cannot hold, and UDPC_ADOPT_UNPROXIABLE for a datagram socket that is
+ * not UDP (D-29) or a raw or packet socket (D-36). */
 #define UDPC_ADOPT_UNTRACKABLE (-1)
 #define UDPC_ADOPT_UNPROXIABLE (-2)
 int udpc_fd_adopt(int fd);

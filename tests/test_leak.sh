@@ -151,6 +151,19 @@ echo "$OUT" | sed 's/^/#   /'
 check "every lookup that needs DNS fails with the proxy down" "$RC" "0"
 check "ZERO queries reached the resolver" "$(grep -c '^QUERY' "$TMP/dnsd.log")" "0"
 
+echo "# TST-03 scenario 5: raw and packet sockets are refused (D-36)"
+# These reach the network below UDP, where SOCKS5 cannot follow.  Without
+# CAP_NET_RAW the kernel refuses them with EPERM anyway, so the shim's own
+# diagnostic is what shows the refusal is the shim's.  As root, the EPERM count
+# alone proves it.
+OUT=$(UDPCHAINS_PROXY="$DEAD_PROXY" UDPCHAINS_QUIET=0 \
+	timeout 30 "$WRAPPER" "$BUILD/leakclient" raw 2>&1)
+echo "$OUT" | sed 's/^/#   /'
+check "all 8 raw and packet socket attempts fail with EPERM" \
+	"$(echo "$OUT" | grep -c '^RAW .* Operation not permitted$')" "8"
+check "and the shim says why" \
+	"$(echo "$OUT" | grep -q 'refusing a raw' && echo yes || echo no)" "yes"
+
 echo "# TST-03 control: the same client DOES reach the destination unproxied"
 # Without this, the test could pass because the client is broken rather than
 # because the shim is working.

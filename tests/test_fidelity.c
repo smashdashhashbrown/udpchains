@@ -13,14 +13,26 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef SOL_UDP
+#define SOL_UDP 17
+#endif
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
 
 static struct sockaddr_in g_echo1, g_echo2;
 static struct sockaddr_in6 g_echo6;
@@ -850,6 +862,247 @@ static void t_fortified(void)
 	close(fd);
 }
 
+/* D-36: calls that reach the kernel without passing through a send or receive
+ * hook.  Through syscall() they are routed to the hooks; dprintf is formatted
+ * and sent through the shim; stdio, sendfile and splice, which glibc and the
+ * kernel carry out without any hook, are refused on a UDP socket. */
+int __dprintf_chk(int fd, int flag, const char *fmt, ...);
+
+static int vdprintf_wrap(int fd, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vdprintf(fd, fmt, ap);
+	va_end(ap);
+	return n;
+}
+
+static void t_syscall_routes(void)
+{
+	struct sockaddr_in peer;
+	socklen_t plen = sizeof(peer);
+	struct msghdr m;
+	struct iovec v;
+	char buf[64], s2[] = "sys2";
+	int fd = udp4();
+
+	TAP_GROUP("D-36: socket calls made through syscall() go through the shim");
+
+	/* Each syscall() is paired with an ordinary call on the other side.  A
+	 * send that bypassed the shim gets a reply the receive hook cannot
+	 * parse; a receive that bypassed it returns the SOCKS header. */
+	TAP_EQ_INT(syscall(SYS_sendto, fd, "sys1", 4, 0, &g_echo1, sizeof(g_echo1)), 4,
+	           "syscall(SYS_sendto) sends 4 bytes");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 4, "and the reply comes back through the proxy");
+	TAP_EQ_MEM(buf, "sys1", 4, "byte for byte");
+
+	sendto(fd, "sys2", 4, 0, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(syscall(SYS_recvfrom, fd, buf, sizeof(buf), 0, NULL, NULL), 4,
+	           "syscall(SYS_recvfrom) returns 4, not the wrapped 14");
+	TAP_EQ_MEM(buf, "sys2", 4, "and the bare payload");
+
+	v.iov_base = s2;
+	v.iov_len = 4;
+	memset(&m, 0, sizeof(m));
+	m.msg_name = &g_echo1;
+	m.msg_namelen = sizeof(g_echo1);
+	m.msg_iov = &v;
+	m.msg_iovlen = 1;
+	TAP_EQ_INT(syscall(SYS_sendmsg, fd, &m, 0), 4, "syscall(SYS_sendmsg) sends 4 bytes");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 4, "and the reply comes back through the proxy");
+	TAP_EQ_MEM(buf, "sys2", 4, "byte for byte");
+	close(fd);
+
+	fd = udp4();
+	TAP_EQ_INT(syscall(SYS_connect, fd, &g_echo1, sizeof(g_echo1)), 0,
+	           "syscall(SYS_connect) succeeds");
+	TAP_EQ_INT(send(fd, "sys3", 4, 0), 4,
+	           "send() then has the destination the shim was told of");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 4, "and the reply is proxied");
+	TAP_EQ_INT(syscall(SYS_getpeername, fd, &peer, &plen), 0,
+	           "syscall(SYS_getpeername) succeeds");
+	TAP_EQ_INT(ntohs(peer.sin_port), ntohs(g_echo1.sin_port),
+	           "and reports the program's destination, not the relay");
+	TAP_EQ_INT(syscall(SYS_write, fd, "sys4", 4), 4, "syscall(SYS_write) sends 4 bytes");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(read(fd, buf, sizeof(buf)), 4, "and the reply is proxied");
+	TAP_EQ_MEM(buf, "sys4", 4, "byte for byte");
+	TAP_EQ_INT(write(fd, "sys5", 4), 4, "write() sends 4 bytes");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(syscall(SYS_read, fd, buf, sizeof(buf)), 4,
+	           "syscall(SYS_read) returns 4, not the wrapped 14");
+	TAP_EQ_MEM(buf, "sys5", 4, "and the bare payload");
+	close(fd);
+}
+
+static void t_dprintf(void)
+{
+	char buf[64];
+	int fd = udp4();
+
+	TAP_GROUP("D-36: dprintf on a UDP socket is sent through the shim");
+
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_EQ_INT(dprintf(fd, "dp%d", 1), 3, "dprintf returns the 3 bytes written");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 3, "and they come back through the proxy");
+	TAP_EQ_MEM(buf, "dp1", 3, "byte for byte");
+
+	TAP_EQ_INT(vdprintf_wrap(fd, "vdp%d", 2), 4, "vdprintf returns 4");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 4, "and is proxied");
+	TAP_EQ_MEM(buf, "vdp2", 4, "byte for byte");
+
+	TAP_EQ_INT(__dprintf_chk(fd, 1, "chk%d", 3), 4,
+	           "__dprintf_chk, which _FORTIFY_SOURCE builds call, returns 4");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 4, "and is proxied");
+	TAP_EQ_MEM(buf, "chk3", 4, "byte for byte");
+	close(fd);
+}
+
+ssize_t __write(int fd, const void *buf, size_t len);
+ssize_t __read(int fd, void *buf, size_t len);
+ssize_t __send(int fd, const void *buf, size_t len, int flags);
+
+static void t_underscored_aliases(void)
+{
+	char buf[16];
+	int fd = udp4();
+
+	TAP_GROUP("D-36: glibc's public underscored aliases go through the shim");
+
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_EQ_INT(__send(fd, "us1", 3, 0), 3, "__send sends 3 bytes");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 3, "and the reply is proxied");
+	TAP_EQ_INT(__write(fd, "us2", 3), 3, "__write sends 3 bytes");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 3, "and the reply is proxied");
+	TAP_EQ_INT(write(fd, "us3", 3), 3, "write sends the next probe");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(__read(fd, buf, sizeof(buf)), 3, "__read returns 3, not the wrapped 13");
+	TAP_EQ_MEM(buf, "us3", 3, "and the bare payload");
+	close(fd);
+}
+
+static void t_pwritev2(void)
+{
+	char buf[16], out[] = "pv2";
+	struct iovec v = { out, 3 }, r = { buf, sizeof(buf) };
+	int fd = udp4();
+
+	TAP_GROUP("D-36: pwritev2 and preadv2 at the current position go through the shim");
+
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	TAP_EQ_INT(pwritev2(fd, &v, 1, -1, 0), 3, "pwritev2 with offset -1 sends 3 bytes");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 3, "and the reply is proxied");
+	TAP_EQ_MEM(buf, "pv2", 3, "byte for byte");
+	TAP_EQ_INT(write(fd, "pr2", 3), 3, "write sends the next probe");
+	memset(buf, 0, sizeof(buf));
+	TAP_EQ_INT(preadv2(fd, &r, 1, -1, 0), 3,
+	           "preadv2 with offset -1 returns 3, not the wrapped 13");
+	TAP_EQ_MEM(buf, "pr2", 3, "and the bare payload");
+	errno = 0;
+	TAP_OK(pwritev2(fd, &v, 1, 0, 0) == -1 && errno == ESPIPE,
+	       "an explicit offset is ESPIPE, as on any socket");
+	close(fd);
+}
+
+static void t_unhookable_refused(void)
+{
+	FILE *tf = tmpfile(), *f;
+	int fd = udp4(), sv[2], p[2];
+	off_t off = 0;
+
+	TAP_GROUP("D-36: stdio, sendfile and splice are refused on a UDP socket");
+
+	connect(fd, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+	fputs("data", tf);
+	fflush(tf);
+
+	errno = 0;
+	f = fdopen(fd, "w");
+	TAP_OK(f == NULL && errno == EINVAL, "fdopen on a UDP socket fails with EINVAL");
+	errno = 0;
+	TAP_OK(sendfile(fd, fileno(tf), &off, 4) == -1 && errno == EINVAL,
+	       "sendfile onto a UDP socket fails with EINVAL");
+	TAP_EQ_INT(pipe(p), 0, "a pipe is created");
+	TAP_EQ_INT(write(p[1], "spl", 3), 3, "and filled");
+	errno = 0;
+	TAP_OK(splice(p[0], NULL, fd, NULL, 3, 0) == -1 && errno == EINVAL,
+	       "splice onto a UDP socket fails with EINVAL");
+
+	/* The same calls on a Unix socket are not the shim's business. */
+	TAP_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0, "a Unix socketpair is created");
+	off = 0;
+	TAP_EQ_INT(sendfile(sv[0], fileno(tf), &off, 4), 4,
+	           "sendfile onto a Unix socket still works");
+	TAP_EQ_INT(splice(p[0], NULL, sv[0], NULL, 3, 0), 3,
+	           "and so does splice");
+	f = fdopen(sv[0], "w");
+	TAP_OK(f != NULL, "and fdopen");
+	if (f != NULL)
+		fclose(f);
+	close(sv[1]);
+	close(p[0]);
+	close(p[1]);
+	fclose(tf);
+	close(fd);
+}
+
+static void t_cork_refused(void)
+{
+	union {
+		struct cmsghdr align;
+		char buf[CMSG_SPACE(sizeof(uint16_t))];
+	} ctl;
+	struct cmsghdr *c;
+	struct msghdr m;
+	struct iovec v;
+	uint16_t seg = 100;
+	char buf[16], gso[] = "gso";
+	int fd = udp4();
+
+	TAP_GROUP("D-36: MSG_MORE and GSO are refused rather than corrupting data");
+
+	errno = 0;
+	TAP_OK(sendto(fd, "m", 1, MSG_MORE, (struct sockaddr *)&g_echo1,
+	              sizeof(g_echo1)) == -1 && errno == EOPNOTSUPP,
+	       "sendto with MSG_MORE fails with EOPNOTSUPP");
+
+	memset(&ctl, 0, sizeof(ctl));
+	v.iov_base = gso;
+	v.iov_len = 3;
+	memset(&m, 0, sizeof(m));
+	m.msg_name = &g_echo1;
+	m.msg_namelen = sizeof(g_echo1);
+	m.msg_iov = &v;
+	m.msg_iovlen = 1;
+	m.msg_control = ctl.buf;
+	m.msg_controllen = sizeof(ctl.buf);
+	c = CMSG_FIRSTHDR(&m);
+	c->cmsg_level = SOL_UDP;
+	c->cmsg_type = UDP_SEGMENT;
+	c->cmsg_len = CMSG_LEN(sizeof(seg));
+	memcpy(CMSG_DATA(c), &seg, sizeof(seg));
+	errno = 0;
+	TAP_OK(sendmsg(fd, &m, 0) == -1 && errno == EOPNOTSUPP,
+	       "sendmsg with a UDP_SEGMENT control message fails with EOPNOTSUPP");
+
+	TAP_EQ_INT(sendto(fd, "ok", 2, 0, (struct sockaddr *)&g_echo1, sizeof(g_echo1)), 2,
+	           "a plain send on the same socket still works");
+	TAP_EQ_INT(recv(fd, buf, sizeof(buf), 0), 2, "and is proxied");
+	close(fd);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 4) {
@@ -893,6 +1146,12 @@ int main(int argc, char **argv)
 	t_fortified();
 	t_non_udp_refused();
 	t_argument_checks();
+	t_syscall_routes();
+	t_dprintf();
+	t_pwritev2();
+	t_underscored_aliases();
+	t_unhookable_refused();
+	t_cork_refused();
 
 	TAP_DONE();
 }

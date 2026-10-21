@@ -15,6 +15,8 @@
 
 #include "compat.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -53,6 +55,17 @@ enum udpc_real_slot {
 	/* name resolution (D-22) */
 	R_GETADDRINFO,
 	R_GETNAMEINFO,
+	/* routes around the send and receive hooks (D-36) */
+	R_PWRITEV2,
+	R_PWRITEV64V2,
+	R_PREADV2,
+	R_PREADV64V2,
+	R_SENDFILE,
+	R_SENDFILE64,
+	R_SPLICE,
+	R_FDOPEN,
+	R_VDPRINTF,
+	R_VDPRINTF_CHK,
 	R_SLOT_COUNT
 };
 
@@ -91,6 +104,14 @@ typedef long (*udpc_syscall_fn)(long, ...);
 
 typedef int (*udpc_getpeername_fn)(int, struct sockaddr *, socklen_t *);
 typedef int (*udpc_getsockname_fn)(int, struct sockaddr *, socklen_t *);
+
+typedef ssize_t (*udpc_pwritev2_fn)(int, const struct iovec *, int, off_t, int);
+typedef ssize_t (*udpc_preadv2_fn)(int, const struct iovec *, int, off_t, int);
+typedef ssize_t (*udpc_sendfile_fn)(int, int, off_t *, size_t);
+typedef ssize_t (*udpc_splice_fn)(int, loff_t *, int, loff_t *, size_t, unsigned);
+typedef FILE *(*udpc_fdopen_fn)(int, const char *);
+typedef int (*udpc_vdprintf_fn)(int, const char *, va_list);
+typedef int (*udpc_vdprintf_chk_fn)(int, int, const char *, va_list);
 
 struct addrinfo;
 typedef int (*udpc_getaddrinfo_fn)(const char *, const char *,
@@ -134,5 +155,20 @@ typedef int (*udpc_getnameinfo_fn)(const struct sockaddr *, socklen_t, char *,
 	((udpc_getaddrinfo_fn)udpc_real(R_GETADDRINFO, "getaddrinfo"))
 #define REAL_GETNAMEINFO \
 	((udpc_getnameinfo_fn)udpc_real(R_GETNAMEINFO, "getnameinfo"))
+
+#define REAL_PWRITEV2 ((udpc_pwritev2_fn)udpc_real(R_PWRITEV2, "pwritev2"))
+#define REAL_PWRITEV64V2 \
+	((udpc_pwritev2_fn)udpc_real(R_PWRITEV64V2, "pwritev64v2"))
+#define REAL_PREADV2 ((udpc_preadv2_fn)udpc_real(R_PREADV2, "preadv2"))
+#define REAL_PREADV64V2 \
+	((udpc_preadv2_fn)udpc_real(R_PREADV64V2, "preadv64v2"))
+#define REAL_SENDFILE ((udpc_sendfile_fn)udpc_real(R_SENDFILE, "sendfile"))
+#define REAL_SENDFILE64 \
+	((udpc_sendfile_fn)udpc_real(R_SENDFILE64, "sendfile64"))
+#define REAL_SPLICE ((udpc_splice_fn)udpc_real(R_SPLICE, "splice"))
+#define REAL_FDOPEN ((udpc_fdopen_fn)udpc_real(R_FDOPEN, "fdopen"))
+#define REAL_VDPRINTF ((udpc_vdprintf_fn)udpc_real(R_VDPRINTF, "vdprintf"))
+#define REAL_VDPRINTF_CHK \
+	((udpc_vdprintf_chk_fn)udpc_real(R_VDPRINTF_CHK, "__vdprintf_chk"))
 
 #endif /* UDPCHAINS_REAL_H */

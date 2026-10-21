@@ -68,7 +68,8 @@ static size_t copy_to_iov(const uint8_t *src, size_t len, const struct iovec *io
 /* D-33: these fire per datagram, so a program retrying a multicast send in a
  * loop -- or a remote peer sending oversized replies -- would otherwise fill
  * stderr.  One report per second, with a count of the rest. */
-static struct udpc_ratelimit g_rl_multicast, g_rl_broadcast, g_rl_oversize;
+static struct udpc_ratelimit g_rl_multicast, g_rl_broadcast, g_rl_oversize,
+	g_rl_cork;
 
 static int reject_unrepresentable(const struct sockaddr *dst)
 {
@@ -301,6 +302,22 @@ ssize_t udpc_core_send(int fd, struct udpc_fdent *e, const struct iovec *iov,
 	/* L2: what the kernel says, rather than a crash in iov_total. */
 	if (iovcnt > 0 && iov == NULL) {
 		errno = EFAULT;
+		return -1;
+	}
+
+	/* D-36: MSG_MORE asks the kernel to join this call to the next into one
+	 * datagram.  Each call carries its own SOCKS header, so the joined
+	 * datagram would arrive with a header in its middle. */
+	if (flags & MSG_MORE) {
+		char note[80];
+		unsigned n = udpc_ratelimit(&g_rl_cork);
+
+		if (n != 0)
+			udpc_warn("refusing MSG_MORE: each send carries its own SOCKS "
+			          "header, so sends cannot be joined into one "
+			          "datagram%s",
+			          udpc_ratelimit_note(n, note, sizeof(note)));
+		errno = EOPNOTSUPP;
 		return -1;
 	}
 

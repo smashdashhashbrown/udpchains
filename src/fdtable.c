@@ -183,6 +183,11 @@ int udpc_fd_adopt(int fd)
 	len = sizeof(type);
 	if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0)
 		return 0;
+	/* D-36: raw and packet sockets reach the network below UDP, where
+	 * SOCKS5 cannot follow. */
+	if (domain == AF_PACKET ||
+	    ((domain == AF_INET || domain == AF_INET6) && type == SOCK_RAW))
+		return UDPC_ADOPT_UNPROXIABLE;
 	if (type != SOCK_DGRAM || (domain != AF_INET && domain != AF_INET6))
 		return 0;
 	len = sizeof(protocol);

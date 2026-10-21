@@ -88,6 +88,15 @@ want getaddrinfo getnameinfo getaddrinfo_a \
 	__res_nquery __res_nsearch __res_nquerydomain __res_nsend
 reject freeaddrinfo
 
+# D-36: calls that move data through a descriptor without any send or receive
+# hook seeing it.  Each is proxied (dprintf, pwritev2, preadv2), refused on a UDP
+# socket (sendfile, splice, fdopen), or adopted (pidfd_getfd).
+echo "# TST-02: D-36 routes around the send and receive hooks"
+want sendfile sendfile64 splice fdopen dprintf vdprintf __dprintf_chk __vdprintf_chk \
+	pwritev2 pwritev64v2 preadv2 preadv64v2 pidfd_getfd
+# glibc's public underscored aliases for hooked calls, which a program can link
+# against directly.
+want __write __read __send __connect __close __dup2 __fcntl
 echo "# TST-02: FR-I-05 introspection hooks"
 want getpeername getsockname
 
