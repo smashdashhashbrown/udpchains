@@ -20,9 +20,10 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   hop alone. A single proxy behaves exactly as before.
 - **Chain setup** in the SOCKS5 client: each hop is reached by `CONNECT` through the hops before
   it and negotiated with its own credentials, later hops by the address as written (D-39), and
-  each hop's relay is fixed up as D-40 says. A failure at any hop fails the whole chain and names
-  the hop (D-37). The resolver's TCP fallback tunnels through the chain. Not yet used by the
-  datagram path.
+  each hop's relay is fixed up as D-40 says, `localhost` counting as loopback. Later hops are
+  declared the unspecified address in the family they see (D-44). A failure at any hop fails the
+  whole chain and names the hop, once a second (D-37, D-43). The resolver's TCP fallback tunnels
+  through the chain. Not yet used by the datagram path.
 
 ### Changed
 
@@ -49,10 +50,10 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 870 assertions across 18 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
+- 884 assertions across 18 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
   leak client tries 13 more routes, and the leak test checks the raw-socket refusal. The chain
   configuration adds 71 to unit-config and 6 to the wrapper tests, and chain setup has a new
-  group, unit-chain, with 80, against chained fixture proxies. Clean under
+  group, unit-chain, with 94, against chained fixture proxies. Clean under
   ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
 
 ## [0.1.0] — 2026-10-20

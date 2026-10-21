@@ -56,6 +56,8 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-40](#d-40) | The relay fixup applies per hop; the loopback guard looks at the exit hop | FR-CH-07, FR-CH-08; amends D-16, D-05 R2 |
 | [D-41](#d-41) | Every layer of a received datagram is checked, or the datagram is dropped | FR-CH-06 |
 | [D-42](#d-42) | At most 8 hops; `max_datagram` stays the program's payload | FR-CH-13 |
+| [D-43](#d-43) | A chain's setup failures name the hop, once a second | FR-CH-12; extends D-33 |
+| [D-44](#d-44) | Later hops are declared the unspecified address, in the family they see | FR-P-05 per hop |
 
 ---
 
@@ -1502,6 +1504,10 @@ is a foothold into the next network. Skipping one either fails later in a confus
 reaches the target by a route the user did not intend. This is D-05's argument against a bypass
 list, applied to the chain.
 
+**In the code.** `udpc_socks_associate_chain` associates hop 1 first, then each later hop, and
+closes the hops already up if one fails. The single-hop `udpc_socks_associate` is given a chain only
+by mistake; it then fails with `EINVAL` rather than associate with the first hop alone.
+
 **Revisit if:** a user needs failover between equivalent first hops. That would be a list of
 alternatives for one hop, not a looser chain.
 
@@ -1596,9 +1602,22 @@ local, because the proxy is where it will be resolved. Both read one flag, `prox
   name, carried as `ATYP 0x03` in the outer header. A loopback `BND.ADDR` is used only if hop *k*
   was itself given as a loopback address, so that it is on the same host as hop *k*−1; otherwise it
   is replaced by hop *k*'s address.
+- **`localhost` counts as a loopback address** (added with chain setup, the same day). A hop given
+  as `localhost`, in any case and with or without the root dot, is treated like one given as
+  `127.0.0.1`: its loopback relay is kept, and a wildcard relay becomes the loopback address in the
+  relay's family. RFC 6761 reserves the name for loopback. Without this, the relay would become the
+  name `localhost`, which costs header bytes, may resolve at hop *k*−1 to `::1` when the relay
+  listens only on `127.0.0.1`, and leaves D-41 only the port to check. Other names that happen to
+  resolve to loopback stay names. The hop itself is still reached by name, as D-39 says.
+- **A relay given by name is refused at every hop.** A `BND.ADDR` of `ATYP 0x03` in a UDP ASSOCIATE
+  reply fails the chain with `EPROTO`, as 0.1.0 does for its one proxy. For hop 1 this must stay:
+  this host sends to that relay, and would have to resolve it. For a later hop it could be accepted,
+  since only the hop before it needs to resolve the name, at the cost of D-41 checking that layer by
+  port alone. No proxy known to do this has been seen.
 
-**Open question.** Whether real proxies accept a name (`ATYP 0x03`) in a UDP header, which the
-wildcard case with a named hop needs. Interop will tell (FR-CH-T4).
+**Open questions.** Whether real proxies accept a name (`ATYP 0x03`) in a UDP header, which the
+wildcard case with a named hop needs, and whether any answers UDP ASSOCIATE with a named relay.
+Interop will tell (FR-CH-T4).
 
 ---
 
@@ -1639,3 +1658,65 @@ relay inject datagrams with a forged inner source.
   the smallest buffer in the chain decides what fits (D-12: configured, not discovered). The README
   will say how to choose `max_datagram` for a chain.
 
+---
+
+## D-43
+### A chain's setup failures name the hop, once a second
+
+**Date:** 2026-10-20 · **Status:** Accepted · FR-CH-12. Extends D-33.
+
+**Context.** An `errno` such as `ECONNREFUSED` cannot say which of several hops failed. For one
+proxy, 0.1.0 reports a failure to reach or associate with it by the `errno` alone, and prints only
+for authentication problems. A program that retries its sends rebuilds the whole chain on each
+retry, so a line per failure would repeat once per send.
+
+**Decision.**
+
+- **In a chain, every setup failure prints one line naming the hop:** its position, the chain's
+  length and its address as given, then what failed and the `errno`. For example:
+  `hop 2 of 3 (10.0.0.5:1080): hop 1 could not reach it: Connection refused`.
+- **At error level,** so `-q` does not hide it: with it hidden, the `errno` would not say which hop
+  to look at.
+- **At most one a second,** shared by all hops, as D-33 limits repeated warnings. The next line
+  that prints says how many were held back.
+- **No vaguer line after a specific one.** Where the negotiation has already said what went wrong
+  (for example, `proxy rejected the supplied credentials`), prefixed with the hop, no generic
+  `negotiation failed` line follows it. Those specific lines are not rate-limited, as in 0.1.0.
+- **A chain of one prints exactly what 0.1.0 printed** (FR-CH-01): nothing for a failure to reach
+  or associate, and the same authentication messages with no prefix.
+
+**Consequences.** Because the limit is shared, a second, different failure within the same second
+is counted rather than shown. A chain that keeps failing in one way shows one line a second.
+
+**Revisit if:** users find a whole chain's failures held back by one noisy hop. The limit could
+then be kept per hop.
+
+---
+
+## D-44
+### Later hops are declared the unspecified address, in the family they see
+
+**Date:** 2026-10-20 · **Status:** Accepted · FR-P-05, applied to each hop.
+
+**Context.** FR-P-05 declares in UDP ASSOCIATE the address the client will send from, or
+`0.0.0.0:0` when it does not know it. Hop *k* (*k* ≥ 2) receives its datagrams from hop *k*−1's
+UDP relay socket, whose address and port this host is never told. The only address hop *k*−1
+reports is the one its `CONNECT` to hop *k* came from, in the `CONNECT` reply's `BND.ADDR`, and that
+is a TCP connection, not the UDP socket.
+
+**Decision.** Hop *k* is declared the unspecified address with port 0, in:
+
+1. the family of hop *k*'s own address, when it was given as a number;
+2. otherwise, the family of the `CONNECT` reply's `BND.ADDR`, which is the family hop *k* sees the
+   chain arrive in, a v4-mapped address counting as IPv4. A reply of all zeros, or naming a domain,
+   is not taken as a signal, since proxies that send zeros send them whatever the family;
+3. otherwise, IPv4.
+
+**Rejected: declaring the `CONNECT` reply's address with port 0.** A proxy that pins an association
+to the declared address (Dante with `udp.connectdst`, the fixture's `--pin-declared`) would then
+accept datagrams from hop *k*−1, but only if hop *k*−1 sends its UDP from the same address as its
+TCP connection. That is common but not guaranteed, and where it fails the association silently
+drops everything, which is the failure FR-P-05 exists to prevent.
+
+**Revisit if:** interop (FR-CH-T4) finds a proxy that needs a declared address to serve as a later
+hop, and that the address its predecessor connects from is also the one it sends UDP from.

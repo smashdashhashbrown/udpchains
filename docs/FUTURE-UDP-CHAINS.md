@@ -112,7 +112,8 @@ stream, so fixture chains need no new fixture.
 
 **Decisions this revisits:** D-05 R2 (loopback guard), D-16 (relay fixup), D-25 (password
 locations), D-26 (protected descriptors), D-27 (configuration resolved once, proxy resolved
-locally), D-31 (fork), and FR-P-05 (declared address; for hops 2 to n it is always `0.0.0.0:0`).
+locally), D-31 (fork), and FR-P-05 (declared address; for hops 2 to n it is always the unspecified
+address, in the family D-44 chooses).
 
 **Decision records to write before coding:**
 
@@ -152,5 +153,13 @@ locally), D-31 (fork), and FR-P-05 (declared address; for hops 2 to n it is alwa
 - **Per-layer checking on receive** has to be exactly right; see decision 4 above.
 - **D-27 was only recently settled.** Remote resolution of later hops changes it again.
 - **Testing a real chain across hosts** needs at least two remote machines. D2 already needs one.
+- **Setup time.** Every step of chain setup (each connect, greeting, `CONNECT` and reply) has its
+  own `connect_timeout`, 5 s by default. An 8-hop chain is 36 handshakes, so a chain whose hops are
+  slow but alive can take far longer than `connect_timeout` to set up, and the program blocks for
+  that long on its first send. An overall deadline, such as `connect_timeout` times the number of
+  hops, would bound it. To decide in step 4, when the association uses chains.
+- **Proxies that pin the declared address** need more than D-44 gives them. Whether any real proxy
+  needs it as a later hop is for interop, as is whether any answers UDP ASSOCIATE with a named
+  relay (D-40).
 - **The name.** The requirements call `udpchains` a working name. If this feature is not built,
   the name promises something the tool does not do.

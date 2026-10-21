@@ -1,5 +1,5 @@
 /* test_chain.c -- chain setup against chained fixtures (FR-CH-01 to FR-CH-04,
- * FR-CH-07, FR-CH-09, FR-CH-12; D-37 to D-40).
+ * FR-CH-07, FR-CH-09, FR-CH-12; D-37 to D-40, D-43, D-44).
  *
  * Links the shim's objects directly, like the other unit tests, and starts its
  * own fixture proxies from the directory it was built in, so it runs the same
@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -484,6 +485,43 @@ int main(int argc, char **argv)
 		TAP_OK(relay.named && relay.port == 40005,
 		       "a loopback relay from a named hop becomes the name");
 
+		/* "localhost" is a loopback address (RFC 6761), whatever its
+		 * case and with or without the root dot. */
+		memset(&relay, 0, sizeof(relay));
+		make_v4(r4, "127.0.0.1", 40009);
+		udpc_socks_hop_addr("localhost:1080", &hop);
+		udpc_socks_fixup_hop_relay(&relay, &hop);
+		TAP_OK(!relay.named && ntohl(r4->sin_addr.s_addr) == INADDR_LOOPBACK &&
+		       ntohs(r4->sin_port) == 40009,
+		       "a loopback relay from a hop given as localhost is kept, "
+		       "as an address");
+
+		memset(&relay, 0, sizeof(relay));
+		make_v4(r4, "0.0.0.0", 40010);
+		udpc_socks_hop_addr("LocalHost.:1080", &hop);
+		udpc_socks_fixup_hop_relay(&relay, &hop);
+		TAP_OK(!relay.named && ntohl(r4->sin_addr.s_addr) == INADDR_LOOPBACK &&
+		       ntohs(r4->sin_port) == 40010,
+		       "a wildcard relay from localhost becomes 127.0.0.1, not the "
+		       "name");
+
+		memset(&relay, 0, sizeof(relay));
+		make_v6(r6, "::", 40011);
+		udpc_socks_hop_addr("localhost:1080", &hop);
+		udpc_socks_fixup_hop_relay(&relay, &hop);
+		TAP_OK(!relay.named && relay.sa.ss_family == AF_INET6 &&
+		       IN6_IS_ADDR_LOOPBACK(&r6->sin6_addr) &&
+		       ntohs(r6->sin6_port) == 40011,
+		       "and an IPv6 wildcard from localhost becomes ::1");
+
+		/* Only "localhost" itself: another name is still a name. */
+		memset(&relay, 0, sizeof(relay));
+		make_v4(r4, "127.0.0.1", 40012);
+		udpc_socks_hop_addr("localhost.example:1080", &hop);
+		udpc_socks_fixup_hop_relay(&relay, &hop);
+		TAP_OK(relay.named && strcmp(relay.host, "localhost.example") == 0,
+		       "a name that merely starts with localhost is a name");
+
 		/* Routable: left alone. */
 		memset(&relay, 0, sizeof(relay));
 		make_v4(r4, "198.51.100.7", 40006);
@@ -509,6 +547,48 @@ int main(int argc, char **argv)
 		TAP_OK(!relay.named && IN6_IS_ADDR_LOOPBACK(&r6->sin6_addr) &&
 		       ntohs(r6->sin6_port) == 40008,
 		       "a ::1 relay from a hop given as ::1 is kept");
+	}
+
+	/* ------------------------------------------------------------------ */
+	TAP_GROUP("D-44: the family a later hop is declared");
+	{
+		struct udpc_socks_addr hop;
+		struct udpc_socks_hdr bnd;
+
+		udpc_socks_hop_addr("[2001:db8::7]:1080", &hop);
+		memset(&bnd, 0, sizeof(bnd));
+		make_v4((struct sockaddr_in *)&bnd.addr, "192.0.2.1", 4000);
+		bnd.addr_valid = true;
+		TAP_EQ_INT(udpc_socks_declared_family(&hop, &bnd), AF_INET6,
+		           "a hop given as IPv6 is declared ::, whatever the reply");
+
+		udpc_socks_hop_addr("proxy.internal:1080", &hop);
+		TAP_EQ_INT(udpc_socks_declared_family(&hop, NULL), AF_INET,
+		           "a named hop with no reply to go on is declared 0.0.0.0");
+
+		memset(&bnd, 0, sizeof(bnd));
+		make_v6((struct sockaddr_in6 *)&bnd.addr, "2001:db8::1", 4000);
+		bnd.addr_valid = true;
+		TAP_EQ_INT(udpc_socks_declared_family(&hop, &bnd), AF_INET6,
+		           "a named hop reached over IPv6 is declared ::");
+
+		memset(&bnd, 0, sizeof(bnd));
+		make_v6((struct sockaddr_in6 *)&bnd.addr, "::ffff:192.0.2.1", 4000);
+		bnd.addr_valid = true;
+		TAP_EQ_INT(udpc_socks_declared_family(&hop, &bnd), AF_INET,
+		           "a v4-mapped reply counts as IPv4");
+
+		memset(&bnd, 0, sizeof(bnd));
+		make_v6((struct sockaddr_in6 *)&bnd.addr, "::", 0);
+		bnd.addr_valid = true;
+		TAP_EQ_INT(udpc_socks_declared_family(&hop, &bnd), AF_INET,
+		           "a reply of :: is not taken as a signal");
+
+		memset(&bnd, 0, sizeof(bnd));
+		bnd.atyp = UDPC_ATYP_DOMAIN;
+		bnd.addr_valid = false;
+		TAP_EQ_INT(udpc_socks_declared_family(&hop, &bnd), AF_INET,
+		           "nor is a reply naming a domain");
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -603,12 +683,59 @@ int main(int argc, char **argv)
 		TAP_EQ_INT(udpc_socks_associate_chain(cfg, NULL, &ch, &e), 0,
 		           "a chain of three associates");
 		TAP_EQ_INT(ch.n, 3, "with three hops");
-		TAP_OK(ch.relay[2].named && strcmp(ch.relay[2].host, "localhost") == 0,
-		       "hop 3 was given by name, so its loopback relay is that name");
+		TAP_OK(!ch.relay[2].named &&
+		       udpc_addr_is_loopback((struct sockaddr *)&ch.relay[2].sa),
+		       "hop 3 was given as localhost, so its loopback relay is "
+		       "kept as an address");
 		TAP_EQ_INT(round_trip(&ch, (struct sockaddr *)&echo_sa), 3,
-		           "a datagram crosses all three and back, the named "
-		           "relay's layer checked by port");
+		           "a datagram crosses all three and back");
 		udpc_socks_disconnect_chain(&ch);
+	}
+
+	/* ------------------------------------------------------------------ */
+	TAP_GROUP("D-40: a relay that becomes a name is crossed by name");
+	{
+		/* This host's own name, if it resolves to an address here: the
+		 * hop before resolves it, and every local address reaches the
+		 * fixture's relay, which listens on all of them.  The relay comes
+		 * back as loopback, so it is replaced by the name. */
+		char host[256], spec[300];
+		struct addrinfo hints, *res = NULL;
+		bool usable = false;
+
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_DGRAM;
+		if (gethostname(host, sizeof(host)) == 0 &&
+		    strcasecmp(host, "localhost") != 0 &&
+		    getaddrinfo(host, NULL, &hints, &res) == 0 && res != NULL) {
+			usable = udpc_addr_is_loopback(res->ai_addr) ||
+			         udpc_addr_is_local(res->ai_addr);
+			freeaddrinfo(res);
+		}
+
+		if (usable) {
+			const char *two[2];
+
+			snprintf(spec, sizeof(spec), "%s:%u", host, pc);
+			two[0] = a;
+			two[1] = spec;
+			cfg = chain_cfg(two, 2);
+			e = 0;
+			TAP_EQ_INT(udpc_socks_associate_chain(cfg, NULL, &ch, &e), 0,
+			           "a chain through this host's name associates");
+			TAP_OK(ch.relay[1].named && strcmp(ch.relay[1].host, host) == 0,
+			       "its loopback relay becomes the name");
+			TAP_EQ_INT(round_trip(&ch, (struct sockaddr *)&echo_sa), 2,
+			           "a datagram crosses it by name and back, that "
+			           "layer checked by port");
+			udpc_socks_disconnect_chain(&ch);
+		} else {
+			TAP_OK(1, "# SKIP this host's name does not resolve to a "
+			          "local address");
+			TAP_OK(1, "# SKIP");
+			TAP_OK(1, "# SKIP");
+		}
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -618,6 +745,7 @@ int main(int argc, char **argv)
 
 		cfg = chain_cfg(two, 2);
 		before = lowest_free_fd();
+		next_report_window();
 		capture_begin(&saved);
 		e = 0;
 		TAP_EQ_INT(udpc_socks_associate_chain(cfg, NULL, &ch, &e), -1,
@@ -626,6 +754,8 @@ int main(int argc, char **argv)
 		TAP_EQ_INT(e, EACCES, "with EACCES");
 		TAP_OK(strstr(g_stderr, "UDPCHAINS_USERNAME_2") != NULL,
 		       "naming hop 2's variables");
+		TAP_OK(strstr(g_stderr, "negotiation failed") == NULL,
+		       "with no vaguer line after the specific one (D-43)");
 		TAP_OK(chain_is_empty(&ch), "leaving no hop");
 		TAP_EQ_INT(lowest_free_fd(), before, "and nothing open");
 
@@ -636,7 +766,8 @@ int main(int argc, char **argv)
 		           "a wrong password for hop 2 fails");
 		capture_end(saved);
 		TAP_EQ_INT(e, EACCES, "with EACCES");
-		TAP_OK(strstr(g_stderr, "hop 2 of 2 (") != NULL,
+		TAP_OK(strstr(g_stderr, "hop 2 of 2 (") != NULL &&
+		       strstr(g_stderr, "rejected the supplied credentials") != NULL,
 		       "and the diagnostic names hop 2 (FR-CH-12)");
 
 		/* Hop 1's credentials are not hop 2's. */

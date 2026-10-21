@@ -25,7 +25,7 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 870 assertions across 18 groups (`tests/run.sh`), all passing, plus the 91-check
+**Test totals:** 884 assertions across 18 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
@@ -34,7 +34,7 @@ from a run rather than editing it by hand.
 | unit-addr | 51 |
 | unit-config | 125 |
 | unit-socks5 | 88 |
-| unit-chain | 80 |
+| unit-chain | 94 |
 | unit-fdtable | 22 |
 | unit-dns | 52 |
 | TST-01 hook matrix | 108 |
@@ -187,12 +187,12 @@ means no code yet.
 | FR-CH-04 | M | unit-config, unit-chain | **Partial** — later hops are checked for form and never resolved here, and are sent to the previous hop as written, a name as `ATYP 0x03` (D-39); a chain through a named hop is tested. Not yet on the wire from the shim |
 | FR-CH-05 | M | — | **Not started** |
 | FR-CH-06 | M | — | **Not started** (D-41) |
-| FR-CH-07 | M | unit-socks5, unit-chain | **Partial** — the per-hop fixup is implemented and unit-tested for every case D-40 lists, and a named relay is crossed against fixtures; the datagram path does not use it yet |
+| FR-CH-07 | M | unit-socks5, unit-chain | **Partial** — the per-hop fixup is implemented and unit-tested for every case D-40 lists, `localhost` counting as loopback, and a relay that becomes a name (this host's own) is crossed against fixtures; the datagram path does not use it yet |
 | FR-CH-08 | M | — | **Not started** (D-40) |
 | FR-CH-09 | M | unit-chain | **Partial** — a chain is alive only while every control connection is, and a later hop's expiry is seen through the tunnel; re-association not started |
 | FR-CH-10 | M | — | **Not started** |
 | FR-CH-11 | M | unit-chain | **Partial** — the TCP fallback's `CONNECT` tunnels through the chain; UDP queries not started |
-| FR-CH-12 | M | unit-chain | **Partial** — chain setup names the failing hop in its diagnostics, and a chain of one keeps 0.1.0's; `-v` path not started |
+| FR-CH-12 | M | unit-chain | **Partial** — chain setup names the failing hop, once a second, with no vaguer line after a specific one, and a chain of one keeps 0.1.0's diagnostics (D-43); `-v` path not started |
 | FR-CH-13 | S | unit-config | **Partial** — at most 8 hops is enforced (D-42); README guidance not written |
 | FR-CH-14 | S | — | **Not started** |
 | FR-CH-T1 to T4 | — | — | **Not started** |

@@ -184,8 +184,19 @@ bool udpc_socks_chain_alive(const struct udpc_socks_chain *chain);
  * it; hop is hop k's address as given.  A wildcard relay becomes hop's address
  * with the relay's port, and may become a name.  A loopback relay is kept only
  * if hop was given as a loopback address, which puts it on the same host as
- * the hop before it; otherwise it is replaced the same way. */
+ * the hop before it; otherwise it is replaced the same way.  "localhost" counts
+ * as a loopback address, and a wildcard from it becomes loopback, not the
+ * name. */
 void udpc_socks_fixup_hop_relay(struct udpc_socks_addr *relay,
                                 const struct udpc_socks_addr *hop);
+
+/* The family of the unspecified address hop k >= 2 is declared in UDP
+ * ASSOCIATE (D-44): that of hop's own address when it was given as a number;
+ * otherwise that of the address the hop before connected to it from, as the
+ * CONNECT reply connect_reply gives it (NULL if there is none); otherwise
+ * AF_INET.  Exposed so the choice can be tested without a proxy that reports
+ * its outbound address. */
+int udpc_socks_declared_family(const struct udpc_socks_addr *hop,
+                               const struct udpc_socks_hdr *connect_reply);
 
 #endif /* UDPCHAINS_SOCKS5_H */
