@@ -11,6 +11,14 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ## [Unreleased]
 
+### Added
+
+- **Configuration for multi-hop chains** (D-37 to D-42): `[hop]` sections in a config file,
+  repeated `-p`, a comma-separated `UDPCHAINS_PROXY`, and credentials per hop, passed on by
+  location like hop 1's. Chains are not carried yet: a configuration of more than one hop is
+  refused by the wrapper, and fails every send in the shim, rather than running through the first
+  hop alone. A single proxy behaves exactly as before.
+
 ### Changed
 
 - **Raw and packet sockets are refused** with `EPERM` and a diagnostic: `SOCK_RAW` and
@@ -36,8 +44,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 713 assertions across 17 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
-  leak client tries 13 more routes, and the leak test checks the raw-socket refusal. Clean under
+- 790 assertions across 17 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
+  leak client tries 13 more routes, and the leak test checks the raw-socket refusal. The chain
+  configuration adds 71 to unit-config and 6 to the wrapper tests. Clean under
   ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
 
 ## [0.1.0] — 2026-10-20

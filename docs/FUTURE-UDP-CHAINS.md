@@ -1,6 +1,10 @@
 # Future requirement — multi-hop UDP chains (FR-P-10)
 
-**Status:** deferred from v1. Planned for a release after 0.1.0. Nothing here is implemented.
+**Status:** in progress after 0.1.0. The requirements in §4 have moved to §2a of
+[`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the reference for them,
+and the design questions in §5 are decided in D-37 to D-42. Steps 1 and 2 of §7 are done: the
+records, and chain configuration with its handoff to the shim. This document stays as the
+background and estimate.
 **Written:** 2026-10-19, against the 0.1.0 candidate (`aa30ddf`). Line counts and file references
 are as of that commit; recheck them before starting.
 

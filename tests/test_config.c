@@ -8,6 +8,8 @@
 #include "tap.h"
 
 #include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -315,6 +317,284 @@ int main(void)
 		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &(int){0}), 0,
 		           "a '#' inside a value is not a comment");
 		TAP_EQ_STR(layer.password, "abc#def", "and stays part of it");
+	}
+
+	TAP_GROUP("D-38: a chain of one is 0.1.0's configuration");
+	{
+		const char *path = write_conf("one.conf",
+		                              "proxy = 127.0.0.1:1080\n"
+		                              "username = alice\n"
+		                              "password = apw\n",
+		                              0600);
+
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &line), 0,
+		           "a 0.1.0 file parses");
+		TAP_EQ_INT(layer.nextra, 0, "as a chain of one");
+		TAP_EQ_STR(layer.username, "alice", "with its credentials on hop 1");
+	}
+
+	TAP_GROUP("D-38: [hop] sections add hops in order");
+	{
+		char pwpath[600], conf[1400];
+		const char *path, *pw;
+
+		pw = write_conf("bob.pw", "bobpw\n", 0600);
+		snprintf(pwpath, sizeof(pwpath), "%s", pw);
+		snprintf(conf, sizeof(conf),
+		         "proxy = 127.0.0.1:1080\n"
+		         "username = alice\n"
+		         "password = apw\n"
+		         "\n"
+		         "[hop]\n"
+		         "proxy = 10.0.0.5:1081\n"
+		         "username = bob\n"
+		         "password_file = %s\n"
+		         "\n"
+		         "[hop]\n"
+		         "proxy = internal.example:1082\n"
+		         "username = carol\n"
+		         "password = cpw\n",
+		         pwpath);
+		path = write_conf("chain.conf", conf, 0600);
+
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &line), 0,
+		           "a file with two [hop] sections parses (%s)", err ? err : "ok");
+		TAP_EQ_INT(layer.nextra, 2, "into a chain of three");
+		TAP_EQ_STR(layer.proxy_spec, "127.0.0.1:1080", "hop 1 is the top-level proxy");
+		TAP_EQ_STR(layer.username, "alice", "with the top-level credentials");
+		TAP_EQ_STR(layer.hops[0].spec, "10.0.0.5:1081", "hop 2 is the first [hop]");
+		TAP_EQ_STR(layer.hops[0].username, "bob", "with its own username");
+		TAP_EQ_STR(layer.hops[0].password, "bobpw", "and the password from its file");
+		TAP_OK(layer.hops[0].password_file[0] == '/',
+		       "remembered by absolute path (D-25)");
+		TAP_EQ_STR(layer.hops[1].spec, "internal.example:1082",
+		           "hop 3 is kept as written");
+		TAP_EQ_STR(layer.hops[1].password, "cpw", "an inline hop password is read");
+		TAP_OK(layer.hops[1].password_config[0] == '/',
+		       "and is passed on by naming the file (D-25)");
+		TAP_OK(layer.password_config[0] == '/',
+		       "as hop 1's inline password is");
+	}
+
+	TAP_GROUP("D-38: malformed chains are errors, with a line number");
+	{
+		static const struct {
+			const char *name, *text, *needle;
+			int line;
+		} bad[] = {
+			{ "nofirst.conf", "[hop]\nproxy = 10.0.0.5:1081\n", "top-level proxy", 1 },
+			{ "noproxy.conf", "proxy = 127.0.0.1:1080\n[hop]\nusername = bob\n",
+			  "without a proxy", 2 },
+			{ "badkey.conf",
+			  "proxy = 127.0.0.1:1080\n[hop]\nproxy = 10.0.0.5:1081\nmax_datagram = 100\n",
+			  "[hop] section", 4 },
+			{ "section.conf", "proxy = 127.0.0.1:1080\n[hops]\n", "[hop]", 2 },
+		};
+		size_t i;
+
+		for (i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+			const char *path = write_conf(bad[i].name, bad[i].text, 0600);
+			int at = 0;
+
+			udpc_config_init(&layer);
+			err = NULL;
+			TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &at), -1,
+			           "%s is rejected", bad[i].name);
+			TAP_OK(err != NULL && strstr(err, bad[i].needle) != NULL,
+			       "saying '%s' (%s)", bad[i].needle, err ? err : "no message");
+			TAP_EQ_INT(at, bad[i].line, "on line %d", bad[i].line);
+		}
+	}
+
+	TAP_GROUP("D-42: a chain has at most 8 hops");
+	{
+		char conf[2048];
+		const char *path;
+		int n, at = 0;
+		size_t off;
+
+		off = (size_t)snprintf(conf, sizeof(conf), "proxy = 127.0.0.1:1080\n");
+		for (n = 2; n <= 8; n++)
+			off += (size_t)snprintf(conf + off, sizeof(conf) - off,
+			                        "[hop]\nproxy = 10.0.0.%d:1080\n", n);
+		path = write_conf("eight.conf", conf, 0600);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &at), 0, "8 hops parse");
+		TAP_EQ_INT(layer.nextra, 7, "as hop 1 and seven more");
+
+		snprintf(conf + off, sizeof(conf) - off, "[hop]\nproxy = 10.0.0.9:1080\n");
+		path = write_conf("nine.conf", conf, 0600);
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &at), -1,
+		           "a ninth is rejected");
+		TAP_OK(err != NULL && strstr(err, "8") != NULL, "naming the limit (%s)",
+		       err ? err : "no message");
+		err = NULL;
+		udpc_config_init(&layer);
+		udpc_config_set(&layer, "proxy", "127.0.0.1:1080", &err);
+		for (n = 2; n <= 8; n++)
+			udpc_config_append_hop(&layer, "10.0.0.2:1080", &err);
+		TAP_EQ_INT(udpc_config_append_hop(&layer, "10.0.0.2:1080", &err), -1,
+		           "and so is a ninth -p");
+	}
+
+	TAP_GROUP("D-38: the environment takes a list, and per-hop credentials");
+	{
+		char pwpath[600];
+
+		snprintf(pwpath, sizeof(pwpath), "%s/bob.pw", g_tmpdir);
+		setenv("UDPCHAINS_PROXY", "127.0.0.1:1080,10.0.0.5:1081,[fd00::9]:1082", 1);
+		setenv("UDPCHAINS_USERNAME_2", "bob", 1);
+		setenv("UDPCHAINS_PASSWORD_FILE_2", pwpath, 1);
+		setenv("UDPCHAINS_USERNAME_3", "carol", 1);
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), 0,
+		           "a list in UDPCHAINS_PROXY is accepted (%s)", err ? err : "ok");
+		TAP_EQ_STR(layer.proxy_spec, "127.0.0.1:1080", "its first entry is hop 1");
+		TAP_EQ_INT(layer.nextra, 2, "and the rest follow");
+		TAP_EQ_STR(layer.hops[1].spec, "[fd00::9]:1082", "an IPv6 hop keeps its brackets");
+		TAP_EQ_STR(layer.hops[0].username, "bob", "UDPCHAINS_USERNAME_2 is hop 2's");
+		TAP_EQ_STR(layer.hops[0].password, "bobpw", "and so is its password file");
+		TAP_EQ_STR(layer.hops[1].username, "carol", "UDPCHAINS_USERNAME_3 is hop 3's");
+
+		setenv("UDPCHAINS_PROXY", "127.0.0.1:1080,,10.0.0.5:1081", 1);
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), -1, "an empty entry is rejected");
+		setenv("UDPCHAINS_PROXY", "127.0.0.1:1080,", 1);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), -1, "so is a trailing comma");
+		unsetenv("UDPCHAINS_PROXY");
+		unsetenv("UDPCHAINS_USERNAME_2");
+		unsetenv("UDPCHAINS_PASSWORD_FILE_2");
+		unsetenv("UDPCHAINS_USERNAME_3");
+	}
+
+	TAP_GROUP("D-38: precedence -- the chain comes whole from one layer");
+	{
+		const char *path = NULL;
+		struct udpc_config base, over;
+		char p[600];
+
+		snprintf(p, sizeof(p), "%s/chain.conf", g_tmpdir);
+		path = p;
+		udpc_config_defaults(&base);
+		udpc_config_init(&layer);
+		udpc_config_read_file(&layer, path, &err, &line);
+		udpc_config_merge(&base, &layer);
+		TAP_EQ_INT(base.nextra, 2, "a file's chain of three is merged");
+
+		udpc_config_init(&over);
+		udpc_config_set(&over, "proxy", "10.9.9.9:1080", &err);
+		cfg = base;
+		udpc_config_merge(&cfg, &over);
+		TAP_EQ_INT(cfg.nextra, 0, "a higher layer naming one proxy replaces the chain");
+		TAP_EQ_STR(cfg.proxy_spec, "10.9.9.9:1080", "with its own hop 1");
+
+		udpc_config_init(&over);
+		setenv("UDPCHAINS_USERNAME_2", "dave", 1);
+		udpc_config_from_env(&over, &err);
+		unsetenv("UDPCHAINS_USERNAME_2");
+		cfg = base;
+		udpc_config_merge(&cfg, &over);
+		TAP_EQ_INT(cfg.nextra, 2, "a layer setting only hop 2's username keeps the chain");
+		TAP_EQ_STR(cfg.hops[0].username, "dave", "and replaces that username");
+		TAP_EQ_STR(cfg.hops[0].password, "bobpw", "but not the password it did not set");
+	}
+
+	TAP_GROUP("D-39: later hops are checked, never resolved");
+	{
+		char host[256];
+		uint16_t port = 0;
+
+		TAP_EQ_INT(udpc_addr_split("[fd00::9]:1082", 1080, host, sizeof(host), &port,
+		                           &err), 0, "[fd00::9]:1082 splits");
+		TAP_EQ_STR(host, "fd00::9", "into its host");
+		TAP_EQ_INT(port, 1082, "and port");
+		TAP_EQ_INT(udpc_addr_split("name.example", 1080, host, sizeof(host), &port,
+		                           &err), 0, "a bare name splits");
+		TAP_EQ_INT(port, 1080, "with the default port");
+		TAP_EQ_INT(udpc_addr_split("x:99999", 1080, host, sizeof(host), &port, &err),
+		           -1, "an out-of-range port does not");
+
+		udpc_config_defaults(&cfg);
+		udpc_config_set(&cfg, "proxy", "127.0.0.1:1080", &err);
+		udpc_config_append_hop(&cfg, "no-such-host.invalid:1080", &err);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_finalize(&cfg, &err), 0,
+		           "a later hop that does not resolve here is accepted (%s)",
+		           err ? err : "ok");
+
+		udpc_config_defaults(&cfg);
+		udpc_config_set(&cfg, "proxy", "127.0.0.1:1080", &err);
+		udpc_config_append_hop(&cfg, "10.0.0.5:99999", &err);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_finalize(&cfg, &err), -1, "a malformed one is not");
+		TAP_OK(err != NULL && strstr(err, "hop 2") != NULL, "and the error names it (%s)",
+		       err ? err : "no message");
+	}
+
+	TAP_GROUP("D-38: the handoff to the shim round-trips the chain");
+	{
+		char p[600];
+		const char *v;
+		int n;
+
+		snprintf(p, sizeof(p), "%s/chain.conf", g_tmpdir);
+		udpc_config_defaults(&cfg);
+		udpc_config_init(&layer);
+		udpc_config_read_file(&layer, p, &err, &line);
+		udpc_config_merge(&cfg, &layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_finalize(&cfg, &err), 0, "the file's chain finalises");
+		TAP_EQ_INT(udpc_config_export(&cfg), 0, "and exports");
+		v = getenv("UDPCHAINS_PROXY");
+		TAP_EQ_STR(v ? v : "", "127.0.0.1:1080,10.0.0.5:1081,internal.example:1082",
+		           "UDPCHAINS_PROXY lists the hops, later ones as written");
+		v = getenv("UDPCHAINS_USERNAME_2");
+		TAP_EQ_STR(v ? v : "", "bob", "hop 2's username is exported");
+		v = getenv("UDPCHAINS_PASSWORD_FILE_2");
+		TAP_EQ_STR(v ? v : "", cfg.hops[0].password_file, "and where its password is");
+		TAP_OK(getenv("UDPCHAINS_PASSWORD_2") == NULL, "never the password (D-25)");
+		v = getenv("UDPCHAINS_PASSWORD_CONFIG_3");
+		TAP_EQ_STR(v ? v : "", cfg.hops[1].password_config,
+		           "hop 3's inline password is passed on by naming the file");
+
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), 0, "the shim reads it back (%s)",
+		           err ? err : "ok");
+		TAP_EQ_INT(layer.nextra, 2, "as a chain of three");
+		TAP_EQ_STR(layer.hops[0].password, "bobpw", "with hop 2's password from its file");
+		TAP_EQ_STR(layer.hops[1].password, "cpw", "and hop 3's from the config file");
+		TAP_EQ_STR(layer.password, "apw", "and hop 1's");
+
+		/* FR-CH-01: a chain of one leaves no trace of the longer one. */
+		udpc_config_defaults(&cfg);
+		udpc_config_set(&cfg, "proxy", "127.0.0.1:1080", &err);
+		udpc_config_finalize(&cfg, &err);
+		TAP_EQ_INT(udpc_config_export(&cfg), 0, "a chain of one exports");
+		v = getenv("UDPCHAINS_PROXY");
+		TAP_EQ_STR(v ? v : "", "127.0.0.1:1080", "a single address, as 0.1.0 did");
+		for (n = 2; n <= 8; n++) {
+			char name[64];
+			bool any;
+
+			snprintf(name, sizeof(name), "UDPCHAINS_USERNAME_%d", n);
+			any = getenv(name) != NULL;
+			snprintf(name, sizeof(name), "UDPCHAINS_PASSWORD_FILE_%d", n);
+			any = any || getenv(name) != NULL;
+			snprintf(name, sizeof(name), "UDPCHAINS_PASSWORD_CONFIG_%d", n);
+			any = any || getenv(name) != NULL;
+			if (any)
+				break;
+		}
+		TAP_EQ_INT(n, 9, "and no per-hop variable is left behind");
 	}
 
 	{

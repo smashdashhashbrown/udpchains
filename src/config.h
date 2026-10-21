@@ -34,6 +34,8 @@
 #define UDPC_DEFAULT_HOSTS_FILE "/etc/hosts"
 #define UDPC_MAX_DATAGRAM_CEILING 65507 /* largest a UDP payload can ever be */
 #define UDPC_PASSWORD_MAX 255 /* RFC 1929: PLEN is one byte */
+#define UDPC_CHAIN_MAX 8      /* D-42: hops in a chain, the first included */
+#define UDPC_PATH_MAX 4096    /* a password file or config file path */
 
 /* Which keys a layer set explicitly. */
 #define UDPC_SET_PROXY (1u << 0)
@@ -48,6 +50,19 @@
 #define UDPC_SET_DNS_TIMEOUT (1u << 9)
 #define UDPC_SET_DNS_SEARCH (1u << 10)
 #define UDPC_SET_HOSTS_FILE (1u << 11)
+
+/* Hop 2 onwards of a chain (D-38).  Hop 1 is the top-level proxy and credential
+ * fields of struct udpc_config, which a chain of one uses exactly as 0.1.0 did
+ * (FR-CH-01). */
+struct udpc_hop {
+	uint32_t set_mask;              /* UDPC_SET_USERNAME, UDPC_SET_PASSWORD */
+	char spec[256];                 /* as written; never resolved here (D-39) */
+	bool have_credentials;
+	char username[UDPC_PASSWORD_MAX + 1];
+	char password[UDPC_PASSWORD_MAX + 1];
+	char password_file[UDPC_PATH_MAX]; /* D-25, as for hop 1 */
+	char password_config[UDPC_PATH_MAX];
+};
 
 struct udpc_config {
 	uint32_t set_mask; /* UDPC_SET_* explicitly set in this layer */
@@ -75,18 +90,24 @@ struct udpc_config {
 	/* SEC-03: credentials come from a file or the environment, never from
 	 * the command line (FR-P-09, D-20). */
 	bool have_credentials;
-	char username[256];
-	char password[256];
+	char username[UDPC_PASSWORD_MAX + 1];
+	char password[UDPC_PASSWORD_MAX + 1];
 
 	/* D-25: where the password came from, so the wrapper can pass THAT to
 	 * the target rather than the secret itself.  At most one is set: the
 	 * absolute path of a password file, or of a config file holding
 	 * `password =` inline.  Neither means UDPCHAINS_PASSWORD, which the
 	 * user put in the environment themselves. */
-	char password_file[4096];
-	char password_config[4096];
+	char password_file[UDPC_PATH_MAX];
+	char password_config[UDPC_PATH_MAX];
 
 	char config_path[4096];
+
+	/* D-38: the hops after the first.  They belong to the layer that set
+	 * the proxy (UDPC_SET_PROXY), and are merged with it as a whole; their
+	 * credentials are merged one by one, as hop 1's are. */
+	unsigned nextra;
+	struct udpc_hop hops[UDPC_CHAIN_MAX - 1];
 };
 
 /* Zeroes the layer.  set_mask ends up 0: nothing is explicitly set. */
@@ -108,6 +129,12 @@ void udpc_config_merge(struct udpc_config *dst, const struct udpc_config *src);
 int udpc_config_set(struct udpc_config *cfg, const char *key, const char *value,
                     const char **err);
 
+/* Adds a hop to the end of the layer's chain (D-38): the second and later -p,
+ * or entries of a UDPCHAINS_PROXY list.  The layer must already have a proxy.
+ * Returns 0, or -1 with a static reason in *err. */
+int udpc_config_append_hop(struct udpc_config *cfg, const char *spec,
+                           const char **err);
+
 /* Reads a config file into its own layer.  Returns 0 on success, -1 on failure
  * (including a file that exists but does not parse), with a static reason in
  * *err and the offending line in *errline.  A missing file is reported via
@@ -121,7 +148,8 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 int udpc_config_from_env(struct udpc_config *cfg, const char **err);
 
 /* Resolves proxy_spec to an address, computes proxy_is_local, and enforces
- * D-10: fails if no proxy was configured.  Returns 0, or -1 with *err.
+ * D-10: fails if no proxy was configured.  Later hops are checked for form
+ * only, never resolved (D-39).  Returns 0, or -1 with *err.
  *
  * Calls getaddrinfo when the spec is a name; callers inside the shim must hold
  * the re-entry guard (guard.h). */

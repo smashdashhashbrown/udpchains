@@ -283,16 +283,12 @@ int udpc_addr_parse_numeric(const char *spec, uint16_t default_port,
 	return addr_parse(spec, default_port, ss, err, AI_NUMERICHOST);
 }
 
-static int addr_parse(const char *spec, uint16_t default_port,
-                      struct sockaddr_storage *ss, const char **err,
-                      int gai_flags)
+int udpc_addr_split(const char *spec, uint16_t default_port, char *hostbuf,
+                    size_t hostlen, uint16_t *portp, const char **err)
 {
-	char hostbuf[256];
 	char portbuf[16];
-	const char *host = hostbuf;
-	const char *port = portbuf;
-	struct addrinfo hints, *res = NULL;
 	size_t len;
+	long p;
 
 	if (err)
 		*err = NULL;
@@ -313,7 +309,7 @@ static int addr_parse(const char *spec, uint16_t default_port,
 			return -1;
 		}
 		len = (size_t)(close - spec - 1);
-		if (len == 0 || len >= sizeof(hostbuf)) {
+		if (len == 0 || len >= hostlen) {
 			if (err)
 				*err = "IPv6 literal too long or empty";
 			return -1;
@@ -332,7 +328,7 @@ static int addr_parse(const char *spec, uint16_t default_port,
 		const char *colon = strrchr(spec, ':');
 		if (colon != NULL && strchr(spec, ':') == colon) {
 			len = (size_t)(colon - spec);
-			if (len == 0 || len >= sizeof(hostbuf)) {
+			if (len == 0 || len >= hostlen) {
 				if (err)
 					*err = "host too long or empty";
 				return -1;
@@ -342,12 +338,12 @@ static int addr_parse(const char *spec, uint16_t default_port,
 			snprintf(portbuf, sizeof(portbuf), "%s", colon + 1);
 		} else {
 			/* No colon, or many colons (bare IPv6 literal). */
-			if (strlen(spec) >= sizeof(hostbuf)) {
+			if (strlen(spec) >= hostlen) {
 				if (err)
 					*err = "host too long";
 				return -1;
 			}
-			snprintf(hostbuf, sizeof(hostbuf), "%s", spec);
+			snprintf(hostbuf, hostlen, "%s", spec);
 		}
 	}
 
@@ -356,14 +352,27 @@ static int addr_parse(const char *spec, uint16_t default_port,
 			*err = "port is not a number";
 		return -1;
 	}
-	{
-		long p = strtol(portbuf, NULL, 10);
-		if (p <= 0 || p > 65535) {
-			if (err)
-				*err = "port out of range";
-			return -1;
-		}
+	p = strtol(portbuf, NULL, 10);
+	if (p <= 0 || p > 65535) {
+		if (err)
+			*err = "port out of range";
+		return -1;
 	}
+	*portp = (uint16_t)p;
+	return 0;
+}
+
+static int addr_parse(const char *spec, uint16_t default_port,
+                      struct sockaddr_storage *ss, const char **err,
+                      int gai_flags)
+{
+	char host[256], port[8];
+	struct addrinfo hints, *res = NULL;
+	uint16_t portnum;
+
+	if (udpc_addr_split(spec, default_port, host, sizeof(host), &portnum, err) != 0)
+		return -1;
+	snprintf(port, sizeof(port), "%u", portnum);
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;

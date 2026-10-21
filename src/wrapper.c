@@ -394,7 +394,11 @@ int main(int argc, char **argv)
 				fprintf(stderr, "udpchains: -p needs an address\n");
 				return 1;
 			}
-			if (udpc_config_set(&cli, "proxy", argv[i], &err) != 0) {
+			/* D-38: the first -p is hop 1; each further one is
+			 * the next hop. */
+			if (((cli.set_mask & UDPC_SET_PROXY)
+			         ? udpc_config_append_hop(&cli, argv[i], &err)
+			         : udpc_config_set(&cli, "proxy", argv[i], &err)) != 0) {
 				fprintf(stderr, "udpchains: -p: %s\n", err);
 				return 1;
 			}
@@ -438,6 +442,17 @@ int main(int argc, char **argv)
 		fprintf(stderr, "udpchains: %s\n", err);
 		fprintf(stderr,
 		        "udpchains: refusing to run '%s' unproxied.\n", argv[i]);
+		return 1;
+	}
+
+	/* D-38: until chains are carried on the wire, a longer chain is
+	 * refused rather than run as a chain of its first hop. */
+	if (cfg.nextra > 0) {
+		fprintf(stderr,
+		        "udpchains: a chain of %u proxies is configured, but this "
+		        "version carries only one.\n"
+		        "udpchains: refusing to run '%s' through the first alone.\n",
+		        cfg.nextra + 1, argv[i]);
 		return 1;
 	}
 

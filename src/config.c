@@ -34,10 +34,16 @@ void udpc_config_defaults(struct udpc_config *cfg)
 void udpc_config_merge(struct udpc_config *dst, const struct udpc_config *src)
 {
 	uint32_t m = src->set_mask;
+	unsigned i;
 
 	if (m & UDPC_SET_PROXY) {
 		memcpy(dst->proxy_spec, src->proxy_spec, sizeof(dst->proxy_spec));
 		dst->proxy_set = src->proxy_set;
+		/* D-38: the chain comes whole from the layer that names it. */
+		dst->nextra = src->nextra;
+		for (i = 0; i < UDPC_CHAIN_MAX - 1; i++)
+			memcpy(dst->hops[i].spec, src->hops[i].spec,
+			       sizeof(dst->hops[i].spec));
 	}
 	if (m & UDPC_SET_MAX_DATAGRAM)
 		dst->max_datagram = src->max_datagram;
@@ -71,6 +77,27 @@ void udpc_config_merge(struct udpc_config *dst, const struct udpc_config *src)
 		memcpy(dst->dns_search, src->dns_search, sizeof(dst->dns_search));
 	if (m & UDPC_SET_HOSTS_FILE)
 		memcpy(dst->hosts_file, src->hosts_file, sizeof(dst->hosts_file));
+
+	/* Later hops' credentials, each from the highest layer that sets it, as
+	 * hop 1's are. */
+	for (i = 0; i < UDPC_CHAIN_MAX - 1; i++) {
+		const struct udpc_hop *sh = &src->hops[i];
+		struct udpc_hop *dh = &dst->hops[i];
+
+		if (sh->set_mask & UDPC_SET_USERNAME) {
+			memcpy(dh->username, sh->username, sizeof(dh->username));
+			dh->have_credentials = true;
+		}
+		if (sh->set_mask & UDPC_SET_PASSWORD) {
+			memcpy(dh->password, sh->password, sizeof(dh->password));
+			memcpy(dh->password_file, sh->password_file,
+			       sizeof(dh->password_file));
+			memcpy(dh->password_config, sh->password_config,
+			       sizeof(dh->password_config));
+			dh->have_credentials = true;
+		}
+		dh->set_mask |= sh->set_mask;
+	}
 
 	dst->set_mask |= m;
 }
@@ -163,10 +190,77 @@ static int read_password_file(const char *path, char *out, size_t outlen,
 	return 0;
 }
 
+/* The credential keys, for hop 1 or a later hop (D-38): each has the same
+ * fields, so one setter serves both.  Returns 1 if key was a credential key and
+ * was set, 0 if it is not a credential key, and -1 with *err on a bad value. */
+struct creds {
+	uint32_t *mask;
+	char *username, *password, *password_file, *password_config;
+};
+
+static int set_credential(const struct creds *c, const char *key, const char *value,
+                          const char **err)
+{
+	if (strcmp(key, "username") == 0) {
+		if (strlen(value) >= UDPC_PASSWORD_MAX + 1) {
+			*err = "username too long";
+			return -1;
+		}
+		snprintf(c->username, UDPC_PASSWORD_MAX + 1, "%s", value);
+		*c->mask |= UDPC_SET_USERNAME;
+		return 1;
+	}
+	if (strcmp(key, "password") == 0) {
+		if (strlen(value) >= UDPC_PASSWORD_MAX + 1) {
+			*err = "password too long";
+			return -1;
+		}
+		snprintf(c->password, UDPC_PASSWORD_MAX + 1, "%s", value);
+		/* An inline value.  If it came from a config file,
+		 * udpc_config_read_file records which one (D-25). */
+		c->password_file[0] = '\0';
+		c->password_config[0] = '\0';
+		*c->mask |= UDPC_SET_PASSWORD;
+		return 1;
+	}
+	if (strcmp(key, "password_file") == 0) {
+		char *abs;
+
+		if (read_password_file(value, c->password, UDPC_PASSWORD_MAX + 1,
+		                       err) != 0)
+			return -1;
+		/* D-25: remembered as an ABSOLUTE path, so a target that changes
+		 * directory -- or a descendant that starts elsewhere -- can still
+		 * read it. */
+		abs = realpath(value, NULL);
+		snprintf(c->password_file, UDPC_PATH_MAX, "%s", abs != NULL ? abs : value);
+		free(abs);
+		c->password_config[0] = '\0';
+		*c->mask |= UDPC_SET_PASSWORD;
+		return 1;
+	}
+	return 0;
+}
+
+static struct creds hop1_creds(struct udpc_config *cfg)
+{
+	struct creds c = { &cfg->set_mask, cfg->username, cfg->password,
+	                   cfg->password_file, cfg->password_config };
+	return c;
+}
+
+static struct creds hop_creds(struct udpc_hop *h)
+{
+	struct creds c = { &h->set_mask, h->username, h->password,
+	                   h->password_file, h->password_config };
+	return c;
+}
+
 int udpc_config_set(struct udpc_config *cfg, const char *key, const char *value,
                     const char **err)
 {
 	long n;
+	int rc;
 
 	*err = NULL;
 
@@ -243,44 +337,12 @@ int udpc_config_set(struct udpc_config *cfg, const char *key, const char *value,
 		cfg->set_mask |= UDPC_SET_HOSTS_FILE;
 		return 0;
 	}
-	if (strcmp(key, "username") == 0) {
-		if (strlen(value) >= sizeof(cfg->username)) {
-			*err = "username too long";
-			return -1;
-		}
-		snprintf(cfg->username, sizeof(cfg->username), "%s", value);
-		cfg->set_mask |= UDPC_SET_USERNAME;
-		return 0;
-	}
-	if (strcmp(key, "password") == 0) {
-		if (strlen(value) >= sizeof(cfg->password)) {
-			*err = "password too long";
-			return -1;
-		}
-		snprintf(cfg->password, sizeof(cfg->password), "%s", value);
-		/* An inline value.  If it came from a config file,
-		 * udpc_config_read_file records which one (D-25). */
-		cfg->password_file[0] = '\0';
-		cfg->password_config[0] = '\0';
-		cfg->set_mask |= UDPC_SET_PASSWORD;
-		return 0;
-	}
-	if (strcmp(key, "password_file") == 0) {
-		char *abs;
+	{
+		struct creds c = hop1_creds(cfg);
 
-		if (read_password_file(value, cfg->password, sizeof(cfg->password),
-		                       err) != 0)
-			return -1;
-		/* D-25: remembered as an ABSOLUTE path, so a target that changes
-		 * directory -- or a descendant that starts elsewhere -- can still
-		 * read it. */
-		abs = realpath(value, NULL);
-		snprintf(cfg->password_file, sizeof(cfg->password_file), "%s",
-		         abs != NULL ? abs : value);
-		free(abs);
-		cfg->password_config[0] = '\0';
-		cfg->set_mask |= UDPC_SET_PASSWORD;
-		return 0;
+		rc = set_credential(&c, key, value, err);
+		if (rc != 0)
+			return rc < 0 ? -1 : 0;
 	}
 	if (strcmp(key, "quiet") == 0) {
 		bool b;
@@ -318,9 +380,58 @@ int udpc_config_set(struct udpc_config *cfg, const char *key, const char *value,
 	return -1;
 }
 
+int udpc_config_append_hop(struct udpc_config *cfg, const char *spec,
+                           const char **err)
+{
+	*err = NULL;
+	if (!(cfg->set_mask & UDPC_SET_PROXY)) {
+		*err = "a later hop needs a first proxy before it";
+		return -1;
+	}
+	if (cfg->nextra >= UDPC_CHAIN_MAX - 1) {
+		*err = "a chain has at most 8 hops (D-42)";
+		return -1;
+	}
+	if (spec[0] == '\0' || strlen(spec) >= sizeof(cfg->hops[0].spec)) {
+		*err = "proxy address empty or too long";
+		return -1;
+	}
+	snprintf(cfg->hops[cfg->nextra].spec, sizeof(cfg->hops[0].spec), "%s", spec);
+	cfg->nextra++;
+	return 0;
+}
+
+/* A key inside a [hop] section (D-38).  Only the hop's own keys belong there:
+ * any other would look per-hop and is not. */
+static int set_hop_key(struct udpc_hop *h, const char *key, const char *value,
+                       const char **err)
+{
+	struct creds c = hop_creds(h);
+	int rc;
+
+	if (strcmp(key, "proxy") == 0) {
+		if (value[0] == '\0' || strlen(value) >= sizeof(h->spec)) {
+			*err = "proxy address empty or too long";
+			return -1;
+		}
+		snprintf(h->spec, sizeof(h->spec), "%s", value);
+		return 0;
+	}
+	rc = set_credential(&c, key, value, err);
+	if (rc != 0)
+		return rc < 0 ? -1 : 0;
+	*err = "only proxy, username, password and password_file belong in a "
+	       "[hop] section";
+	return -1;
+}
+
 int udpc_config_read_file(struct udpc_config *cfg, const char *path,
                           const char **err, int *errline)
 {
+	/* D-38: 0 at the top level, which is hop 1; k inside the k-th [hop]
+	 * section, which is hop k + 1. */
+	unsigned section = 0;
+	int section_line = 0;
 	FILE *f;
 	char line[1024];
 	int lineno = 0;
@@ -369,6 +480,44 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 		if (*p == '\0' || *p == '#' || *p == ';')
 			continue;
 
+		if (*p == '[') {
+			end = p + strlen(p);
+			while (end > p && (end[-1] == ' ' || end[-1] == '\t'))
+				*--end = '\0';
+			if (strcasecmp(p, "[hop]") != 0) {
+				/* FR-C-04's message for a proxychains.conf, and
+				 * a plain one for anything else. */
+				if (udpc_config_set(cfg, p, "", err) == 0 ||
+				    strcmp(*err, "unknown configuration key") == 0)
+					*err = "unknown section; the only section is [hop]";
+				*errline = lineno;
+				fclose(f);
+				return -1;
+			}
+			if (!(cfg->set_mask & UDPC_SET_PROXY)) {
+				*err = "a [hop] section needs a top-level proxy before "
+				       "it, which is hop 1";
+				*errline = lineno;
+				fclose(f);
+				return -1;
+			}
+			if (section > 0 && cfg->hops[section - 1].spec[0] == '\0') {
+				*err = "[hop] section without a proxy";
+				*errline = section_line;
+				fclose(f);
+				return -1;
+			}
+			if (cfg->nextra >= UDPC_CHAIN_MAX - 1) {
+				*err = "a chain has at most 8 hops (D-42)";
+				*errline = lineno;
+				fclose(f);
+				return -1;
+			}
+			section = ++cfg->nextra;
+			section_line = lineno;
+			continue;
+		}
+
 		eq = strchr(p, '=');
 		if (eq == NULL) {
 			*err = "expected 'key = value'";
@@ -411,11 +560,20 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 			return -1;
 		}
 
-		if (udpc_config_set(cfg, key, value, err) != 0) {
+		if ((section == 0 ? udpc_config_set(cfg, key, value, err)
+		                  : set_hop_key(&cfg->hops[section - 1], key, value,
+		                                err)) != 0) {
 			*errline = lineno;
 			fclose(f);
 			return -1;
 		}
+	}
+
+	if (section > 0 && cfg->hops[section - 1].spec[0] == '\0') {
+		*err = "[hop] section without a proxy";
+		*errline = section_line;
+		fclose(f);
+		return -1;
 	}
 
 	if (ferror(f)) {
@@ -429,9 +587,20 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 	cfg->set_mask |= UDPC_SET_CONFIG_PATH;
 
 	/* D-25: a password written inline in this file is passed on by naming
-	 * the file, never by copying the value into the environment. */
-	if ((cfg->set_mask & UDPC_SET_PASSWORD) && cfg->password_file[0] == '\0') {
-		char *abs = realpath(path, NULL);
+	 * the file, never by copying the value into the environment.  So is a
+	 * later hop's (D-38). */
+	{
+		bool inline_pw = (cfg->set_mask & UDPC_SET_PASSWORD) &&
+		                 cfg->password_file[0] == '\0';
+		char *abs;
+		unsigned i;
+
+		for (i = 0; i < cfg->nextra; i++)
+			if ((cfg->hops[i].set_mask & UDPC_SET_PASSWORD) &&
+			    cfg->hops[i].password_file[0] == '\0')
+				inline_pw = true;
+		if (!inline_pw)
+			return 0;
 
 		/* L5: SEC-04 warns about a writable config file because it
 		 * directs traffic; one holding a password also matters when
@@ -442,8 +611,16 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 			          "by other users",
 			          path);
 
-		snprintf(cfg->password_config, sizeof(cfg->password_config), "%s",
-		         abs != NULL ? abs : path);
+		abs = realpath(path, NULL);
+		if ((cfg->set_mask & UDPC_SET_PASSWORD) && cfg->password_file[0] == '\0')
+			snprintf(cfg->password_config, sizeof(cfg->password_config),
+			         "%s", abs != NULL ? abs : path);
+		for (i = 0; i < cfg->nextra; i++)
+			if ((cfg->hops[i].set_mask & UDPC_SET_PASSWORD) &&
+			    cfg->hops[i].password_file[0] == '\0')
+				snprintf(cfg->hops[i].password_config,
+				         sizeof(cfg->hops[i].password_config), "%s",
+				         abs != NULL ? abs : path);
 		free(abs);
 	}
 	return 0;
@@ -455,7 +632,6 @@ struct env_key {
 };
 
 static const struct env_key g_env_keys[] = {
-	{ "UDPCHAINS_PROXY", "proxy" },
 	{ "UDPCHAINS_MAX_DATAGRAM", "max_datagram" },
 	{ "UDPCHAINS_STRICT_LOOPBACK", "strict_loopback" },
 	{ "UDPCHAINS_CONNECT_TIMEOUT", "connect_timeout" },
@@ -467,12 +643,107 @@ static const struct env_key g_env_keys[] = {
 	{ "UDPCHAINS_HOSTS_FILE", "hosts_file" },
 };
 
+/* D-38: UDPCHAINS_PROXY is a comma-separated list; the first entry is hop 1. */
+static int proxy_list_from_env(struct udpc_config *cfg, const char *v, const char **err)
+{
+	char spec[256];
+	const char *p = v;
+
+	for (;;) {
+		size_t len = strcspn(p, ",");
+
+		if (len == 0) {
+			*err = "UDPCHAINS_PROXY has an empty entry";
+			return -1;
+		}
+		if (len >= sizeof(spec)) {
+			*err = "proxy address too long";
+			return -1;
+		}
+		memcpy(spec, p, len);
+		spec[len] = '\0';
+		if ((p == v ? udpc_config_set(cfg, "proxy", spec, err)
+		            : udpc_config_append_hop(cfg, spec, err)) != 0)
+			return -1;
+		if (p[len] == '\0')
+			return 0;
+		p += len + 1;
+	}
+}
+
+/* The password inline in the n-th hop (from 1) of a config file, which the
+ * wrapper names rather than exporting the password (D-25, D-38).  Read into a
+ * static layer: this runs once, at start-up, and a config with every hop is
+ * too large for a small thread stack. */
+static int password_from_config(const char *path, unsigned hop, char *out,
+                                size_t outlen)
+{
+	static struct udpc_config tmp;
+	const char *ferr = NULL;
+	int fline = 0, rc = -1;
+
+	udpc_config_init(&tmp);
+	if (udpc_config_read_file(&tmp, path, &ferr, &fline) == 0) {
+		const uint32_t mask = hop == 1 ? tmp.set_mask : tmp.hops[hop - 2].set_mask;
+		const char *pw = hop == 1 ? tmp.password : tmp.hops[hop - 2].password;
+
+		if ((mask & UDPC_SET_PASSWORD) && (hop == 1 || hop - 2 < tmp.nextra)) {
+			snprintf(out, outlen, "%s", pw);
+			rc = 0;
+		}
+	}
+	explicit_bzero(&tmp, sizeof(tmp));
+	return rc;
+}
+
+/* Hop n's credentials, for n from 2: UDPCHAINS_USERNAME_<n> and the rest. */
+static int hop_creds_from_env(struct udpc_config *cfg, unsigned n, const char **err)
+{
+	struct udpc_hop *h = &cfg->hops[n - 2];
+	struct creds c = hop_creds(h);
+	char name[64];
+	const char *v;
+
+	snprintf(name, sizeof(name), "UDPCHAINS_USERNAME_%u", n);
+	if ((v = getenv(name)) != NULL && *v != '\0' &&
+	    set_credential(&c, "username", v, err) < 0)
+		return -1;
+	snprintf(name, sizeof(name), "UDPCHAINS_PASSWORD_FILE_%u", n);
+	if ((v = getenv(name)) != NULL && *v != '\0' &&
+	    set_credential(&c, "password_file", v, err) < 0)
+		return -1;
+	snprintf(name, sizeof(name), "UDPCHAINS_PASSWORD_CONFIG_%u", n);
+	if ((v = getenv(name)) != NULL && *v != '\0') {
+		if (password_from_config(v, n, h->password, sizeof(h->password)) != 0) {
+			*err = "cannot read a hop's password from the file named by "
+			       "UDPCHAINS_PASSWORD_CONFIG_<n>";
+			return -1;
+		}
+		snprintf(h->password_config, sizeof(h->password_config), "%s", v);
+		h->password_file[0] = '\0';
+		h->set_mask |= UDPC_SET_PASSWORD;
+	}
+	snprintf(name, sizeof(name), "UDPCHAINS_PASSWORD_%u", n);
+	if ((v = getenv(name)) != NULL && *v != '\0' &&
+	    set_credential(&c, "password", v, err) < 0)
+		return -1;
+	return 0;
+}
+
 int udpc_config_from_env(struct udpc_config *cfg, const char **err)
 {
 	size_t i;
+	unsigned n;
 	const char *v;
 
 	*err = NULL;
+
+	v = getenv("UDPCHAINS_PROXY");
+	if (v != NULL && *v != '\0' && proxy_list_from_env(cfg, v, err) != 0)
+		return -1;
+	for (n = 2; n <= UDPC_CHAIN_MAX; n++)
+		if (hop_creds_from_env(cfg, n, err) != 0)
+			return -1;
 
 	for (i = 0; i < sizeof(g_env_keys) / sizeof(g_env_keys[0]); i++) {
 		v = getenv(g_env_keys[i].env);
@@ -487,26 +758,14 @@ int udpc_config_from_env(struct udpc_config *cfg, const char **err)
 	 * it; everything else arrived resolved, in the variables above. */
 	v = getenv("UDPCHAINS_PASSWORD_CONFIG");
 	if (v != NULL && *v != '\0') {
-		struct udpc_config tmp;
-		const char *ferr = NULL;
-		int fline = 0;
-		int rc;
-
-		udpc_config_init(&tmp);
-		rc = udpc_config_read_file(&tmp, v, &ferr, &fline);
-		if (rc == 0 && (tmp.set_mask & UDPC_SET_PASSWORD)) {
-			memcpy(cfg->password, tmp.password, sizeof(cfg->password));
-			snprintf(cfg->password_config, sizeof(cfg->password_config),
-			         "%s", v);
-			cfg->password_file[0] = '\0';
-			cfg->set_mask |= UDPC_SET_PASSWORD;
-		}
-		explicit_bzero(tmp.password, sizeof(tmp.password));
-		if (rc != 0 || !(cfg->set_mask & UDPC_SET_PASSWORD)) {
+		if (password_from_config(v, 1, cfg->password, sizeof(cfg->password)) != 0) {
 			*err = "cannot read the password from the file named by "
 			       "UDPCHAINS_PASSWORD_CONFIG";
 			return -1;
 		}
+		snprintf(cfg->password_config, sizeof(cfg->password_config), "%s", v);
+		cfg->password_file[0] = '\0';
+		cfg->set_mask |= UDPC_SET_PASSWORD;
 	}
 
 	/* SEC-03 note: UDPCHAINS_PASSWORD (the value itself, rather than a path
@@ -587,6 +846,26 @@ int udpc_config_finalize(struct udpc_config *cfg, const char **err)
 	if (cfg->max_datagram == 0)
 		cfg->max_datagram = UDPC_DEFAULT_MAX_DATAGRAM;
 
+	/* D-39: a later hop is reached through the hop before it, which
+	 * resolves it.  Here only its form is checked. */
+	{
+		unsigned i;
+
+		for (i = 0; i < cfg->nextra; i++) {
+			static char buf[160];
+			char host[256];
+			uint16_t port;
+
+			if (udpc_addr_split(cfg->hops[i].spec, UDPC_DEFAULT_PROXY_PORT,
+			                    host, sizeof(host), &port, &perr) != 0) {
+				snprintf(buf, sizeof(buf), "hop %u: %s", i + 2,
+				         perr ? perr : "cannot parse proxy address");
+				*err = buf;
+				return -1;
+			}
+		}
+	}
+
 	/* D-22: a resolver named by hostname would need a lookup before
 	 * lookups work, and that lookup could only go direct.  Refused here,
 	 * so the wrapper reports it before exec (FR-C-03). */
@@ -607,7 +886,10 @@ int udpc_config_finalize(struct udpc_config *cfg, const char **err)
 int udpc_config_load_layers(struct udpc_config *cfg, const char *cli_path,
                             const char **err)
 {
-	struct udpc_config filecfg, envcfg;
+	/* Static: with a chain's hops, a layer is too large for a small thread
+	 * stack, and this runs once, during single-threaded start-up -- the
+	 * wrapper before exec, or the shim under pthread_once. */
+	static struct udpc_config filecfg, envcfg;
 	const char *path = NULL;
 	const char *ferr = NULL;
 	int fline = 0;
@@ -692,18 +974,68 @@ static int numeric_proxy(const struct udpc_config *cfg, char *out, size_t outlen
 	return (n < 0 || (size_t)n >= outlen) ? -1 : 0;
 }
 
+/* D-38: hop n's credentials, for n from 2, exported as hop 1's are below: the
+ * username, and where the password is, never the password.  A hop past the end
+ * of the chain, or one without credentials, leaves nothing behind. */
+static int export_hop_creds(const struct udpc_config *cfg, unsigned n)
+{
+	const struct udpc_hop *h = &cfg->hops[n - 2];
+	char user[64], file[64], conf[64], pw[64];
+	bool in_chain = n - 2 < cfg->nextra;
+
+	snprintf(user, sizeof(user), "UDPCHAINS_USERNAME_%u", n);
+	snprintf(file, sizeof(file), "UDPCHAINS_PASSWORD_FILE_%u", n);
+	snprintf(conf, sizeof(conf), "UDPCHAINS_PASSWORD_CONFIG_%u", n);
+	snprintf(pw, sizeof(pw), "UDPCHAINS_PASSWORD_%u", n);
+
+	if (!in_chain || !h->have_credentials) {
+		unsetenv(user);
+		unsetenv(file);
+		unsetenv(conf);
+		unsetenv(pw);
+		return 0;
+	}
+	if (h->username[0] != '\0' ? setenv(user, h->username, 1) != 0
+	                           : unsetenv(user) != 0)
+		return -1;
+	unsetenv(conf);
+	if (h->password_file[0] != '\0') {
+		if (setenv(file, h->password_file, 1) != 0)
+			return -1;
+		unsetenv(pw);
+	} else if (h->password_config[0] != '\0') {
+		if (setenv(conf, h->password_config, 1) != 0)
+			return -1;
+		unsetenv(pw);
+		unsetenv(file);
+	}
+	return 0;
+}
+
 int udpc_config_export(const struct udpc_config *cfg)
 {
 	char buf[64], proxy[NI_MAXHOST + NI_MAXSERV + 4];
+	char list[sizeof(proxy) + (UDPC_CHAIN_MAX - 1) * 257];
+	size_t off;
+	unsigned i, n;
 
 	/* D-27: the ADDRESS the wrapper resolved and checked, not the name.
 	 * Exported by name, every process started under the shim looked the
 	 * proxy up again -- directly, since that lookup must bypass the proxy
-	 * it is trying to find -- and could reach a different address. */
+	 * it is trying to find -- and could reach a different address.  Later
+	 * hops are exported as written: only the hop before each may resolve
+	 * it (D-39). */
 	if (numeric_proxy(cfg, proxy, sizeof(proxy)) != 0)
 		snprintf(proxy, sizeof(proxy), "%s", cfg->proxy_spec);
-	if (setenv("UDPCHAINS_PROXY", proxy, 1) != 0)
+	off = (size_t)snprintf(list, sizeof(list), "%s", proxy);
+	for (i = 0; i < cfg->nextra && off < sizeof(list); i++)
+		off += (size_t)snprintf(list + off, sizeof(list) - off, ",%s",
+		                        cfg->hops[i].spec);
+	if (setenv("UDPCHAINS_PROXY", list, 1) != 0)
 		return -1;
+	for (n = 2; n <= UDPC_CHAIN_MAX; n++)
+		if (export_hop_creds(cfg, n) != 0)
+			return -1;
 
 	snprintf(buf, sizeof(buf), "%zu", cfg->max_datagram);
 	if (setenv("UDPCHAINS_MAX_DATAGRAM", buf, 1) != 0)
@@ -790,7 +1122,8 @@ int udpc_config_export(const struct udpc_config *cfg)
 
 int udpc_config_load_shim(struct udpc_config *cfg, const char **err)
 {
-	struct udpc_config envcfg;
+	/* Static, for the reason given in udpc_config_load_layers. */
+	static struct udpc_config envcfg;
 
 	udpc_config_defaults(cfg);
 

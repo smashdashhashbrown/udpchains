@@ -25,14 +25,14 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 713 assertions across 17 groups (`tests/run.sh`), all passing, plus the 91-check
+**Test totals:** 790 assertions across 17 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
 | Group | Assertions |
 |---|---|
 | unit-addr | 51 |
-| unit-config | 54 |
+| unit-config | 125 |
 | unit-socks5 | 88 |
 | unit-fdtable | 22 |
 | unit-dns | 52 |
@@ -43,7 +43,7 @@ from a run rather than editing it by hand.
 | TST-07 threading | 9 |
 | FR-P-09 auth | 15 |
 | D-22 resolve | 11 checks, over four programs making 99 assertions of their own |
-| wrapper loadability | 12 |
+| wrapper loadability | 18 |
 | TST-03 leak | 11 checks |
 | fault injection | 17 |
 | TST-04 real tools | 2 run, 3 skipped (automated, against the fixture) |
@@ -79,7 +79,7 @@ from a run rather than editing it by hand.
 | FR-P-07 | M | §4.3 | unit-socks5 | **Verified** — encode/decode of ATYP 0x03. Not reachable via the socket API (no libc UDP call takes a hostname); covered by unit test, as §4.3 notes |
 | FR-P-08 | S | §4.4 | faults | **Verified** — fixture expires an association; the shim re-associates before the send, so no datagram is lost |
 | FR-P-09 | S | §4.1 | unit-socks5, FR-P-09-auth | **Verified** — RFC 1929 implemented (D-20, superseding the D-08 deferral). `0x02` is offered only when credentials are configured; the sub-negotiation version byte is `0x01`, not SOCKS5's `0x05`, which the unit test asserts specifically. End-to-end against a fixture performing real authentication: correct credentials round-trip, and wrong or absent credentials deliver **nothing** rather than falling through to a direct send. A test asserts the password appears in no log on either side (NFR-05, SEC-03) |
-| FR-P-10 | C | — | — | **Deferred** — a §8 non-goal for v1, planned after 0.1.0 ([`FUTURE-UDP-CHAINS.md`](FUTURE-UDP-CHAINS.md)) |
+| FR-P-10 | C | — | — | **In progress** — a §8 non-goal for v1, now §2a; see [Multi-hop chains](#multi-hop-chains-2a-in-progress) |
 
 ## §3 Syscall fidelity
 
@@ -170,6 +170,31 @@ from a run rather than editing it by hand.
 | ADD-09 | D-14 | §4.3, §5.2 | unit-socks5, TST-05 | **Verified** — v4-mapped destinations encode as ATYP 0x01; the fixture now rejects the wrong form rather than forgiving it |
 | ADD-10 | D-22 | §11 | unit-dns, D-22-resolve, TST-03 | **Verified** — name lookups made through libc are answered locally or through the proxy, never by the host's resolver. With `dns` unset they fail `EAI_FAIL`; with the proxy down, `EAI_AGAIN`. Zero queries reach the resolver in either case, and `strace` shows no direct port-53 send in any mode. Truncated answers are repeated over SOCKS5 `CONNECT`. Supersedes D-04's "no DNS leak by construction", which was false on every supported glibc. The wire-level capture case is written but not yet run (it needs root) |
 | ADD-11 | D-36 | §2.3 | TST-05, TST-03, TST-02 | **Verified** — `syscall()` routes every socket, send and receive call to its hook; `dprintf` and `pwritev2`/`preadv2` are proxied; `fdopen`, `sendfile` and `splice` are refused on a UDP socket; `pidfd_getfd` copies are adopted; raw and packet sockets, `MSG_MORE` and `UDP_SEGMENT` are refused. The leak client's 27 sends all fail with the proxy down, against 11 that reached the destination before |
+
+---
+
+## Multi-hop chains (§2a), in progress
+
+Not part of v1 scope, and not counted in the summary above. Design: D-37 to D-42. `Not started`
+means no code yet.
+
+| ID | Pri | Test | Status |
+|---|---|---|---|
+| FR-CH-01 | M | unit-config, wrapper loadability | **Partial** — `[hop]` sections, repeated `-p` and a `UDPCHAINS_PROXY` list are parsed, merged and handed to the shim (D-38); a chain of one exports exactly what 0.1.0 did. Until chains are carried, a longer chain is refused by the wrapper and fails every send in the shim |
+| FR-CH-02 | M | — | **Not started** (D-37) |
+| FR-CH-03 | M | unit-config | **Partial** — each hop's credentials are configured and passed on by location, never by value (D-25, D-38); `CONNECT` tunnelling not started |
+| FR-CH-04 | M | unit-config | **Partial** — later hops are checked for form and never resolved here (D-39); sending them to the previous hop not started |
+| FR-CH-05 | M | — | **Not started** |
+| FR-CH-06 | M | — | **Not started** (D-41) |
+| FR-CH-07 | M | — | **Not started** (D-40) |
+| FR-CH-08 | M | — | **Not started** (D-40) |
+| FR-CH-09 | M | — | **Not started** |
+| FR-CH-10 | M | — | **Not started** |
+| FR-CH-11 | M | — | **Not started** |
+| FR-CH-12 | M | — | **Not started** |
+| FR-CH-13 | S | unit-config | **Partial** — at most 8 hops is enforced (D-42); README guidance not written |
+| FR-CH-14 | S | — | **Not started** |
+| FR-CH-T1 to T4 | — | — | **Not started** |
 
 ---
 

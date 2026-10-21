@@ -124,6 +124,32 @@ out=$(PATH="$TMP/bin:$PATH" UDPCHAINS_LIB="$SHIM" "$WRAPPER" -q \
 	-p 127.0.0.1:1080 noshebang arg1 2>&1) || true
 check "$out" "NOSHEBANG-RAN arg1" "a script with no #! line still runs, with its arguments"
 
+# --- D-38: a chain is parsed, but refused until it is carried ----------------
+
+echo "# a chain of more than one proxy is refused, not run through the first (D-38)"
+
+rc=0
+out=$(UDPCHAINS_LIB="$SHIM" "$WRAPPER" -p 127.0.0.1:1080 -p 10.0.0.5:1080 \
+	/bin/echo SHOULD-NOT-RUN 2>&1) || rc=$?
+check "$(printf '%s' "$out" | grep -c SHOULD-NOT-RUN)" "0" "a second -p is not run as a chain of one"
+check "$rc" "1" "the wrapper exits 1"
+check "$(printf '%s' "$out" | grep -c 'chain of 2 proxies')" "1" "and says why"
+
+printf 'proxy = 127.0.0.1:1080\n[hop]\nproxy = 10.0.0.5:1080\n' > "$TMP/chain.conf"
+chmod 600 "$TMP/chain.conf"
+# Without UDPCHAINS_PROXY, whose single proxy would replace the file's chain.
+out=$(env -u UDPCHAINS_PROXY UDPCHAINS_LIB="$SHIM" "$WRAPPER" -f "$TMP/chain.conf" \
+	/bin/echo SHOULD-NOT-RUN 2>&1) || true
+check "$(printf '%s' "$out" | grep -c SHOULD-NOT-RUN)" "0" "nor is a config file's [hop]"
+
+# The shim on its own, as a bare LD_PRELOAD would load it.
+out=$(env -u UDPCHAINS_RESOLVED UDPCHAINS_PROXY=127.0.0.1:1080,10.0.0.5:1080 \
+	LD_PRELOAD="$SHIM" "$(cd "$(dirname "$0")/.." && pwd)/build/leakclient" 127.0.0.1 9 \
+	2>&1) || true
+check "$(printf '%s' "$out" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')" "0" \
+	"the shim alone fails every send rather than use the first hop"
+check "$(printf '%s' "$out" | grep -c 'carries only one')" "1" "and says why"
+
 # NOTE: the noexec / security-policy case exercises the same refusal through the
 # PROT_EXEC probe, and is not covered here because creating a noexec mount needs
 # either root or unprivileged user namespaces, neither of which a test run can
