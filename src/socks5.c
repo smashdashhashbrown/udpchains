@@ -1,10 +1,12 @@
 #include "socks5.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -110,8 +112,9 @@ ssize_t udpc_socks_encode(uint8_t *buf, size_t buflen, const struct sockaddr *ds
 	return n + 3;
 }
 
-ssize_t udpc_socks_encode_domain(uint8_t *buf, size_t buflen, const char *host,
-                                 uint16_t port)
+/* Writes ATYP 0x03 + length + name + port at buf, returning its length. */
+static ssize_t encode_name(uint8_t *buf, size_t buflen, const char *host,
+                           uint16_t port)
 {
 	size_t hlen;
 	uint16_t nport;
@@ -125,7 +128,39 @@ ssize_t udpc_socks_encode_domain(uint8_t *buf, size_t buflen, const char *host,
 		errno = EINVAL;
 		return -1;
 	}
-	if (buflen < 4 + 1 + hlen + 2) {
+	if (buflen < 1 + 1 + hlen + 2) {
+		errno = ENOBUFS;
+		return -1;
+	}
+
+	buf[0] = UDPC_ATYP_DOMAIN;
+	buf[1] = (uint8_t)hlen;
+	memcpy(buf + 2, host, hlen);
+	nport = htons(port);
+	memcpy(buf + 2 + hlen, &nport, 2);
+
+	return (ssize_t)(4 + hlen);
+}
+
+/* encode_addr or encode_name, as the address is held. */
+static ssize_t encode_target(uint8_t *buf, size_t buflen,
+                             const struct udpc_socks_addr *a)
+{
+	if (a->named)
+		return encode_name(buf, buflen, a->host, a->port);
+	return encode_addr(buf, buflen, (const struct sockaddr *)&a->sa);
+}
+
+ssize_t udpc_socks_encode_domain(uint8_t *buf, size_t buflen, const char *host,
+                                 uint16_t port)
+{
+	ssize_t n;
+
+	if (host == NULL) {
+		errno = EDESTADDRREQ;
+		return -1;
+	}
+	if (buflen < 3) {
 		errno = ENOBUFS;
 		return -1;
 	}
@@ -133,13 +168,12 @@ ssize_t udpc_socks_encode_domain(uint8_t *buf, size_t buflen, const char *host,
 	buf[0] = 0;
 	buf[1] = 0;
 	buf[2] = 0; /* FRAG */
-	buf[3] = UDPC_ATYP_DOMAIN;
-	buf[4] = (uint8_t)hlen;
-	memcpy(buf + 5, host, hlen);
-	nport = htons(port);
-	memcpy(buf + 5 + hlen, &nport, 2);
 
-	return (ssize_t)(7 + hlen);
+	n = encode_name(buf + 3, buflen - 3, host, port);
+	if (n < 0)
+		return -1;
+
+	return n + 3;
 }
 
 
@@ -458,13 +492,165 @@ void udpc_socks_fixup_relay(struct sockaddr_storage *relay,
 	udpc_sa_set_port((struct sockaddr *)relay, port);
 }
 
-/* Opens the TCP connection to the proxy and completes method negotiation,
- * including RFC 1929 authentication when the proxy selects it.  Shared by UDP
- * ASSOCIATE and CONNECT, so both authenticate identically.  Returns the
- * connected descriptor, or -1 with errno set and nothing left open. */
-static int open_negotiated(const struct udpc_config *cfg)
+/* --- hops ------------------------------------------------------------------ */
+
+/* One hop as the handshake sees it.  Hop 1 is the top-level proxy and
+ * credentials, exactly as in 0.1.0; hop k >= 2 is cfg->hops[k - 2] (D-38). */
+struct hop {
+	unsigned no;      /* from 1 */
+	unsigned n;       /* hops in the chain */
+	const char *spec; /* as written, for diagnostics */
+	struct udpc_socks_addr addr;
+	bool have_credentials;
+	const char *username;
+	const char *password;
+};
+
+/* Fills h for hop index k, from 0.  Returns 0, or -1 with errno EINVAL for a
+ * later hop whose address does not parse, which udpc_config_finalize has
+ * already ruled out. */
+static int hop_view(const struct udpc_config *cfg, unsigned k, struct hop *h)
 {
-	uint8_t buf[2 + 2];
+	const struct udpc_hop *hp;
+
+	memset(h, 0, sizeof(*h));
+	h->no = k + 1;
+	h->n = 1 + cfg->nextra;
+
+	if (k == 0) {
+		h->spec = cfg->proxy_spec;
+		h->addr.sa = cfg->proxy;
+		h->have_credentials = cfg->have_credentials;
+		h->username = cfg->username;
+		h->password = cfg->password;
+		return 0;
+	}
+
+	hp = &cfg->hops[k - 1];
+	h->spec = hp->spec;
+	h->have_credentials = hp->have_credentials;
+	h->username = hp->username;
+	h->password = hp->password;
+	return udpc_socks_hop_addr(hp->spec, &h->addr);
+}
+
+/* The prefix a diagnostic about h carries: nothing for a chain of one, so its
+ * diagnostics are 0.1.0's word for word (FR-CH-01), and the hop otherwise
+ * (FR-CH-12). */
+#define HOP_NAME_MAX (sizeof("hop 8 of 8 (): ") + 256)
+
+static const char *hop_name(const struct hop *h, char *buf, size_t len)
+{
+	if (h->n <= 1)
+		return "";
+	snprintf(buf, len, "hop %u of %u (%s): ", h->no, h->n, h->spec);
+	return buf;
+}
+
+static struct udpc_ratelimit g_rl_hop;
+
+/* In a chain, says which hop failed and how (FR-CH-12).  A chain of one says
+ * nothing here, as 0.1.0 did not: the errno is its report.  Rate-limited, since
+ * a program retrying its sends retries the chain each time.  Keeps errno. */
+static void hop_failed(const struct hop *h, const char *what, int err)
+{
+	char name[HOP_NAME_MAX], note[64];
+	unsigned n;
+
+	if (h->n <= 1)
+		return;
+	if ((n = udpc_ratelimit(&g_rl_hop)) == 0) {
+		errno = err;
+		return;
+	}
+	udpc_err("%s%s: %s%s", hop_name(h, name, sizeof(name)), what,
+	         strerror(err), udpc_ratelimit_note(n, note, sizeof(note)));
+	errno = err;
+}
+
+int udpc_socks_hop_addr(const char *spec, struct udpc_socks_addr *out)
+{
+	struct sockaddr_in *in = (struct sockaddr_in *)&out->sa;
+	struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&out->sa;
+	char host[sizeof(out->host)];
+	uint16_t port;
+
+	memset(out, 0, sizeof(*out));
+	if (udpc_addr_split(spec, UDPC_DEFAULT_PROXY_PORT, host, sizeof(host), &port,
+	                    NULL) != 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (inet_pton(AF_INET, host, &in->sin_addr) == 1) {
+		in->sin_family = AF_INET;
+		in->sin_port = htons(port);
+		return 0;
+	}
+	if (inet_pton(AF_INET6, host, &in6->sin6_addr) == 1) {
+		in6->sin6_family = AF_INET6;
+		in6->sin6_port = htons(port);
+		return 0;
+	}
+
+	/* D-39: a name stays a name, for the hop before this one to resolve. */
+	memset(&out->sa, 0, sizeof(out->sa));
+	out->named = true;
+	memcpy(out->host, host, sizeof(out->host));
+	out->port = port;
+	return 0;
+}
+
+/* D-40.  Hop 1's relay is fixed up by udpc_socks_fixup_relay, against the
+ * address this host reached it on. */
+void udpc_socks_fixup_hop_relay(struct udpc_socks_addr *relay,
+                                const struct udpc_socks_addr *hop)
+{
+	const struct sockaddr *r = (const struct sockaddr *)&relay->sa;
+	bool wildcard;
+	uint16_t port;
+
+	if (relay->named)
+		return;
+	if (relay->sa.ss_family == AF_INET) {
+		const struct sockaddr_in *r4 = (const struct sockaddr_in *)r;
+		wildcard = (r4->sin_addr.s_addr == INADDR_ANY);
+	} else if (relay->sa.ss_family == AF_INET6) {
+		const struct sockaddr_in6 *r6 = (const struct sockaddr_in6 *)r;
+		wildcard = IN6_IS_ADDR_UNSPECIFIED(&r6->sin6_addr);
+	} else {
+		return;
+	}
+
+	/* A loopback relay is the hop's own view of itself.  It is reachable
+	 * from the hop before only if the two share a host, which is what a
+	 * hop given as a loopback address means: the hop before connected to
+	 * it there. */
+	if (!wildcard) {
+		if (!udpc_addr_is_loopback(r))
+			return;
+		if (!hop->named &&
+		    udpc_addr_is_loopback((const struct sockaddr *)&hop->sa))
+			return;
+	}
+
+	udpc_debug("a later hop returned a %s relay; using its address as given",
+	           wildcard ? "wildcard" : "loopback");
+
+	port = udpc_sa_port(r);
+	*relay = *hop;
+	if (relay->named)
+		relay->port = port;
+	else
+		udpc_sa_set_port((struct sockaddr *)&relay->sa, port);
+}
+
+/* --- negotiation ----------------------------------------------------------- */
+
+/* Opens the TCP connection to hop 1.  Returns the connected descriptor, or -1
+ * with errno set and nothing left open. */
+static int open_tcp(const struct udpc_config *cfg)
+{
 	socklen_t plen;
 	int fd, saved;
 
@@ -482,14 +668,31 @@ static int open_negotiated(const struct udpc_config *cfg)
 		return -1;
 
 	if (connect_with_timeout(fd, (const struct sockaddr *)&cfg->proxy, plen,
-	                         cfg->connect_timeout_ms) != 0)
-		goto fail;
+	                         cfg->connect_timeout_ms) != 0) {
+		saved = errno;
+		close(fd);
+		errno = saved ? saved : ECONNREFUSED;
+		return -1;
+	}
 
 	{
 		/* Nagle would delay the request behind the greeting. */
 		int one = 1;
 		(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 	}
+	return fd;
+}
+
+/* Completes method negotiation with hop h over fd, which is a connection to
+ * it or a tunnel through the hops before it, including RFC 1929
+ * authentication when the hop selects it.  Shared by UDP ASSOCIATE and CONNECT,
+ * so both authenticate identically.  Returns 0, or -1 with errno set; fd stays
+ * open either way. */
+static int negotiate(int fd, int timeout_ms, const struct hop *h)
+{
+	uint8_t buf[2 + 2];
+	char name[HOP_NAME_MAX];
+	const char *who = hop_name(h, name, sizeof(name));
 
 	/* Method negotiation: VER, NMETHODS, METHODS.
 	 *
@@ -503,30 +706,37 @@ static int open_negotiated(const struct udpc_config *cfg)
 
 		buf[0] = SOCKS_VER;
 		buf[2 + nmethods++] = METHOD_NONE;
-		if (cfg->have_credentials)
+		if (h->have_credentials)
 			buf[2 + nmethods++] = METHOD_USERPASS;
 		buf[1] = nmethods;
 
-		if (write_all(fd, buf, 2 + (size_t)nmethods,
-		              cfg->connect_timeout_ms) != 0)
-			goto fail;
+		if (write_all(fd, buf, 2 + (size_t)nmethods, timeout_ms) != 0)
+			return -1;
 	}
 
-	if (read_all(fd, buf, 2, cfg->connect_timeout_ms) != 0)
-		goto fail;
+	if (read_all(fd, buf, 2, timeout_ms) != 0)
+		return -1;
 	if (buf[0] != SOCKS_VER) {
-		udpc_debug("proxy replied with version 0x%02x, expected 0x05", buf[0]);
+		udpc_debug("%sproxy replied with version 0x%02x, expected 0x05", who,
+		           buf[0]);
 		errno = EPROTO;
-		goto fail;
+		return -1;
 	}
 	if (buf[1] == METHOD_UNACCEPTABLE) {
-		udpc_err("proxy rejected all offered authentication methods");
-		if (!cfg->have_credentials)
-			udpc_err("no credentials are configured; set "
+		udpc_err("%sproxy rejected all offered authentication methods", who);
+		if (!h->have_credentials && h->no == 1)
+			udpc_err("%sno credentials are configured; set "
 			         "UDPCHAINS_USERNAME and UDPCHAINS_PASSWORD_FILE "
-			         "if the proxy requires authentication");
+			         "if the proxy requires authentication",
+			         who);
+		else if (!h->have_credentials)
+			udpc_err("%sno credentials are configured for this hop; "
+			         "set username and password_file in its [hop] "
+			         "section, or UDPCHAINS_USERNAME_%u and "
+			         "UDPCHAINS_PASSWORD_FILE_%u",
+			         who, h->no, h->no);
 		errno = EACCES;
-		goto fail;
+		return -1;
 	}
 	if (buf[1] == METHOD_USERPASS) {
 		/* FR-P-09 / RFC 1929.  A separate buffer: the request can reach
@@ -534,111 +744,109 @@ static int open_negotiated(const struct udpc_config *cfg)
 		uint8_t authbuf[3 + 255 + 255];
 		ssize_t alen;
 
-		if (!cfg->have_credentials) {
+		if (!h->have_credentials) {
 			/* Unreachable unless the proxy selected a method we did
 			 * not offer, which is a protocol violation worth naming
 			 * rather than treating as an auth failure. */
-			udpc_err("proxy selected username/password authentication, "
-			         "which was not offered -- no credentials are "
-			         "configured");
+			udpc_err("%sproxy selected username/password "
+			         "authentication, which was not offered -- no "
+			         "credentials are configured",
+			         who);
 			errno = EPROTO;
-			goto fail;
+			return -1;
 		}
 
 		alen = udpc_socks_encode_userpass(authbuf, sizeof(authbuf),
-		                                  cfg->username, cfg->password);
+		                                  h->username, h->password);
 		if (alen < 0) {
-			udpc_err("cannot encode credentials: username must be 1 "
-			         "to 255 bytes and the password at most 255");
+			udpc_err("%scannot encode credentials: username must be 1 "
+			         "to 255 bytes and the password at most 255",
+			         who);
 			errno = EINVAL;
-			goto fail;
+			return -1;
 		}
 
 		/* NFR-05: the length is logged, never the bytes. */
-		udpc_debug("proxy selected username/password auth; sending "
+		udpc_debug("%sproxy selected username/password auth; sending "
 		           "credentials for user of %zu bytes",
-		           strlen(cfg->username));
+		           who, strlen(h->username));
 
-		if (write_all(fd, authbuf, (size_t)alen,
-		              cfg->connect_timeout_ms) != 0) {
+		if (write_all(fd, authbuf, (size_t)alen, timeout_ms) != 0) {
 			explicit_bzero(authbuf, sizeof(authbuf));
-			goto fail;
+			return -1;
 		}
 		explicit_bzero(authbuf, sizeof(authbuf));
 
-		if (read_all(fd, buf, 2, cfg->connect_timeout_ms) != 0)
-			goto fail;
+		if (read_all(fd, buf, 2, timeout_ms) != 0)
+			return -1;
 		if (buf[0] != UDPC_AUTH_VER) {
-			udpc_err("proxy replied to authentication with version "
+			udpc_err("%sproxy replied to authentication with version "
 			         "0x%02x, expected 0x01 (RFC 1929)",
-			         buf[0]);
+			         who, buf[0]);
 			errno = EPROTO;
-			goto fail;
+			return -1;
 		}
 		if (buf[1] != 0x00) {
-			udpc_err("proxy rejected the supplied credentials "
+			udpc_err("%sproxy rejected the supplied credentials "
 			         "(status 0x%02x)",
-			         buf[1]);
+			         who, buf[1]);
 			errno = EACCES;
-			goto fail;
+			return -1;
 		}
-		udpc_debug("authenticated");
+		udpc_debug("%sauthenticated", who);
 	} else if (buf[1] != METHOD_NONE) {
-		udpc_err("proxy selected authentication method 0x%02x, which is "
+		udpc_err("%sproxy selected authentication method 0x%02x, which is "
 		         "not implemented (only 0x00 and 0x02 are supported)",
-		         buf[1]);
+		         who, buf[1]);
 		errno = EACCES;
-		goto fail;
+		return -1;
 	}
-	return fd;
-
-fail:
-	saved = errno;
-	close(fd);
-	errno = saved ? saved : ECONNREFUSED;
-	return -1;
+	return 0;
 }
 
-/* Sends a request -- VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT -- and reads the
- * reply, decoding BND.ADDR/BND.PORT into *bnd.  A NULL addr is sent as the
- * unspecified address with port 0, in the family of the control connection.
- * Returns 0, or -1 with errno set from the reply code (FR-F-07). */
-static int request(int fd, const struct udpc_config *cfg, uint8_t cmd,
-                   const struct sockaddr *addr, struct udpc_socks_hdr *bnd)
+/* Writes the unspecified address with port 0 at buf, as ATYP + address + port,
+ * in the given family: what a request declares when it has nothing to
+ * declare. */
+static ssize_t encode_unspecified(uint8_t *buf, int family)
 {
-	uint8_t buf[UDPC_SOCKS_HDR_MAX];
-	ssize_t hlen;
+	if (family == AF_INET6) {
+		buf[0] = UDPC_ATYP_IPV6;
+		memset(buf + 1, 0, 16 + 2); /* :: port 0 */
+		return 1 + 16 + 2;
+	}
+	buf[0] = UDPC_ATYP_IPV4;
+	memset(buf + 1, 0, 4 + 2); /* 0.0.0.0 port 0 */
+	return 1 + 4 + 2;
+}
+
+/* Sends a request -- VER, CMD, RSV, then dst, which is ATYP, DST.ADDR and
+ * DST.PORT already encoded -- and reads the reply, decoding BND.ADDR/BND.PORT
+ * into *bnd.  Returns 0, or -1 with errno set from the reply code (FR-F-07). */
+static int request(int fd, int timeout_ms, uint8_t cmd, const uint8_t *dst,
+                   size_t dstlen, struct udpc_socks_hdr *bnd)
+{
+	uint8_t buf[3 + UDPC_SOCKS_HDR_MAX];
 	size_t replylen;
 
+	if (dstlen > sizeof(buf) - 3) {
+		errno = EINVAL;
+		return -1;
+	}
 	buf[0] = SOCKS_VER;
 	buf[1] = cmd;
 	buf[2] = 0;
+	memcpy(buf + 3, dst, dstlen);
 
-	if (addr != NULL && udpc_sa_len(addr) != 0) {
-		/* Same ATYP+addr+port encoding as a datagram header, including
-		 * the v4-mapped normalisation (D-14). */
-		hlen = encode_addr(buf + 3, sizeof(buf) - 3, addr);
-		if (hlen < 0)
-			return -1;
-	} else if (cfg->proxy.ss_family == AF_INET6) {
-		buf[3] = UDPC_ATYP_IPV6;
-		memset(buf + 4, 0, 16 + 2); /* :: port 0 */
-		hlen = 1 + 16 + 2;
-	} else {
-		buf[3] = UDPC_ATYP_IPV4;
-		memset(buf + 4, 0, 4 + 2); /* 0.0.0.0 port 0 */
-		hlen = 1 + 4 + 2;
-	}
-
-	if (write_all(fd, buf, 3 + (size_t)hlen, cfg->connect_timeout_ms) != 0)
+	if (write_all(fd, buf, 3 + dstlen, timeout_ms) != 0)
 		return -1;
 
 	/* Reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT.  Read the fixed part,
 	 * then exactly as much as the declared ATYP requires -- never a fixed
 	 * slurp, which would either block waiting for bytes the proxy will not
 	 * send or steal bytes that are not ours.  After a CONNECT the bytes
-	 * that follow are the tunnelled stream. */
-	if (read_all(fd, buf, 4, cfg->connect_timeout_ms) != 0)
+	 * that follow are the tunnelled stream: in a chain, the next hop's
+	 * greeting. */
+	if (read_all(fd, buf, 4, timeout_ms) != 0)
 		return -1;
 	if (buf[0] != SOCKS_VER) {
 		errno = EPROTO;
@@ -664,21 +872,21 @@ static int request(int fd, const struct udpc_config *cfg, uint8_t cmd,
 
 	switch (buf[3]) {
 	case UDPC_ATYP_IPV4:
-		if (read_all(fd, buf + 4, 4 + 2, cfg->connect_timeout_ms) != 0)
+		if (read_all(fd, buf + 4, 4 + 2, timeout_ms) != 0)
 			return -1;
 		replylen = 4 + 4 + 2;
 		break;
 	case UDPC_ATYP_IPV6:
-		if (read_all(fd, buf + 4, 16 + 2, cfg->connect_timeout_ms) != 0)
+		if (read_all(fd, buf + 4, 16 + 2, timeout_ms) != 0)
 			return -1;
 		replylen = 4 + 16 + 2;
 		break;
 	case UDPC_ATYP_DOMAIN: {
 		size_t dlen;
-		if (read_all(fd, buf + 4, 1, cfg->connect_timeout_ms) != 0)
+		if (read_all(fd, buf + 4, 1, timeout_ms) != 0)
 			return -1;
 		dlen = buf[4];
-		if (read_all(fd, buf + 5, dlen + 2, cfg->connect_timeout_ms) != 0)
+		if (read_all(fd, buf + 5, dlen + 2, timeout_ms) != 0)
 			return -1;
 		replylen = 5 + dlen + 2;
 		break;
@@ -703,60 +911,192 @@ static int request(int fd, const struct udpc_config *cfg, uint8_t cmd,
 	return 0;
 }
 
-int udpc_socks_associate(const struct udpc_config *cfg,
-                         const struct sockaddr *bind_addr,
-                         struct udpc_socks_conn *conn, int *out_errno)
+/* Returns a descriptor whose stream is negotiated with hop index k, from 0: a
+ * connection to hop 1, extended by CONNECT through each hop before k, each hop
+ * negotiated with its own credentials inside the tunnel (FR-CH-03).  *h is left
+ * describing hop k.  Returns -1 with errno set and nothing left open. */
+static int open_tunnel(const struct udpc_config *cfg, unsigned k, struct hop *h)
 {
-	struct udpc_socks_hdr hdr;
+	uint8_t dst[UDPC_SOCKS_HDR_MAX];
+	struct udpc_socks_hdr bnd;
+	char what[48];
+	unsigned j;
+	ssize_t dlen;
 	int fd, saved;
 
-	memset(conn, 0, sizeof(*conn));
-	conn->control_fd = -1;
-
-	fd = open_negotiated(cfg);
+	(void)hop_view(cfg, 0, h);
+	fd = open_tcp(cfg);
 	if (fd < 0) {
-		*out_errno = errno;
+		hop_failed(h, "cannot connect", errno);
 		return -1;
 	}
+	if (negotiate(fd, cfg->connect_timeout_ms, h) != 0) {
+		hop_failed(h, "negotiation failed", errno);
+		goto fail;
+	}
+
+	for (j = 1; j <= k; j++) {
+		if (hop_view(cfg, j, h) != 0) {
+			hop_failed(h, "the address does not parse", errno);
+			goto fail;
+		}
+
+		/* D-39: the address as given.  A name goes as ATYP 0x03, for
+		 * hop j to resolve; it is never looked up here.  BND.ADDR is hop
+		 * j's outbound address for the tunnel, of no use to us. */
+		dlen = encode_target(dst, sizeof(dst), &h->addr);
+		if (dlen < 0 || request(fd, cfg->connect_timeout_ms, CMD_CONNECT,
+		                        dst, (size_t)dlen, &bnd) != 0) {
+			snprintf(what, sizeof(what), "hop %u could not reach it", j);
+			hop_failed(h, what, errno);
+			goto fail;
+		}
+		if (negotiate(fd, cfg->connect_timeout_ms, h) != 0) {
+			hop_failed(h, "negotiation failed", errno);
+			goto fail;
+		}
+	}
+	return fd;
+
+fail:
+	saved = errno;
+	close(fd);
+	errno = saved ? saved : ECONNREFUSED;
+	return -1;
+}
+
+/* Associates with hop index k, from 0: a tunnel to it, then UDP ASSOCIATE.  On
+ * success *fdp is the control connection and *relay the relay after the
+ * fixup.  Returns -1 with errno set and nothing left open. */
+static int associate_hop(const struct udpc_config *cfg, unsigned k,
+                         const struct sockaddr *bind_addr, int *fdp,
+                         struct udpc_socks_addr *relay)
+{
+	uint8_t dst[UDPC_SOCKS_HDR_MAX];
+	char name[HOP_NAME_MAX];
+	struct udpc_socks_hdr hdr;
+	struct hop h;
+	ssize_t dlen;
+	int fd, saved;
+
+	fd = open_tunnel(cfg, k, &h);
+	if (fd < 0)
+		return -1;
 
 	/* FR-P-05: declare 0.0.0.0:0 unless the application bound a concrete
 	 * address.  Proxies pin the association to a declared address, so
-	 * declaring one we will not send from breaks the association. */
-	if (request(fd, cfg, CMD_UDP_ASSOCIATE, bind_addr, &hdr) != 0)
+	 * declaring one we will not send from breaks the association.  Only
+	 * hop 1 sees datagrams from the application's socket; a later hop sees
+	 * them from the previous hop's relay, so it is always declared the
+	 * unspecified address, in the family of its own address when that is
+	 * known. */
+	if (k == 0 && bind_addr != NULL && udpc_sa_len(bind_addr) != 0)
+		dlen = encode_addr(dst, sizeof(dst), bind_addr);
+	else
+		dlen = encode_unspecified(dst, h.addr.named ? AF_INET
+		                                            : h.addr.sa.ss_family);
+
+	if (dlen < 0 || request(fd, cfg->connect_timeout_ms, CMD_UDP_ASSOCIATE,
+	                        dst, (size_t)dlen, &hdr) != 0) {
+		hop_failed(&h, "UDP ASSOCIATE failed", errno);
 		goto fail;
+	}
 
 	if (!hdr.addr_valid) {
 		/* A named relay would need a lookup we cannot do honestly here. */
-		udpc_err("proxy returned a domain-name relay address, which is "
-		         "not usable for a UDP association");
+		udpc_err("%sproxy returned a domain-name relay address, which is "
+		         "not usable for a UDP association",
+		         hop_name(&h, name, sizeof(name)));
 		errno = EPROTO;
 		goto fail;
 	}
 
-	conn->relay = hdr.addr;
-	udpc_socks_fixup_relay(&conn->relay, cfg);
-	conn->control_fd = fd;
+	memset(relay, 0, sizeof(*relay));
+	relay->sa = hdr.addr;
+	if (k == 0)
+		udpc_socks_fixup_relay(&relay->sa, cfg);
+	else
+		udpc_socks_fixup_hop_relay(relay, &h.addr);
+	*fdp = fd;
 	return 0;
 
 fail:
 	saved = errno;
 	close(fd);
-	*out_errno = saved ? saved : ECONNREFUSED;
+	errno = saved ? saved : ECONNREFUSED;
 	return -1;
+}
+
+int udpc_socks_associate(const struct udpc_config *cfg,
+                         const struct sockaddr *bind_addr,
+                         struct udpc_socks_conn *conn, int *out_errno)
+{
+	struct udpc_socks_addr relay;
+
+	memset(conn, 0, sizeof(*conn));
+	conn->control_fd = -1;
+
+	if (cfg->nextra != 0) {
+		*out_errno = EINVAL;
+		return -1;
+	}
+	if (associate_hop(cfg, 0, bind_addr, &conn->control_fd, &relay) != 0) {
+		*out_errno = errno;
+		return -1;
+	}
+	conn->relay = relay.sa;
+	return 0;
+}
+
+int udpc_socks_associate_chain(const struct udpc_config *cfg,
+                               const struct sockaddr *bind_addr,
+                               struct udpc_socks_chain *chain, int *out_errno)
+{
+	unsigned k;
+
+	memset(chain, 0, sizeof(*chain));
+	for (k = 0; k < UDPC_CHAIN_MAX; k++)
+		chain->control_fd[k] = -1;
+
+	if (cfg->nextra > UDPC_CHAIN_MAX - 1) {
+		*out_errno = EINVAL;
+		return -1;
+	}
+
+	/* Hop 1 first, so a dead first hop fails fastest.  Each hop's tunnel is
+	 * built afresh through the hops before it: O(n^2) handshakes, every
+	 * step with its own timeout. */
+	for (k = 0; k <= cfg->nextra; k++) {
+		if (associate_hop(cfg, k, k == 0 ? bind_addr : NULL,
+		                  &chain->control_fd[k], &chain->relay[k]) != 0) {
+			*out_errno = errno;
+			udpc_socks_disconnect_chain(chain);
+			return -1;
+		}
+		chain->n = k + 1;
+	}
+	return 0;
 }
 
 int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst,
                        int *out_errno)
 {
+	uint8_t req[UDPC_SOCKS_HDR_MAX];
 	struct udpc_socks_hdr hdr;
+	struct hop h;
+	ssize_t dlen;
 	int fd, saved;
 
 	if (dst == NULL || udpc_sa_len(dst) == 0) {
 		*out_errno = EAFNOSUPPORT;
 		return -1;
 	}
+	if (cfg->nextra > UDPC_CHAIN_MAX - 1) {
+		*out_errno = EINVAL;
+		return -1;
+	}
 
-	fd = open_negotiated(cfg);
+	fd = open_tunnel(cfg, cfg->nextra, &h);
 	if (fd < 0) {
 		*out_errno = errno;
 		return -1;
@@ -764,8 +1104,11 @@ int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst
 
 	/* BND.ADDR is the proxy's outbound address for the tunnel.  The
 	 * caller has no use for it, and a domain-form one is legal here. */
-	if (request(fd, cfg, CMD_CONNECT, dst, &hdr) != 0) {
+	dlen = encode_addr(req, sizeof(req), dst);
+	if (dlen < 0 || request(fd, cfg->connect_timeout_ms, CMD_CONNECT, req,
+	                        (size_t)dlen, &hdr) != 0) {
 		saved = errno;
+		hop_failed(&h, "CONNECT failed", saved);
 		close(fd);
 		*out_errno = saved ? saved : ECONNREFUSED;
 		return -1;
@@ -783,12 +1126,26 @@ void udpc_socks_disconnect(struct udpc_socks_conn *conn)
 	conn->control_fd = -1;
 }
 
-bool udpc_socks_control_alive(const struct udpc_socks_conn *conn)
+void udpc_socks_disconnect_chain(struct udpc_socks_chain *chain)
+{
+	unsigned k;
+
+	if (chain == NULL)
+		return;
+	for (k = 0; k < chain->n && k < UDPC_CHAIN_MAX; k++) {
+		if (chain->control_fd[k] >= 0)
+			close(chain->control_fd[k]);
+		chain->control_fd[k] = -1;
+	}
+	chain->n = 0;
+}
+
+static bool control_alive(int fd)
 {
 	struct pollfd pfd;
 	int r;
 
-	if (conn == NULL || conn->control_fd < 0)
+	if (fd < 0)
 		return false;
 
 	/* POLLRDHUP is the signal that matters, not POLLHUP and not POLLIN.
@@ -806,8 +1163,11 @@ bool udpc_socks_control_alive(const struct udpc_socks_conn *conn)
 	 * would otherwise have every one of its associations torn down and
 	 * rebuilt on the next send.  Being wrong in that direction is expensive
 	 * and hard to diagnose; being wrong the other way merely delays noticing
-	 * a dead association until the send fails, which is already handled. */
-	pfd.fd = conn->control_fd;
+	 * a dead association until the send fails, which is already handled.
+	 *
+	 * Through a tunnel, a hop that drops the association closes its end of
+	 * the tunnel, and the hops before it carry that close back here. */
+	pfd.fd = fd;
 	pfd.events = POLLRDHUP;
 	pfd.revents = 0;
 
@@ -819,5 +1179,22 @@ bool udpc_socks_control_alive(const struct udpc_socks_conn *conn)
 		return false;
 	if (pfd.revents & (POLLRDHUP | POLLERR | POLLHUP | POLLNVAL))
 		return false;
+	return true;
+}
+
+bool udpc_socks_control_alive(const struct udpc_socks_conn *conn)
+{
+	return conn != NULL && control_alive(conn->control_fd);
+}
+
+bool udpc_socks_chain_alive(const struct udpc_socks_chain *chain)
+{
+	unsigned k;
+
+	if (chain == NULL || chain->n == 0)
+		return false;
+	for (k = 0; k < chain->n && k < UDPC_CHAIN_MAX; k++)
+		if (!control_alive(chain->control_fd[k]))
+			return false;
 	return true;
 }

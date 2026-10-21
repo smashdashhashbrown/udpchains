@@ -86,6 +86,7 @@ WRAPPER := udpchains
 # shipped shim.
 FIXTURES := $(OBJDIR)/socks5d $(OBJDIR)/udpecho $(OBJDIR)/dnsd
 TESTS    := $(OBJDIR)/test_config $(OBJDIR)/test_socks5 $(OBJDIR)/test_addr \
+            $(OBJDIR)/test_chain \
             $(OBJDIR)/test_matrix $(OBJDIR)/test_fidelity \
             $(OBJDIR)/test_lifecycle $(OBJDIR)/test_thread \
             $(OBJDIR)/leakclient $(OBJDIR)/test_faults \
@@ -138,6 +139,10 @@ $(OBJDIR)/test_config: $(TESTDIR)/test_config.c $(UNIT_OBJS) | $(OBJDIR)
 
 $(OBJDIR)/test_socks5: $(TESTDIR)/test_socks5.c $(UNIT_OBJS) | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS)
+
+# Starts its own fixture proxies, from the directory it is built in.
+$(OBJDIR)/test_chain: $(TESTDIR)/test_chain.c $(UNIT_OBJS) | $(OBJDIR) $(FIXTURES)
+	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(filter %.c %.o,$^) $(LDFLAGS)
 
 $(OBJDIR)/test_addr: $(TESTDIR)/test_addr.c $(UNIT_OBJS) | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS)

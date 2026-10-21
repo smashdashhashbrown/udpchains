@@ -163,7 +163,7 @@ run_asan() {
 	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0:exitcode=99"
 
 	local t rc
-	for t in test_addr test_config test_socks5 test_dns; do
+	for t in test_addr test_config test_socks5 test_chain test_dns; do
 		echo "--- $t"
 		"$BUILD/$t" > "$TMP/$t.out" 2>&1
 		rc=$?

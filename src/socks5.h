@@ -94,12 +94,15 @@ struct udpc_socks_conn {
 ssize_t udpc_socks_encode_userpass(uint8_t *buf, size_t buflen, const char *user,
                                    const char *pass);
 
+/* A chain of one only.  Given a chain it fails with EINVAL, rather than
+ * associate with the first hop alone (D-37); use udpc_socks_associate_chain. */
 int udpc_socks_associate(const struct udpc_config *cfg,
                          const struct sockaddr *bind_addr,
                          struct udpc_socks_conn *conn, int *out_errno);
 
 /* Opens a TCP tunnel to dst through the proxy with SOCKS5 CONNECT (CMD 0x01),
- * negotiating and authenticating exactly as udpc_socks_associate does.
+ * negotiating and authenticating exactly as udpc_socks_associate does.  Through
+ * a chain, the tunnel runs through every hop and the last one connects to dst.
  * Returns a connected, non-blocking, close-on-exec descriptor whose byte stream
  * is now dst's, or -1 with *out_errno set.
  *
@@ -130,5 +133,59 @@ void udpc_socks_disconnect(struct udpc_socks_conn *conn);
  * re-associate (FR-P-08).  Does not consume application data: the control
  * connection carries none after the reply. */
 bool udpc_socks_control_alive(const struct udpc_socks_conn *conn);
+
+/* --- chains (D-37 to D-42) ------------------------------------------------- */
+
+/* An address as SOCKS5 carries it: numeric, or a name the hop before it
+ * resolves (ATYP 0x03).  Hops after the first, and their relays, take this
+ * form, because they are never resolved here (D-39, D-40). */
+struct udpc_socks_addr {
+	bool named;
+	struct sockaddr_storage sa; /* when !named, port included */
+	char host[256];             /* when named */
+	uint16_t port;              /* when named, host order */
+};
+
+/* Reads a later hop's address as written: a numeric address becomes sa, and a
+ * name stays a name.  Never resolves (D-39).  Returns 0, or -1 with errno
+ * EINVAL for a spec udpc_addr_split refuses. */
+int udpc_socks_hop_addr(const char *spec, struct udpc_socks_addr *out);
+
+/* Hop k's association, for k from 0: control_fd[k] is a stream to hop 1,
+ * extended by CONNECT through hops 1 to k, on which hop k+1 was negotiated and
+ * asked for UDP ASSOCIATE (FR-CH-03).  relay[k] is that hop's relay after the
+ * fixup; relay[0] is always numeric, since it is what this host sends to. */
+struct udpc_socks_chain {
+	unsigned n; /* hops, 1 to UDPC_CHAIN_MAX */
+	int control_fd[UDPC_CHAIN_MAX];
+	struct udpc_socks_addr relay[UDPC_CHAIN_MAX];
+};
+
+/* Associates with every hop of cfg's chain, first to last (D-37: all of them or
+ * none).  bind_addr is declared to hop 1 as udpc_socks_associate declares it;
+ * later hops are declared the unspecified address, since datagrams reach them
+ * from the previous hop's relay, whose port is not known (FR-P-05).
+ *
+ * Returns 0, or -1 with *out_errno set and nothing left open.  With a chain of
+ * more than one, a failure is reported naming the hop (FR-CH-12).  A chain of
+ * one does exactly what udpc_socks_associate does (FR-CH-01). */
+int udpc_socks_associate_chain(const struct udpc_config *cfg,
+                               const struct sockaddr *bind_addr,
+                               struct udpc_socks_chain *chain, int *out_errno);
+
+/* Closes every control connection.  The chain is empty afterwards. */
+void udpc_socks_disconnect_chain(struct udpc_socks_chain *chain);
+
+/* True while every control connection is open: losing any hop loses the
+ * association (FR-CH-09). */
+bool udpc_socks_chain_alive(const struct udpc_socks_chain *chain);
+
+/* The D-16 fixup for hop k >= 2 (D-40).  relay is numeric, as hop k returned
+ * it; hop is hop k's address as given.  A wildcard relay becomes hop's address
+ * with the relay's port, and may become a name.  A loopback relay is kept only
+ * if hop was given as a loopback address, which puts it on the same host as
+ * the hop before it; otherwise it is replaced the same way. */
+void udpc_socks_fixup_hop_relay(struct udpc_socks_addr *relay,
+                                const struct udpc_socks_addr *hop);
 
 #endif /* UDPCHAINS_SOCKS5_H */

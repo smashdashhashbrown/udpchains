@@ -86,6 +86,7 @@ export UDPCHAINS_QUIET=1
 run_test unit-addr    "$BUILD/test_addr"
 run_test unit-config  "$BUILD/test_config"
 run_test unit-socks5  "$BUILD/test_socks5"
+run_test unit-chain   "$BUILD/test_chain"
 run_test unit-fdtable "$BUILD/test_fdtable_mt"
 run_test unit-dns     "$BUILD/test_dns"
 
