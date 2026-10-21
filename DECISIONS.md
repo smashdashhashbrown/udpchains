@@ -1617,9 +1617,11 @@ local, because the proxy is where it will be resolved. Both read one flag, `prox
   since only the hop before it needs to resolve the name, at the cost of D-41 checking that layer by
   port alone. No proxy known to do this has been seen.
 
-**Open questions.** Whether real proxies accept a name (`ATYP 0x03`) in a UDP header, which the
-wildcard case with a named hop needs, and whether any answers UDP ASSOCIATE with a named relay.
-Interop will tell (FR-CH-T4).
+**Open questions, answered by interop** (2026-10-21, FR-CH-T4). Whether real proxies accept a name
+(`ATYP 0x03`) in a UDP header, which the wildcard case with a named hop needs: all seven tested
+did, as hop 1 with hop 2 given by name and its loopback relay replaced by that name. Whether any
+answers UDP ASSOCIATE with a named relay: none of the seven did. Both on one host only
+([`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §13).
 
 ---
 

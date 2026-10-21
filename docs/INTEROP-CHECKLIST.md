@@ -25,6 +25,7 @@ Run everything with `-v` and keep the output. The per-datagram debug line names 
 | `ntpdate -q` (§4) | ✅ passed 2026-08-19 — stratum-2 offsets accepted. The only test so far run by a client that validates a reply's **source address** rather than just its port |
 | dual-stack → v4-mapped (§6a) | ✅ passed 2026-08-19 — `ATYP 0x01` with a 10-byte header from an `AF_INET6` socket. D-14 confirmed fixed against the real proxy, outbound direction |
 | Seven other proxies, on this host (§12) | ✅ run 2026-10-19 — Dante, 3proxy, gost, Xray, sing-box, hev-socks5-server and shadowsocks-rust. No proxy-specific udpchains defect; one general `errno` bug found and fixed. Found per-proxy datagram limits, above which the proxy silently truncates; four proxies that drop zero-length datagrams; and Dante port-restricted by default. Also covers `ATYP 0x04` to `::1`, the resolver's `CONNECT` fallback, and idle expiry |
+| The same seven as hops of chains (§13) | ✅ run 2026-10-21 — each a middle hop and an exit hop, and all seven as one chain. Every datagram limit through a chain was as predicted from the hops'; every proxy accepted a hop's relay named in a UDP header; a dead hop leaked nothing |
 
 TFTP is **lockstep**: one block, wait for the ACK. It never has more than one datagram in flight, so
 despite the volume it says nothing about burst behaviour, receive-queue pressure, or batching. That
@@ -684,6 +685,108 @@ shadowsocks-rust. `-U` enables UDP on both ends:
 ssserver -s 127.0.0.1:18388 -m aes-256-gcm -k <key> -U
 sslocal  -b 127.0.0.1:11086 -s 127.0.0.1:18388 -m aes-256-gcm -k <key> -U
 ```
+
+## 13. The same proxies, as the hops of chains (2026-10-21)
+
+The seven proxies of §12, in the same containers on this host, as hops of chains (FR-CH-T4). It
+answers the question [`FUTURE-UDP-CHAINS.md`](FUTURE-UDP-CHAINS.md) §8 left for interop: which real
+proxies can be a middle hop. All seven can.
+
+### Running it again
+
+`make interop` runs the chains after the single-proxy checks. `--chains-only` runs only them, and
+`--no-chains` skips them:
+
+```sh
+make interop INTEROP_ARGS="--chains-only"            # every chain below, about 10 minutes
+make interop INTEROP_ARGS="--chains-only gost xray"  # the chains of those two only
+```
+
+### What was run
+
+- **A ring of 2-hop chains,** each proxy followed by the next: Dante > 3proxy, 3proxy > gost,
+  gost > Xray, Xray > sing-box, sing-box > hev, hev > shadowsocks-rust, shadowsocks-rust > Dante.
+  Each proxy is a middle hop once and the exit hop once. Each chain gets:
+  - `test_matrix` (108 cells), `test_fidelity`, `test_portswitch`, and `test_resolve main`
+    against `dnsd`, counting the UDP queries and the TCP query through the chained `CONNECT`;
+  - one datagram to `::1`, checking the bytes on the wire: 100 of payload, the exit hop's 22-byte
+    header and hop 1's 10-byte one;
+  - the size at which the chain is predicted to stop carrying a datagram whole, and one byte more;
+  - hop 2 given by name, `udpchains-hop.test`, which every container resolves to `127.0.0.1`. Hop
+    2's relay is then that name too (D-40), so hop 1 must resolve it in each UDP header
+    (`ATYP 0x03`);
+  - a steady sender with each hop killed in turn, as in §12.
+- **All seven as one chain,** in the order above: the matrix, `test_lifecycle`, the resolver, the
+  size check, `::1`, and the steady sender with its middle hop, Xray, killed.
+- **Authentication at both hops:** Dante, then 3proxy, each requiring a login. Hop 1's from
+  `UDPCHAINS_USERNAME` and `UDPCHAINS_PASSWORD_FILE`, hop 2's from the same names with `_2`. The
+  matrix with both right, then a wrong password for hop 2 alone.
+
+### Results
+
+| Chain | Matrix | Fidelity | Port switch | Largest whole | Named hop 2 | Resolver | Each hop killed |
+|---|---|---|---|---|---|---|---|
+| Dante > 3proxy | ✅ | zero-length ✗ | ✅ | 16 326, by 3proxy, the exit | ✅ | ✅ | ✅ |
+| 3proxy > gost | ✅ | ✅ | ✅ | 16 316, by 3proxy, the middle | ✅ | ✅ | ✅ |
+| gost > Xray | ✅ | zero-length ✗ | ✅ | 8 182, by Xray, the exit | ✅ | ✅ | ✅ |
+| Xray > sing-box | ✅ | ✅ | ✅ | 8 172, by Xray, the middle | ✅ | ✅ | ✅, see below |
+| sing-box > hev | ✅ | zero-length ✗ | ✅ | 1 490, by hev, the exit | ✅ | ✅ | ✅ |
+| hev > shadowsocks-rust | ✅ | zero-length ✗ | ✅ | 1 480, by hev, the middle | ✅ | ✅ | ✅ |
+| shadowsocks-rust > Dante | ✅ | ✅ | ✗, as Dante alone | ≥ 64 990 | ✅ | ✅ | ✅ |
+| all seven | ✅ | — | — | 1 480, by hev, hop 6 of 7 | — | ✅ | ✅ (Xray) |
+
+`::1` through every chain: ✅, with exactly the predicted bytes on the wire, 132 through two hops
+and 182 through seven. Lifecycle through all seven: ✅. Authentication at both hops: ✅, and a
+wrong password for hop 2 alone fails the send with 3proxy's `ECONNRESET`, as it does alone.
+
+### What the chains show
+
+**Every proxy can be a middle hop.** Each allowed `CONNECT` to the next hop and relayed UDP to its
+relay, and each accepted UDP from the previous hop's outbound port though its association was
+asked for on a connection from another port: D-44 declares the unspecified address, so none had
+an address to pin. Dante's port restriction (§12) applies to what its relay receives from the
+destination it sent to. As a middle hop that destination is the next hop's relay, which replies
+from the same port, so Dante at its defaults is a working middle hop.
+
+**What a datagram can be is decided hop by hop, and predicted exactly.** Hop *i* of *n* carries the
+headers of the *n* − *i* hops after it, 10 bytes each here, so its own limit from §12 falls by that
+much. Every chain carried a datagram whole at the predicted size and truncated it one byte above,
+by the hop the prediction named. As a middle hop 3proxy carries 16 316, Xray 8 172 and hev 1 480,
+each 10 below its limit alone; as the exit hop each keeps its limit. The exit hop alone decides a
+zero-length datagram and a reply from another port, since every hop before it carries at least a
+header: the fidelity and port-switch columns are the exit hop's columns from §12.
+
+**A name in a UDP header** (`ATYP 0x03`) was accepted by every proxy as hop 1, which D-40 needed
+to know. None returned a named relay.
+
+**A dead hop leaks nothing.** In every chain, with any hop killed, no datagram reached the
+destination while it was dead, and the same socket carried traffic again once it was back. The
+`errno` the program sees depends on which hop died. Hop 1 dead is `ECONNREFUSED`, from this host's
+own connect. A later hop dead is the hop before it failing to reach it, as that proxy reports
+it: `ECONNREFUSED` through 3proxy and sing-box, `ENETUNREACH` through gost, `EHOSTUNREACH` through
+hev, `ECONNRESET` through shadowsocks-rust and Xray, and `ECONNREFUSED` and `ECONNRESET` in about
+equal numbers through Dante. The same in two runs.
+
+**Xray as a middle hop is slow to pass on the next hop's death.** With sing-box killed behind it,
+Xray kept the tunnel to the client open for 1 to 2 seconds (about 17 and 13 sends at 10 a second,
+in two runs). Those sends succeeded, and their datagrams were lost at Xray. Then the shim saw the
+tunnel close, and its re-association failed once with `ECONNRESET`. The send after that waited
+inside its re-association until sing-box was back, and then succeeded. Nothing reached the
+destination at any point. Every other middle hop closed the tunnel at once, so sends failed from
+the first one after the kill. Xray's documentation describes `policy` timers, `uplinkOnly` and
+`downlinkOnly`, that keep a connection open for a while after one side closes; whether they are
+the cause was not tested. A program cannot tell such lost datagrams from ordinary UDP loss.
+
+### What this does not show
+
+- **Chains across hosts.** Every hop was on this host's loopback, so every hop saw the same
+  address for the previous hop's TCP and UDP. On a multi-homed middle hop, UDP may leave from a
+  different address than its `CONNECT` did, and a next hop that accepts UDP only from its control
+  connection's address would drop it. D-44's declared family, and the fixup of a relay on another
+  host (D-40), are untested against real proxies.
+- **IPv6 between hops.** Every relay was IPv4; only the destination was IPv6.
+- **A hop on the same host as the next.** Here all of them were, so a loopback relay from hop 2
+  was always usable by hop 1, except when hop 2 was given by name.
 
 ## Reporting a failure
 

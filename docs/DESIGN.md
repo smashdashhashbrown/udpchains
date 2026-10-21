@@ -5,8 +5,8 @@ the choices behind this design and their rationale live in [`DECISIONS.md`](../D
 Requirement IDs are cited inline so [`TRACEABILITY.md`](TRACEABILITY.md) can map each one to a section
 here.
 
-**Status:** as built in 0.1.0. Where the first draft changed, the decision record that changed it is
-cited.
+**Status:** as built in 0.1.0, plus multi-hop chains (§12). Where the first draft changed, the
+decision record that changed it is cited.
 
 ---
 
@@ -475,7 +475,7 @@ debug level, no hex dumps. Lengths, addresses and header fields only.
 
 From §8 of the requirements, listed here because they constrain the design: statically-linked
 binaries, Go binaries, setuid/setgid targets, system calls made without libc, faithful ancillary data,
-GSO/GRO, QUIC performance, TCP proxying, proxy chains. D-04 once put the resolver's TCP fallback
+GSO/GRO, QUIC performance, TCP proxying. Proxy chains were a non-goal for 0.1.0, and are now §12. D-04 once put the resolver's TCP fallback
 outside scope as well; D-22 superseded that, and the shim's own resolver retries over SOCKS5
 `CONNECT` (§11). An application's own TCP DNS is still not proxied. The README states these plainly (acceptance criterion 6, D-05 R4).
 
@@ -594,3 +594,105 @@ is never used: the whole query is repeated over TCP.
   installed, to check the process never addressed a resolver directly.
 - A new leak-test scenario: with the proxy down, every lookup fails and nothing reaches the host's
   resolver.
+
+---
+
+## 12. Multi-hop chains (FR-P-10)
+
+**Status:** implemented after 0.1.0. The requirements are §2a of the requirements document
+(FR-CH-*); the choices are D-37 to D-46. A chain of one is 0.1.0 exactly: the same wire bytes,
+errors, diagnostics and environment (FR-CH-01).
+
+### 12.1 Configuration and handoff
+
+`struct udpc_config` keeps hop 1 in its 0.1.0 fields (`proxy`, `username`, `password_file`, ...)
+and adds `hops[7]` with a count, `nextra`, for hops 2 to 8 (D-42). The wrapper resolves hop 1
+only, as D-27 does for the one proxy; later hops are checked for form and exported as written
+(D-39), in `UDPCHAINS_PROXY` as a comma-separated list. Hop *n*'s credentials travel as
+`UDPCHAINS_USERNAME_<n>` and the password's location as `UDPCHAINS_PASSWORD_FILE_<n>` or
+`UDPCHAINS_PASSWORD_CONFIG_<n>` (D-25, D-38).
+
+### 12.2 Setup
+
+`udpc_socks_associate_chain` (`src/socks5.c`) builds a `struct udpc_socks_chain`: for each hop *k*,
+a control connection and the hop's relay.
+
+```
+hop 1:  connect(hop 1) → negotiate → UDP ASSOCIATE          → relay[0]
+hop 2:  connect(hop 1) → negotiate → CONNECT hop 2
+                       → negotiate with hop 2 → UDP ASSOCIATE → relay[1]
+hop k:  connect(hop 1) → CONNECT through hops 1 … k−1
+                       → negotiate with hop k → UDP ASSOCIATE → relay[k−1]
+```
+
+- **Every control connection is a TCP stream to hop 1,** extended by `CONNECT` through the hops
+  before hop *k* (FR-CH-03). An *n*-hop chain therefore holds *n* streams and makes
+  *n*(*n*+1)/2 negotiations. Each hop is negotiated with its own credentials.
+- **A later hop is sent as written**: numeric as `ATYP 0x01` or `0x04`, a name as `ATYP 0x03`, for
+  the hop before it to resolve (D-39).
+- **Hop *k* ≥ 2 is declared the unspecified address** in its `UDP ASSOCIATE`, in the family of its
+  own numeric address, else of the `CONNECT` reply's `BND.ADDR`, else IPv4 (D-44). Its datagrams
+  arrive from the previous hop's relay, whose outbound port is not known.
+- **The relay fixup is per hop** (D-40). Hop 1 keeps D-16. For hop *k* ≥ 2, a wildcard relay
+  means hop *k*'s address as given, which may be a name; a loopback relay is kept only if hop *k*
+  was given as a loopback address (`localhost` included). A relay returned as a name is refused at
+  every hop.
+- **All or nothing** (D-37). A failure at any hop closes the hops already up and fails the call
+  with an `errno`, naming the hop (D-43). There is no skip or fallback.
+- **Deadline** (D-45). Every wait keeps `connect_timeout`; the whole setup must also finish within
+  `chain_timeout`, by default `connect_timeout` × hops for a chain of more than one, and none for
+  a chain of one.
+
+### 12.3 Codec
+
+`udpc_socks_encode_chain` writes *n* headers into the per-thread header buffer, which grows to
+`UDPC_SOCKS_CHAIN_HDR_MAX`. The outermost, read by hop 1, names `relay[1]`; each one inwards names
+the next relay; the innermost names the destination (FR-CH-05). The payload is still sent from
+the program's buffer with no copy (D-11).
+
+`udpc_socks_decode_chain` strips the layers outermost first. Every layer but the innermost must
+decode, have `FRAG` 0, and name as its source the relay of the next hop, by port alone when that
+relay is a name (D-41). A datagram failing any check at any layer is dropped whole; the
+diagnostic names the layer and the reason (`enum udpc_socks_drop`). The innermost layer is
+handled as 0.1.0 handles its one header. `max_datagram` remains the payload (D-42); receive
+buffers grow by the headers.
+
+### 12.4 Association lifecycle
+
+- **An association holds the whole chain.** All *n* control connections are shim descriptors,
+  moved and marked (D-26), and a forked child closes all of them (D-31).
+- **Liveness** (FR-CH-09): `udpc_socks_chain_alive` checks every control connection. Losing any
+  one loses the association, and FR-P-08's re-association rebuilds the whole chain.
+- **Descriptor range** (D-46): with *n* descriptors per socket, the range at 768 and up can fill.
+  `udpc_fd_shim_adopt` then leaves the descriptor at the number it has, still marked, and warns
+  once a second. With none at all, setup fails with `EMFILE`.
+- **The loopback guard looks at the exit hop** (D-40): a loopback destination is resolved there,
+  so for a chain of more than one it always warns, and `strict_loopback` refuses it.
+
+### 12.5 Name resolution
+
+The resolver's pool entries (§11.3) hold a `struct udpc_socks_chain` in place of one control
+connection. Queries are encoded and replies decoded with the chain codec, so every layer of a
+reply is checked as in §12.3. An entry idle long enough to have expired is replaced if any hop's
+control connection is gone, and a query waits on every control connection as well as the relay. The
+TCP fallback's `CONNECT` runs through every hop to the resolver (FR-CH-11).
+
+### 12.6 Diagnostics
+
+The association line names every hop's relay in order (`via relay A, then B, then C`), for
+datagram and resolver associations alike. A setup failure names the hop and what failed —
+`hop 2 of 3 (10.0.0.5:1080): hop 1's CONNECT to it failed: Connection refused` — at error level,
+once a second, with no vaguer line after it (D-43). A dropped datagram names its layer.
+
+### 12.7 Tests
+
+- `unit-chain` (`tests/test_chain.c`) starts its own fixture proxies: setup, per-hop credentials,
+  fixup, declared family, deadline, codec and hop-naming diagnostics.
+- `tests/run.sh` runs the matrix, fidelity, port-switch, lifecycle and thread tests again through
+  2- and 3-hop fixture chains (FR-CH-T2).
+- `test_leak.sh` and `test_failclosed_capture.sh` repeat the leak test with each hop of a 3-hop
+  chain dead (FR-CH-T1), for datagrams and lookups.
+- `test_faults.sh` adds expiry at a middle hop, `FRAG` at a middle and the innermost layer, a
+  forged inner source, a hop refusing `CONNECT`, and a full descriptor range (FR-CH-T3, FR-CH-10).
+- `make interop` builds chains of the seven real proxies (FR-CH-T4,
+  [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) §13).

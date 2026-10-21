@@ -9,6 +9,10 @@
 # reaches a destination while it is dead.  Results and their meaning are in
 # docs/INTEROP-CHECKLIST.md section 12.
 #
+# Then the same proxies as the hops of chains (FR-CH-T4): a ring of 2-hop
+# chains, in which each proxy is once a middle hop and once the exit hop, and
+# one chain of all of them.  Results are in section 13.
+#
 # Each proxy's known behaviour is an EXPECTATION here, not a failure: Xray
 # truncating above 8182 bytes is reported "expected".  A proxy that changes --
 # a new version that stops truncating, or starts -- is reported FAIL, because
@@ -21,11 +25,14 @@
 # Every image is pinned by digest, and the one downloaded binary by checksum.
 #
 # usage: make interop [INTEROP_ARGS="..."]
-#        tests/interop/run.sh [--long] [--internet] [proxy ...]
+#        tests/interop/run.sh [--long] [--internet] [--no-chains | --chains-only]
+#                             [proxy ...]
 #
 #   --long      also idle each association for 75 s against the proxy's
 #               default timeout (FR-P-08); adds about 80 s
 #   --internet  also resolve real names through each proxy, via 9.9.9.9
+#   --no-chains    skip the chains
+#   --chains-only  run only the chains
 #   proxy       any of: dante 3proxy gost xray singbox hev ssrust
 #
 # INTEROP_PORT_BASE (default 21080) sets the first of the ~50 local ports used.
@@ -43,11 +50,15 @@ BASE=${INTEROP_PORT_BASE:-21080}
 ALL="dante 3proxy gost xray singbox hev ssrust"
 LONG=0
 INTERNET=0
+SINGLE=1
+CHAINS=1
 SELECTED=""
 for a in "$@"; do
 	case "$a" in
 	--long) LONG=1 ;;
 	--internet) INTERNET=1 ;;
+	--no-chains) CHAINS=0 ;;
+	--chains-only) SINGLE=0 ;;
 	-h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 	-*) echo "run.sh: unknown option $a" >&2; exit 2 ;;
 	*)
@@ -170,12 +181,17 @@ wait_listen() {
 	return 1
 }
 
+# A name for this host's loopback, known inside every container, for a chain
+# hop given by name.
+HOPNAME=udpchains-hop.test
+
 # ctr <name> <docker run args...>: starts a container on the host network.
 ctr() {
 	local name=udpc-interop-$1
 	shift
 	docker rm -f "$name" > /dev/null 2>&1
-	docker run -d --name "$name" --label "$LABEL" --network host "$@" > /dev/null
+	docker run -d --name "$name" --label "$LABEL" --network host \
+		--add-host "$HOPNAME:127.0.0.1" "$@" > /dev/null
 }
 
 # --- results -------------------------------------------------------------------
@@ -352,7 +368,20 @@ proxy_version() {
 
 # --- checks --------------------------------------------------------------------
 
-shim() { UDPCHAINS_QUIET=1 timeout "$1" "$W" -p "$2" "${@:3}"; }
+# Sets HOPS to the wrapper's -p arguments for a proxy, or for a chain given as
+# a comma-separated list of them.
+hop_args() {
+	local list h
+	HOPS=()
+	IFS=, read -ra list <<< "$1"
+	for h in "${list[@]}"; do HOPS+=(-p "$h"); done
+}
+
+shim() {
+	local HOPS
+	hop_args "$2"
+	UDPCHAINS_QUIET=1 timeout "$1" "$W" "${HOPS[@]}" "${@:3}"
+}
 
 # A test program under the shim: ok if it passes.
 check_prog() {	# <check> <timeout> <proxy> <cmd...>
@@ -418,11 +447,15 @@ check_sizes() {	# <proxy addr> <whole> <cut>
 	fi
 }
 
+# Through a chain, the exit hop's 22-byte header follows a 10-byte one for each
+# hop before it, naming the next hop's IPv4 relay.
 check_ipv6() {
-	local f="$LOGS/$CUR.ipv6.log"
-	UDPCHAINS_QUIET=0 timeout 30 "$W" -v -p "$1" "$PROBE" sweep ::1 "$E6" 100 > "$f" 2>&1
-	if grep -qx '100 whole' "$f" && grep -q 'ATYP 0x04).*122 bytes on the wire' "$f"; then
-		result ok ipv6 "ATYP 0x04, 22-byte header, to ::1"
+	local f="$LOGS/$CUR.ipv6.log" HOPS wire
+	hop_args "$1"
+	wire=$((122 + 10 * (${#HOPS[@]} / 2 - 1)))
+	UDPCHAINS_QUIET=0 timeout 30 "$W" -v "${HOPS[@]}" "$PROBE" sweep ::1 "$E6" 100 > "$f" 2>&1
+	if grep -qx '100 whole' "$f" && grep -q "ATYP 0x04).* $wire bytes on the wire" "$f"; then
+		result ok ipv6 "ATYP 0x04, 22-byte header, to ::1 ($wire bytes on the wire)"
 	else
 		result FAIL ipv6 "see $f"
 	fi
@@ -472,8 +505,8 @@ check_auth() {	# <auth proxy addr>
 # The proxy is killed under a steady sender, then started again.  Nothing may
 # reach the destination while it is dead (SEC-01), and the same socket must
 # carry traffic again once it is back (FR-P-08).
-check_failclosed() {	# <proxy addr> <container>
-	local f="$LOGS/$CUR.failclosed.log" sink spid t_kill t_start leaked after fails errs
+check_failclosed() {	# <proxy addr> <container> [check name]
+	local name=${3:-failclosed} f="$LOGS/$CUR.${3:-failclosed}.log" sink spid t_kill t_start leaked after fails errs
 	start_bg sink "sink-$CUR" "$PROBE" sink
 	shim 30 "$1" "$PROBE" steady 127.0.0.1 "$sink" 9 > "$f" 2>&1 &
 	spid=$!
@@ -492,9 +525,9 @@ check_failclosed() {	# <proxy addr> <container>
 	fails=$(grep -c '^fail' "$f")
 	errs=$(awk '/^fail/{print $3}' "$f" | sort | uniq -c | awk '{printf "%s%s x%s", s, $2, $1; s=", "}')
 	if [ "$leaked" -eq 0 ] && [ "$fails" -gt 0 ] && [ "$after" -gt 0 ]; then
-		result ok failclosed "0 arrived while dead, sends failed ($errs), recovered ($after arrived)"
+		result ok "$name" "0 arrived while dead, sends failed ($errs), recovered ($after arrived)"
 	else
-		result FAIL failclosed "leaked $leaked, failed $fails, recovered $after (see $f)"
+		result FAIL "$name" "leaked $leaked, failed $fails, recovered $after (see $f)"
 	fi
 }
 
@@ -532,7 +565,9 @@ start_bg ESW echosw "$B/udpecho" --port 0 --switch-port --quiet
 start_bg DNS dnsd "$B/dnsd" --port 0
 printf '127.0.0.1\tlocalhost\n203.0.113.5\thostsonly.test\n' > "$TMP/hosts"
 
-for P in $SELECTED; do
+ONE=$SELECTED
+[ $SINGLE -eq 1 ] || ONE=""
+for P in $ONE; do
 	CUR=$P
 	echo | tee -a "$LOGS/summary"
 	echo "== $P: $(proxy_version "$P")" | tee -a "$LOGS/summary"
@@ -600,10 +635,176 @@ if [ ${#IDLE_JOBS[@]} -gt 0 ]; then
 	done
 fi
 
+# --- chains (FR-CH-T4) ----------------------------------------------------------
+#
+# After the idle runs, which use the plain instances these kill.
+#
+# A middle hop must allow CONNECT, to reach the next hop, and must relay UDP to
+# a next hop that sees it arriving from the middle hop's outbound UDP port, not
+# from the connection the association was asked for on.  What a chain does to
+# a datagram is predicted from what each hop does alone (INTEROP-CHECKLIST.md
+# 13):
+#
+#   - the exit hop alone decides a zero-length datagram and the TFTP pattern:
+#     every hop before it carries at least a header;
+#   - hop i of n carries the 10-byte headers of the n - i hops after it, so it
+#     truncates that much sooner than it does as a single proxy.
+
+# The plain instance's port, starting it if it is not already listening.
+plain_port() {
+	local port
+	port=$(port_plain "$1")
+	if [ -n "$(ss -Hlnt "sport = :$port" 2> /dev/null)" ]; then
+		echo "$port"
+	else
+		start_proxy "$1" plain
+	fi
+}
+
+# The largest IPv4 payload a chain of these hops carries whole, and the hop
+# that limits it: "<bytes> <hop> <its position>".
+chain_whole() {	# <hop names...>
+	local n=$# i=0 h w best="" lim="" at=""
+	for h; do
+		i=$((i + 1))
+		w=$((WHOLE[$h] - 10 * (n - i)))
+		if [ -z "$best" ] || [ $w -lt $best ]; then
+			best=$w lim=$h at=$i
+		fi
+	done
+	echo "$best $lim $at"
+}
+
+check_chain_sizes() {	# <chain addr> <hop names...>
+	local c=$1 f="$LOGS/$CUR.sizes.log" w lim at cut=- sizes s bad=""
+	shift
+	read -r w lim at <<< "$(chain_whole "$@")"
+	[ "${CUT[$lim]}" != - ] && cut=$((w + 1))
+	sizes="1 1400 $w"
+	[ $cut != - ] && sizes="$sizes $cut"
+	UDPCHAINS_MAX_DATAGRAM=65507 shim 120 "$c" "$PROBE" sweep 127.0.0.1 "$E1" $sizes > "$f" 2>&1
+
+	for s in 1 1400 $w; do
+		grep -qx "$s whole" "$f" || bad="$bad $s:$(awk -v s=$s '$1 == s {print $2 $3; exit}' "$f")"
+	done
+	if [ $cut != - ] && ! grep -q "^$cut cut " "$f"; then
+		bad="$bad $cut:$(awk -v s=$cut '$1 == s {print $2 $3; exit}' "$f")"
+	fi
+	if [ -n "$bad" ]; then
+		result FAIL sizes "unexpected:$bad; predicted whole to $w, limited by $lim, hop $at of $# (see $f)"
+	elif [ $cut != - ]; then
+		result expected sizes "whole to $w bytes, truncated at $cut by $lim, hop $at of $#"
+	else
+		result ok sizes "whole to $w bytes"
+	fi
+}
+
+# Both hops authenticated, each with its own settings: hop 1's from
+# UDPCHAINS_USERNAME and UDPCHAINS_PASSWORD_FILE, hop 2's from the same with _2.
+# A wrong password for hop 2 alone fails the send with hop 2's refusal.
+check_chain_auth() {	# <hop 1> <hop 2>
+	local f="$LOGS/$CUR.auth.log" a b c r
+	echo "$APASS" > "$TMP/pw"
+	echo "not-$APASS" > "$TMP/badpw"
+	chmod 600 "$TMP/pw" "$TMP/badpw"
+	if ! a=$(start_proxy "$1" auth) || ! b=$(start_proxy "$2" auth); then
+		result FAIL auth "an authenticated instance did not start"
+		return
+	fi
+	c="127.0.0.1:$a,127.0.0.1:$b"
+
+	if ! UDPCHAINS_USERNAME=$AUSER UDPCHAINS_PASSWORD_FILE="$TMP/pw" \
+		UDPCHAINS_USERNAME_2=$AUSER UDPCHAINS_PASSWORD_FILE_2="$TMP/pw" \
+		shim 300 "$c" "$B/test_matrix" "$E1" "$E6" > "$f" 2>&1; then
+		result FAIL auth "the matrix failed with the right passwords (see $f)"
+		return
+	fi
+	r=$(UDPCHAINS_USERNAME=$AUSER UDPCHAINS_PASSWORD_FILE="$TMP/pw" \
+		UDPCHAINS_USERNAME_2=$AUSER UDPCHAINS_PASSWORD_FILE_2="$TMP/badpw" \
+		shim 30 "$c" "$PROBE" sweep 127.0.0.1 "$E1" 10 2>> "$f")
+	if [ "$r" = "10 refused ${AUTHE[$2]}" ]; then
+		result ok auth "accepted at both hops; hop 2's refusal gives ${AUTHE[$2]}"
+	else
+		result FAIL auth "hop 2's refusal gave '$r', expected ${AUTHE[$2]}"
+	fi
+}
+
+# Hop 2 given by name, which hop 1 resolves (D-39).  Hop 2's relay is its
+# loopback address, which D-40 then replaces with hop 2's address as given:
+# the name.  So hop 1 must resolve a name in a UDP header too (ATYP 0x03),
+# and the shim can check that layer's source by port alone (D-41).
+check_named() {	# <hop 1 addr> <hop 2 port>
+	local f="$LOGS/$CUR.named.log"
+	UDPCHAINS_QUIET=0 timeout 60 "$W" -v -p "$1" -p "$HOPNAME:$2" \
+		"$PROBE" sweep 127.0.0.1 "$E1" 100 > "$f" 2>&1
+	if ! grep -q "via relay .*, then $HOPNAME:[0-9]" "$f"; then
+		result FAIL named "hop 2's relay was not named, so this tested nothing (see $f)"
+	elif grep -qx '100 whole' "$f"; then
+		result ok named "hop 1 resolved hop 2's name, for CONNECT and in UDP headers"
+	else
+		result FAIL named "see $f"
+	fi
+}
+
+# The checks for one chain.  The exit hop's expectations apply to what only it
+# decides.
+run_chain() {	# <full|short> <hop names...>
+	local depth=$1 h i=0 port c="" n=$(($# - 1))
+	shift
+	CUR=chain-$(IFS=-; echo "$*")
+	echo | tee -a "$LOGS/summary"
+	echo "== chain: $(IFS=,; echo "$*" | sed 's/,/ > /g')" | tee -a "$LOGS/summary"
+	for h; do
+		port=$(plain_port "$h") || { result FAIL start "$h did not start"; return; }
+		c="$c${c:+,}127.0.0.1:$port"
+	done
+	P=${!#}
+
+	check_prog matrix 300 "$c" "$B/test_matrix" "$E1" "$E6"
+	if [ "$depth" = full ]; then
+		check_fidelity "$c"
+		check_portswitch "$c" "${PORTSW[$P]}" "the exit hop is port-restricted by default"
+	else
+		check_prog lifecycle 180 "$c" "$B/test_lifecycle" "$E1" "$E2"
+	fi
+	check_chain_sizes "$c" "$@"
+	check_ipv6 "$c"
+	[ "$depth" = full ] && check_named "${c%%,*}" "${c##*:}"
+	check_resolve "$c"
+	for h; do
+		i=$((i + 1))
+		[ "$depth" = full ] || [ $i -eq $(((n + 1) / 2)) ] || continue
+		check_failclosed "$c" "udpc-interop-$h-plain" "failclosed-hop$i"
+	done
+}
+
+set -- $SELECTED
+if [ $CHAINS -eq 1 ] && [ $# -lt 2 ]; then
+	echo | tee -a "$LOGS/summary"
+	echo "== chains: skipped, they need two proxies or more" | tee -a "$LOGS/summary"
+elif [ $CHAINS -eq 1 ]; then
+	ring=("$@")
+	for ((k = 0; k < ${#ring[@]}; k++)); do
+		run_chain full "${ring[k]}" "${ring[(k + 1) % ${#ring[@]}]}"
+	done
+	[ ${#ring[@]} -ge 3 ] && run_chain short "${ring[@]}"
+
+	auth=()
+	for h in "${ring[@]}"; do
+		[ "${AUTHE[$h]}" != - ] && auth+=("$h")
+	done
+	if [ ${#auth[@]} -ge 2 ]; then
+		CUR=chain-auth-${auth[0]}-${auth[1]}
+		echo | tee -a "$LOGS/summary"
+		echo "== chain, authenticated at each hop: ${auth[0]} > ${auth[1]}" | tee -a "$LOGS/summary"
+		check_chain_auth "${auth[0]}" "${auth[1]}"
+	fi
+fi
+
 echo
 if [ $FAILS -eq 0 ]; then
-	echo "INTEROP: every result matched INTEROP-CHECKLIST.md 12 (logs: $LOGS)"
+	echo "INTEROP: every result matched INTEROP-CHECKLIST.md 12 and 13 (logs: $LOGS)"
 else
-	echo "INTEROP: $FAILS result(s) differ from INTEROP-CHECKLIST.md 12 (logs: $LOGS)" >&2
+	echo "INTEROP: $FAILS result(s) differ from INTEROP-CHECKLIST.md 12 and 13 (logs: $LOGS)" >&2
 fi
 exit $((FAILS > 0))

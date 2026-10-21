@@ -250,7 +250,7 @@ Documenting these prevents scope creep and sets user expectations honestly.
 | GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`) | Tier 3. Modern QUIC stacks use these; they will fall back or fail. |
 | QUIC performance | Even when functional, a UDP flow through a TCP-based tunnel inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery. |
 | TCP proxying | `proxychains-ng` already does this well. Composing the two is acceptable; reimplementing is not. |
-| Proxy chains (multi-hop UDP) | FR-P-10. Disproportionate complexity for v1. Not a permanent non-goal: in progress after 0.1.0, see §2a. |
+| Proxy chains (multi-hop UDP) | FR-P-10. Disproportionate complexity for v1. Not a permanent non-goal: implemented after 0.1.0, see §2a. |
 
 ## 9. Testing
 

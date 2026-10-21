@@ -13,7 +13,8 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Added
 
-- **Multi-hop chains** (D-37 to D-46), in progress. A single proxy behaves exactly as before.
+- **Multi-hop chains** (D-37 to D-46): up to 8 SOCKS5 proxies in a strict chain. A single proxy
+  behaves exactly as before.
   - **Configuration:** `[hop]` sections in a config file, repeated `-p`, a comma-separated
     `UDPCHAINS_PROXY`, and credentials per hop, passed on by location like hop 1's (D-38).
   - **Setup:** each hop is reached by `CONNECT` through the hops before it and negotiated with
@@ -31,7 +32,12 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   - **Descriptors:** when the shim's protected range fills, as a long chain can make it, its
     connection stays where it is, still protected, and a warning says so (D-46). At a low number
     it can make a program's `dup2` onto that number fail with `EBUSY`; the warning names it.
-  - **Not yet:** the README and man page do not describe chains.
+  - **Real proxies:** `make interop` also runs chains of the seven proxies it tests. Each works
+    as a middle hop and as the exit hop, and all seven work as one chain. The largest datagram
+    through a chain is each hop's own limit less 10 bytes per IPv4 header it carries for the hops
+    after it, as measured (FR-CH-T4).
+  - **Documented** in the README's new *Chains* section, the man page, `udpchains -h` and
+    `docs/DESIGN.md` §12.
 
 ### Changed
 
@@ -68,6 +74,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   faults and a full descriptor range (26 more). Clean under ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
   On the wire, as root, the capture script saw no datagram and no lookup leave with each hop of a
   3-hop chain dead in turn.
+- `make interop` adds 70 results for chains of the seven real proxies, all as expected: a 2-hop
+  chain with each proxy as the middle hop and as the exit hop, all seven in one
+  chain, and authentication at two hops (`docs/INTEROP-CHECKLIST.md` §13).
 
 ## [0.1.0] — 2026-10-20
 

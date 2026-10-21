@@ -1,6 +1,6 @@
-.TH UDPCHAINS 1 "2026-08-20" "udpchains 0.1.0" "User Commands"
+.TH UDPCHAINS 1 "2026-10-21" "udpchains 0.1.0" "User Commands"
 .SH NAME
-udpchains \- route a program's UDP traffic through a SOCKS5 proxy
+udpchains \- route a program's UDP traffic through a SOCKS5 proxy or a chain of them
 .SH SYNOPSIS
 .B udpchains
 [\fIoptions\fR] \fIprogram\fR [\fIargs\fR...]
@@ -13,8 +13,11 @@ with an
 shim that redirects its
 .B UDP
 traffic through a SOCKS5 proxy supporting
-.BR "UDP ASSOCIATE" " (RFC 1928 \[sc]7)."
+.BR "UDP ASSOCIATE" " (RFC 1928 \[sc]7),"
+or through a chain of up to 8 of them.
 The program is not modified or recompiled.
+See
+.BR CHAINS .
 .PP
 Unlike
 .BR proxychains (1),
@@ -43,6 +46,9 @@ Configuration file.
 .TP
 .BI \-p " addr"
 Proxy address, as \fIhost:port\fR or \fI[v6]:port\fR.
+Repeat it for a chain: the first is hop 1.
+Given on the command line, it replaces any chain from the environment or the
+configuration file.
 .TP
 .B \-q
 Quiet: errors only.
@@ -60,7 +66,7 @@ Configuration is resolved in precedence order: command line, environment,
 configuration file.
 .TP
 .B UDPCHAINS_PROXY
-Proxy as \fIhost:port\fR.
+Proxy as \fIhost:port\fR, or a chain as a comma\-separated list of them.
 .TP
 .B UDPCHAINS_CONFIG
 Configuration file path.
@@ -76,6 +82,15 @@ Promote the loopback\-destination warning to an error.
 Timeout in milliseconds for each step of the proxy handshake, not for the
 whole of it.
 Default 5000.
+.TP
+.B UDPCHAINS_CHAIN_TIMEOUT
+Timeout in milliseconds for the whole of an association's setup, across every
+hop, from 0 to 4800000.
+Unset, it is
+.B UDPCHAINS_CONNECT_TIMEOUT
+times the number of hops for a chain, and there is none for a single proxy.
+Set, it applies to a single proxy too.
+0 means no limit.
 .TP
 .B UDPCHAINS_DNS
 Resolver for name lookups, as a numeric \fIip\fR, \fIip:port\fR or
@@ -117,6 +132,10 @@ The password itself.
 Everything the program starts inherits it; prefer
 .BR UDPCHAINS_PASSWORD_FILE .
 .TP
+.BR UDPCHAINS_USERNAME_ \fIn\fR ", " UDPCHAINS_PASSWORD_FILE_ \fIn\fR ", " UDPCHAINS_PASSWORD_ \fIn\fR
+Hop \fIn\fR's credentials, for \fIn\fR from 2.
+Hop 1 uses the names without a suffix.
+.TP
 .BR UDPCHAINS_QUIET ", " UDPCHAINS_DEBUG
 As
 .B \-q
@@ -131,9 +150,10 @@ or
 .PP
 .B udpchains
 sets
-.B UDPCHAINS_RESOLVED
-and
+.BR UDPCHAINS_RESOLVED ,
 .B UDPCHAINS_PASSWORD_CONFIG
+and
+.BI UDPCHAINS_PASSWORD_CONFIG_ n
 for the program it runs.
 They are not meant to be set by hand.
 .SH FILES
@@ -155,6 +175,7 @@ Keys:
 .BR max_datagram ,
 .BR strict_loopback ,
 .BR connect_timeout ,
+.BR chain_timeout ,
 .BR dns ,
 .BR dns_timeout ,
 .BR dns_search ,
@@ -169,6 +190,17 @@ and
 .BR debug .
 Each matches the environment variable of the same name.
 An unknown key is an error.
+.IP
+Each
+.B [hop]
+section adds the next hop of a chain after the top\-level
+.BR proxy ,
+and may hold only
+.BR proxy ,
+.BR username ,
+.B password_file
+and
+.BR password .
 .IP
 Comments are whole lines only, beginning with
 .B #
@@ -217,6 +249,42 @@ Programs with their own resolver, such as
 send ordinary UDP to the nameserver in
 .IR /etc/resolv.conf ,
 which is proxied like any other datagram.
+.SH CHAINS
+A chain sends each datagram through every proxy listed, in order.
+Hop 1 is the one this host talks to; the last, the exit hop, sends the
+datagram to its destination.
+Each hop after the first is reached by SOCKS5 CONNECT through the hops before
+it, so every hop but the exit must allow CONNECT to the next one, and must
+relay UDP to it.
+.PP
+Chains are strict: if any hop cannot be reached, negotiated or associated,
+the call fails, and the diagnostic names the hop.
+No hop is skipped.
+Hops after the first are never resolved on this host: a name is sent to the
+hop before it, which resolves it.
+Name lookups through
+.B UDPCHAINS_DNS
+use the chain too.
+A loopback destination is resolved at the exit hop, so it always warns.
+.PP
+Each hop's buffer must hold the headers of the hops after it as well as the
+payload, so a hop that is not the exit truncates sooner than it would alone:
+hop \fIi\fR of \fIn\fR, 10 bytes sooner for each later hop with an IPv4
+relay, 22 for IPv6.
+Set
+.B max_datagram
+no higher than the smallest such limit.
+.PP
+The shim holds a TCP connection per hop for every socket.
+When its protected descriptor range (768 and up) is full, a connection stays
+at a lower number, still protected, and a warning is printed; a
+.BR dup2 (2)
+onto that number then fails with
+.BR EBUSY .
+.PP
+Chains add no encryption.
+Every hop can read every datagram, and hop \fIk\fR's credentials pass through
+hops 1 to \fIk\fR\-1 in cleartext.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -321,7 +389,8 @@ returning
 Sending from a signal handler is safe only on a socket already in use.
 .PP
 Tested against real proxies on the same host only: the reference proxy, Dante,
-3proxy, gost, Xray, sing-box, hev\-socks5\-server and shadowsocks\-rust.
+3proxy, gost, Xray, sing-box, hev\-socks5\-server and shadowsocks\-rust, each
+alone and as a middle and exit hop of a chain.
 Some proxies silently truncate datagrams larger than their buffer, below the
 default
 .BR max_datagram ;
@@ -347,6 +416,14 @@ through the proxy:
 .RS
 .EX
 UDPCHAINS_DNS=9.9.9.9 udpchains \-p 127.0.0.1:1080 nc \-u example.com 53
+.EE
+.RE
+.PP
+Send through a chain of two proxies, the second reached through the first:
+.PP
+.RS
+.EX
+udpchains \-p 10.0.0.1:1080 \-p 10.1.0.5:1080 dig @9.9.9.9 example.com
 .EE
 .RE
 .PP

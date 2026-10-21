@@ -1,12 +1,11 @@
 # Future requirement — multi-hop UDP chains (FR-P-10)
 
-**Status:** in progress after 0.1.0. The requirements in §4 have moved to §2a of
+**Status:** implemented after 0.1.0. The requirements in §4 have moved to §2a of
 [`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the reference for them,
-and the design questions in §5 are decided in D-37 to D-42. Steps 1 to 5 of §7 are done: the
-records, chain configuration with its handoff to the shim, chain setup in `socks5.c`, the
-n-layer codec and association, with the integration tests passing through 2- and 3-hop chains,
-and name lookups through the chain, with the leak and fault tests, including the wire capture
-with each hop dead. This document stays as the background and estimate.
+and the design questions in §5 are decided in D-37 to D-46. All six steps of §7 are done; the
+design as built is [`DESIGN.md`](DESIGN.md) §12, the user's guide the README's *Chains* section,
+and the interop results [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) §13. §8 records how each
+risk turned out. This document stays as the background and estimate.
 **Written:** 2026-10-19, against the 0.1.0 candidate (`aa30ddf`). Line counts and file references
 are as of that commit; recheck them before starting.
 
@@ -152,6 +151,10 @@ address, in the family D-44 chooses).
   arriving from the previous hop's outbound port rather than its control connection's, so a
   port-restricted hop drops it. Dante needs `udp.connectdst: no` (INTEROP-CHECKLIST.md §12). The
   Synacktiv slides list "Dante (no tunneling)" without explaining it. Only interop will tell.
+  *Outcome (2026-10-21):* on one host, all seven proxies, Dante at its defaults included, worked
+  as middle hops. Declaring the unspecified address (D-44) lets the next hop accept the previous
+  one's UDP port, and Dante's `udp.connectdst` matters only at the exit hop, where it decides a
+  reply from another port, as it does alone. Across hosts is still untested.
 - **Per-layer checking on receive** has to be exactly right; see decision 4 above.
 - **D-27 was only recently settled.** Remote resolution of later hops changes it again.
 - **Testing a real chain across hosts** needs at least two remote machines. D2 already needs one.
@@ -160,6 +163,7 @@ address, in the family D-44 chooses).
   than one.
 - **Proxies that pin the declared address** need more than D-44 gives them. Whether any real proxy
   needs it as a later hop is for interop, as is whether any answers UDP ASSOCIATE with a named
-  relay (D-40).
+  relay (D-40). *Outcome:* none of the seven needed it, none answered with a named relay, and
+  each, as hop 1, carried datagrams to a hop 2 whose relay was named in the header (`ATYP 0x03`).
 - **The name.** The requirements call `udpchains` a working name. If this feature is not built,
   the name promises something the tool does not do.

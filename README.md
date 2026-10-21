@@ -1,7 +1,8 @@
 # udpchains
 
 Routes a dynamically linked program's **UDP** through a SOCKS5 proxy that supports
-`UDP ASSOCIATE`, using `LD_PRELOAD`. The program is not modified or recompiled.
+`UDP ASSOCIATE`, or through a [chain](#chains) of them, using `LD_PRELOAD`. The program is not
+modified or recompiled.
 
 ```
 udpchains -p 127.0.0.1:1080 dig @9.9.9.9 example.com
@@ -33,7 +34,7 @@ tests/run_sanitizers.sh    # ASan/UBSan, TSan, Valgrind, Helgrind
 udpchains [options] <program> [args...]
 
   -f <file>    config file
-  -p <addr>    proxy as host:port or [v6]:port
+  -p <addr>    proxy as host:port or [v6]:port; repeat for a chain
   -q           errors only
   -v           protocol steps (never payload)
 ```
@@ -60,10 +61,11 @@ dns = 9.9.9.9
 
 | Key | Environment | Meaning | Default |
 |---|---|---|---|
-| `proxy` | `UDPCHAINS_PROXY` | SOCKS5 proxy, `host:port` or `[v6]:port` | none; required |
+| `proxy` | `UDPCHAINS_PROXY` | SOCKS5 proxy, `host:port` or `[v6]:port`. In the environment, a comma-separated list is a [chain](#chains) | none; required |
 | `dns` | `UDPCHAINS_DNS` | resolver, numeric `ip[:port]`, queried through the proxy | none |
 | `max_datagram` | `UDPCHAINS_MAX_DATAGRAM` | largest payload, 1–65507 bytes | 8192 |
 | `connect_timeout` | `UDPCHAINS_CONNECT_TIMEOUT` | ms per proxy handshake step, 1–600000 | 5000 |
+| `chain_timeout` | `UDPCHAINS_CHAIN_TIMEOUT` | ms for a whole association setup, every hop included, 0–4800000; 0 is no limit. Set, it applies to a single proxy too | `connect_timeout` × hops for a chain; none for a single proxy |
 | `dns_timeout` | `UDPCHAINS_DNS_TIMEOUT` | ms per lookup, 100–600000 | 5000 |
 | `dns_search` | `UDPCHAINS_DNS_SEARCH` | search domains for single-label names, space- or comma-separated | none |
 | `hosts_file` | `UDPCHAINS_HOSTS_FILE` | hosts file read before DNS | `/etc/hosts` |
@@ -80,6 +82,7 @@ dns = 9.9.9.9
   (`proxy = 10.0.0.1:1080 # office`) is an error. A `#` inside a value (`abc#def`) is kept, so
   put a password containing ` #` in `password_file`.
 - An unknown key is an error.
+- `[hop]` sections configure a [chain](#chains).
 - `udpchains` sets `UDPCHAINS_RESOLVED` and `UDPCHAINS_PASSWORD_CONFIG` for the program it runs.
   Do not set them by hand.
 
@@ -101,6 +104,84 @@ RFC 1929 username/password is supported.
 - A config file containing `password =` must not be readable by others.
 - Username/password is offered to the proxy only when credentials are configured.
 - If authentication fails, the send fails. There is no unauthenticated or direct fallback.
+
+## Chains
+
+A chain sends each datagram through several SOCKS5 proxies in turn. The first proxy listed is
+hop 1, the one this host talks to; the last is the exit hop, which sends the datagram to its
+destination.
+
+```sh
+udpchains -p 10.0.0.1:1080 -p 10.1.0.5:1080 dig @9.9.9.9 example.com
+UDPCHAINS_PROXY=10.0.0.1:1080,10.1.0.5:1080 udpchains dig @9.9.9.9 example.com
+```
+
+```ini
+proxy = 10.0.0.1:1080
+username = alice
+password_file = ~/.hop1.pw
+
+[hop]
+proxy = inner.example:1080
+username = bob
+password_file = ~/.hop2.pw
+```
+
+- **Up to 8 hops.** Each `[hop]` section adds the next one, and may hold only `proxy`,
+  `username`, `password_file` and `password`. Every other setting applies to the whole chain.
+- **Hop 2's credentials** are `UDPCHAINS_USERNAME_2`, `UDPCHAINS_PASSWORD_FILE_2` and
+  `UDPCHAINS_PASSWORD_2`, and so on for later hops. Hop 1 keeps the unsuffixed names.
+- **`-p` replaces the whole chain** from the environment or the config file; it does not add to
+  it. Each hop's credentials still come from wherever they are set.
+- **Strict.** Every hop must be up, in order, or the send fails, and the error names the hop.
+  There is no mode that skips a dead hop or picks hops at random: a skipped hop is a different
+  path to the destination.
+- **Later hops are not resolved on this host.** Each one is asked for by name, if given by name,
+  from the hop before it. A misspelt later hop is reported when the program first sends, not
+  when `udpchains` starts.
+- **Each hop after the first is reached by SOCKS5 `CONNECT` through the hops before it.** Every
+  hop but the exit must allow `CONNECT` to the next hop, and must relay UDP to it.
+- **Setup takes longer.** A chain of *n* hops makes *n*(*n*+1)/2 handshakes, and the program's
+  first send waits for all of them. `chain_timeout` bounds the whole setup; by default it is
+  `connect_timeout` × the number of hops.
+- **Name lookups** (`dns`) go through the chain too. The resolver sees queries from the exit hop.
+- **A loopback destination is resolved at the exit hop,** so with a chain it always warns, and
+  `strict_loopback` refuses it.
+
+### Datagram size through a chain
+
+Hop *i* of *n* carries, besides the payload, the headers of the *n* − *i* hops after it, so it
+truncates that many headers sooner than it does alone. The exit hop's limit is unchanged. A header
+is 10 bytes for an IPv4 relay and 22 for IPv6. With IPv4 relays, set `max_datagram` no higher than
+the smallest, over all the hops, of:
+
+> (hop *i*'s limit alone) − 10 × (*n* − *i*)
+
+For example, Xray (8 182 alone) as hop 1 of 2 carries 8 172 whole, and hev-socks5-server (1 490)
+as hop 6 of 7 carries 1 480; `make interop` measured exactly these. A later hop given by name,
+whose relay is its own loopback or wildcard address, is named in the header that reaches the hop
+before it: 7 bytes plus the name. `max_datagram` is still the program's payload; the shim adds the
+headers. Above the smallest limit, a datagram is truncated without error, as with one proxy.
+
+### Descriptors
+
+The shim holds one TCP connection per hop for every UDP socket in use. Its connections are kept at
+descriptor 768 and up, where the program cannot close them; that range holds 256, so about 85
+sockets through 3 hops, or 32 through 8. Beyond that, a connection stays at whatever lower number
+it was given, still protected, and a warning says so. A program that `dup2`s onto that number then
+gets `EBUSY`. With no descriptors left at all, the send fails with `EMFILE`.
+
+### Security of a chain
+
+The destination, and every hop after the first, see the address of the hop before them, not this
+host's. Nothing is encrypted, so the hops themselves see more:
+
+- **Every hop can read every datagram,** and every hop before the exit sees the destination in
+  the inner headers.
+- **Hop *k*'s credentials pass through hops 1 to *k*−1** in cleartext, inside the `CONNECT`
+  tunnel. Any of them can read the password.
+- A hop can forge a reply claiming to come from any hop after it. The shim checks each layer's
+  source, which stops packets injected from elsewhere, not a hop that lies.
 
 ## Compatible proxies
 
@@ -124,7 +205,11 @@ dying mid-stream. No proxy-specific udpchains defect was found.
 - **Set `max_datagram` no higher than the proxy's limit.** A proxy silently truncates a datagram
   larger than its buffer. With `max_datagram` at or below the limit, an oversized send fails with
   `EMSGSIZE` instead. hev, gost at its default, and Xray are below the default of 8192.
-- Configurations and full results: [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12.
+- **In a chain,** each of the seven worked as a middle hop and as the exit hop, with a later hop
+  given by name, and seven of them together. What only the exit hop decides — zero-length
+  datagrams, a reply from another port — follows the exit hop's row.
+- Configurations and full results: [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12,
+  and §13 for chains.
   `make interop` repeats the runs (needs Docker). Proxies are tested as black boxes; do not read
   GPL source while working on udpchains ([`CONTRIBUTING.md`](CONTRIBUTING.md)).
 
@@ -164,6 +249,7 @@ glibc's resolver cannot be intercepted, so the shim answers `getaddrinfo`, `geth
 - **Credentials are sent in cleartext** (RFC 1929). For a remote proxy, use a trusted VPN such as
   WireGuard, or a proxy on this host. An SSH port forward carries the TCP control connection but
   not the UDP relay traffic.
+- **A chain adds hops, not encryption.** See [Security of a chain](#security-of-a-chain).
 - **Relay datagrams are neither encrypted nor authenticated.** Anyone on the path can read them. A
   spoofed packet from the relay's address can claim any source, and the program is told that
   source. Only the program's own protocol (DNSSEC, QUIC, DTLS) protects against this.
@@ -209,7 +295,7 @@ Calls that move data without a send or receive call are handled instead:
 
 ### Refused or limited traffic
 
-- **Loopback destinations are resolved at the proxy host.** A datagram to `127.0.0.1` reaches the
+- **Loopback destinations are resolved at the proxy host** (a chain's exit hop). A datagram to `127.0.0.1` reaches the
   proxy host's loopback: correct with a local proxy, wrong with a remote one. Affects statsd
   (8125), syslog over UDP, a local `chrony`, and `systemd-resolved` (`127.0.0.53`). A warning is
   printed when the proxy is not local; `strict_loopback` makes it an error, but is checked only
@@ -246,7 +332,8 @@ Calls that move data without a send or receive call are handled instead:
   `close_range()`, `closefrom()` and `syscall(SYS_close)` release it at once.
 - **The shim's own descriptors are at 768 and up** (lower if the file limit is under 1024). The
   program cannot close them: `close()` gives `EBADF`, `close_range` skips them, `dup2()` onto one
-  gives `EBUSY`. They are close-on-exec.
+  gives `EBUSY`. They are close-on-exec. A chain can fill that range; see
+  [Descriptors](#descriptors).
 - **The proxy's hostname is resolved directly, once,** by `udpchains`. Use a numeric address to
   avoid that lookup. Only the first address is used.
 - **Configuration is read once,** by `udpchains`. A program started with `LD_PRELOAD` directly
@@ -283,8 +370,9 @@ Some protocols reply from a different port than the one addressed: TFTP, SIP/RTP
 
 The automated suite uses an in-repo fixture proxy. 0.1.0 was also tested on the same host against
 the reference proxy (`nc -u`, TFTP, `dig`, `iperf`, `ntpdate`) and against the seven
-[compatible proxies](#compatible-proxies). **Untested:** a proxy on another host, and an IPv6
-destination beyond this host's loopback.
+[compatible proxies](#compatible-proxies), which have since been tested as the hops of chains too.
+**Untested:** a proxy on another host, a chain across hosts, and an IPv6 destination beyond this
+host's loopback.
 
 ### Not implemented
 
@@ -292,8 +380,8 @@ destination beyond this host's loopback.
   including GSSAPI (`0x01`). A proxy selecting one is refused with a diagnostic.
 - `proxychains.conf`-style `[ProxyList]` configuration. A `[ProxyList]` line is an error that
   says so.
-- Proxy chains (multi-hop UDP). Planned after 0.1.0
-  ([`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md)).
+- Chains that skip a dead hop or pick hops at random (proxychains' `dynamic_chain` and
+  `random_chain`). Chains are strict ([`DECISIONS.md`](DECISIONS.md) D-37).
 - Static and Go binaries, and system calls made without libc. Planned after 0.1.0
   ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)).
 - Loopback and multicast bypass. Deferred ([`DECISIONS.md`](DECISIONS.md) D-05).
@@ -307,7 +395,7 @@ destination beyond this host's loopback.
 | [Proxando](https://github.com/NULLhere/Proxando) | `LD_PRELOAD` | GPL-2.0 | TCP; proxychains-style configuration |
 | [graftcp](https://github.com/hmgle/graftcp) | `ptrace` | GPL-3.0 | TCP; static and Go binaries; HTTP proxies |
 
-udpchains does UDP only, through one proxy, for dynamically linked programs.
+udpchains does UDP only, through one proxy or a strict chain, for dynamically linked programs.
 
 ### UDP behaviour, measured
 
@@ -375,6 +463,8 @@ Python 3). Tool configurations are in `tests/compare/conf/`.
   matrix checks byte-identical round trips for `{sendto, send, write, writev, sendmsg, sendmmsg}` ×
   `{recvfrom, recv, read, readv, recvmsg, recvmmsg}` over IPv4 and IPv6, connected and
   unconnected.
+- Through a chain, the shim reaches each later hop with `CONNECT` through the hops before it, and
+  each datagram carries one header per hop, nested, every layer checked on the way back.
 - Per-descriptor state is in a lock-free radix table. Once a socket's association is up, the
   datagram path takes no locks and allocates nothing. Each intercepted call makes one
   `getsockopt` to confirm its descriptor is still the tracked socket.
@@ -388,7 +478,7 @@ Python 3). Tool configurations are in `tests/compare/conf/`.
 | [`docs/DESIGN.md`](docs/DESIGN.md) | design |
 | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | requirements mapped to design and tests |
 | [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | tests against real proxies |
-| [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) | planned: multi-hop UDP chains |
+| [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) | background to multi-hop chains |
 | [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md) | planned: static and Go binaries |
 | [`CHANGELOG.md`](CHANGELOG.md) | changes and known limitations |
 | [`SECURITY.md`](SECURITY.md) | reporting a vulnerability |
