@@ -13,17 +13,22 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Added
 
-- **Configuration for multi-hop chains** (D-37 to D-42): `[hop]` sections in a config file,
-  repeated `-p`, a comma-separated `UDPCHAINS_PROXY`, and credentials per hop, passed on by
-  location like hop 1's. Chains are not carried yet: a configuration of more than one hop is
-  refused by the wrapper, and fails every send in the shim, rather than running through the first
-  hop alone. A single proxy behaves exactly as before.
-- **Chain setup** in the SOCKS5 client: each hop is reached by `CONNECT` through the hops before
-  it and negotiated with its own credentials, later hops by the address as written (D-39), and
-  each hop's relay is fixed up as D-40 says, `localhost` counting as loopback. Later hops are
-  declared the unspecified address in the family they see (D-44). A failure at any hop fails the
-  whole chain and names the hop, once a second (D-37, D-43). The resolver's TCP fallback tunnels
-  through the chain. Not yet used by the datagram path.
+- **Multi-hop chains** (D-37 to D-45), in progress. A single proxy behaves exactly as before.
+  - **Configuration:** `[hop]` sections in a config file, repeated `-p`, a comma-separated
+    `UDPCHAINS_PROXY`, and credentials per hop, passed on by location like hop 1's (D-38).
+  - **Setup:** each hop is reached by `CONNECT` through the hops before it and negotiated with
+    its own credentials, later hops by the address as written (D-39). Each hop's relay is fixed
+    up as D-40 says, `localhost` counting as loopback. Later hops are declared the unspecified
+    address in the family they see (D-44). A failure at any hop fails the whole chain and names
+    the hop, once a second (D-37, D-43). Setup must finish within `chain_timeout`
+    (`UDPCHAINS_CHAIN_TIMEOUT`), by default `connect_timeout` per hop of a chain of more than one;
+    set, it applies to a single proxy too, and 0 means no limit (D-45).
+  - **Datagrams:** each carries one header per hop, still without copying the payload, and every
+    layer of a reply is checked before any of it is delivered (D-41). The association holds a
+    control connection per hop; losing any one loses the association, and a forked child closes
+    all of them. The loopback guard considers the chain's last hop (D-40).
+  - **Not yet:** name lookups that need DNS fail under a chain, rather than go through its first
+    hop alone. The README and man page do not describe chains yet.
 
 ### Changed
 
@@ -50,11 +55,12 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 884 assertions across 18 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
+- 1700 assertions across 21 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
   leak client tries 13 more routes, and the leak test checks the raw-socket refusal. The chain
-  configuration adds 71 to unit-config and 6 to the wrapper tests, and chain setup has a new
-  group, unit-chain, with 94, against chained fixture proxies. Clean under
-  ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
+  configuration adds 89 to unit-config and 5 to the wrapper tests, and chain setup has a new
+  group, unit-chain, with 135, against chained fixture proxies. The integration tests run again
+  through 2- and 3-hop fixture chains, 378 assertions each, and Valgrind and Helgrind run through
+  2 hops. Clean under ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
 
 ## [0.1.0] — 2026-10-20
 

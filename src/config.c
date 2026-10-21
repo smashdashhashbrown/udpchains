@@ -51,6 +51,10 @@ void udpc_config_merge(struct udpc_config *dst, const struct udpc_config *src)
 		dst->strict_loopback = src->strict_loopback;
 	if (m & UDPC_SET_CONNECT_TIMEOUT)
 		dst->connect_timeout_ms = src->connect_timeout_ms;
+	if (m & UDPC_SET_CHAIN_TIMEOUT) {
+		dst->chain_timeout_ms = src->chain_timeout_ms;
+		dst->chain_timeout_set = src->chain_timeout_set;
+	}
 	if (m & UDPC_SET_USERNAME) {
 		memcpy(dst->username, src->username, sizeof(dst->username));
 		dst->have_credentials = true;
@@ -292,12 +296,26 @@ int udpc_config_set(struct udpc_config *cfg, const char *key, const char *value,
 		return 0;
 	}
 	if (strcmp(key, "connect_timeout") == 0) {
-		if (parse_long(value, 1, 600000, &n) != 0) {
+		if (parse_long(value, 1, UDPC_CONNECT_TIMEOUT_MAX_MS, &n) != 0) {
 			*err = "connect_timeout must be 1..600000 ms";
 			return -1;
 		}
 		cfg->connect_timeout_ms = (int)n;
 		cfg->set_mask |= UDPC_SET_CONNECT_TIMEOUT;
+		return 0;
+	}
+	/* D-45: up to what the default can reach, connect_timeout's most for
+	 * each of the most hops. */
+	if (strcmp(key, "chain_timeout") == 0) {
+		if (parse_long(value, 0,
+		               (long)UDPC_CONNECT_TIMEOUT_MAX_MS * UDPC_CHAIN_MAX,
+		               &n) != 0) {
+			*err = "chain_timeout must be 0 (no limit) or 1..4800000 ms";
+			return -1;
+		}
+		cfg->chain_timeout_ms = (int)n;
+		cfg->chain_timeout_set = true;
+		cfg->set_mask |= UDPC_SET_CHAIN_TIMEOUT;
 		return 0;
 	}
 	if (strcmp(key, "dns") == 0) {
@@ -635,6 +653,7 @@ static const struct env_key g_env_keys[] = {
 	{ "UDPCHAINS_MAX_DATAGRAM", "max_datagram" },
 	{ "UDPCHAINS_STRICT_LOOPBACK", "strict_loopback" },
 	{ "UDPCHAINS_CONNECT_TIMEOUT", "connect_timeout" },
+	{ "UDPCHAINS_CHAIN_TIMEOUT", "chain_timeout" },
 	{ "UDPCHAINS_USERNAME", "username" },
 	{ "UDPCHAINS_PASSWORD_FILE", "password_file" },
 	{ "UDPCHAINS_DNS", "dns" },
@@ -1044,6 +1063,16 @@ int udpc_config_export(const struct udpc_config *cfg)
 	snprintf(buf, sizeof(buf), "%d", cfg->connect_timeout_ms);
 	if (setenv("UDPCHAINS_CONNECT_TIMEOUT", buf, 1) != 0)
 		return -1;
+
+	/* D-45: unset is exported as unset, so the shim works the default out
+	 * from the chain it is given. */
+	if (cfg->chain_timeout_set) {
+		snprintf(buf, sizeof(buf), "%d", cfg->chain_timeout_ms);
+		if (setenv("UDPCHAINS_CHAIN_TIMEOUT", buf, 1) != 0)
+			return -1;
+	} else {
+		unsetenv("UDPCHAINS_CHAIN_TIMEOUT");
+	}
 
 	if (setenv("UDPCHAINS_STRICT_LOOPBACK", cfg->strict_loopback ? "1" : "0",
 	           1) != 0)

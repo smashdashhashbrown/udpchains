@@ -124,31 +124,34 @@ out=$(PATH="$TMP/bin:$PATH" UDPCHAINS_LIB="$SHIM" "$WRAPPER" -q \
 	-p 127.0.0.1:1080 noshebang arg1 2>&1) || true
 check "$out" "NOSHEBANG-RAN arg1" "a script with no #! line still runs, with its arguments"
 
-# --- D-38: a chain is parsed, but refused until it is carried ----------------
+# --- D-38: a chain is handed to the program whole ------------------------------
 
-echo "# a chain of more than one proxy is refused, not run through the first (D-38)"
+echo "# a chain of proxies is run as a chain, and handed on whole (D-38)"
 
 rc=0
-out=$(UDPCHAINS_LIB="$SHIM" "$WRAPPER" -p 127.0.0.1:1080 -p 10.0.0.5:1080 \
-	/bin/echo SHOULD-NOT-RUN 2>&1) || rc=$?
-check "$(printf '%s' "$out" | grep -c SHOULD-NOT-RUN)" "0" "a second -p is not run as a chain of one"
-check "$rc" "1" "the wrapper exits 1"
-check "$(printf '%s' "$out" | grep -c 'chain of 2 proxies')" "1" "and says why"
+out=$(env -u UDPCHAINS_PROXY UDPCHAINS_LIB="$SHIM" "$WRAPPER" -p 127.0.0.1:1080 \
+	-p proxy.internal:1081 /bin/sh -c 'echo "PROXY=$UDPCHAINS_PROXY"' 2>&1) || rc=$?
+check "$rc" "0" "two -p run the program"
+check "$(printf '%s' "$out" | grep -c '^PROXY=127.0.0.1:1080,proxy.internal:1081$')" "1" \
+	"with both hops handed on, the second as written (D-39)"
 
 printf 'proxy = 127.0.0.1:1080\n[hop]\nproxy = 10.0.0.5:1080\n' > "$TMP/chain.conf"
 chmod 600 "$TMP/chain.conf"
 # Without UDPCHAINS_PROXY, whose single proxy would replace the file's chain.
+rc=0
 out=$(env -u UDPCHAINS_PROXY UDPCHAINS_LIB="$SHIM" "$WRAPPER" -f "$TMP/chain.conf" \
-	/bin/echo SHOULD-NOT-RUN 2>&1) || true
-check "$(printf '%s' "$out" | grep -c SHOULD-NOT-RUN)" "0" "nor is a config file's [hop]"
+	/bin/sh -c 'echo "PROXY=$UDPCHAINS_PROXY"' 2>&1) || rc=$?
+check "$rc" "0" "a config file's [hop] runs the program"
+check "$(printf '%s' "$out" | grep -c '^PROXY=127.0.0.1:1080,10.0.0.5:1080$')" "1" \
+	"with the file's chain handed on"
 
-# The shim on its own, as a bare LD_PRELOAD would load it.
-out=$(env -u UDPCHAINS_RESOLVED UDPCHAINS_PROXY=127.0.0.1:1080,10.0.0.5:1080 \
+# The shim on its own, as a bare LD_PRELOAD would load it, with a dead first
+# hop: strict (D-37), so every send fails, and none goes anywhere else.
+out=$(env -u UDPCHAINS_RESOLVED UDPCHAINS_PROXY=127.0.0.1:9,10.0.0.5:1080 \
 	LD_PRELOAD="$SHIM" "$(cd "$(dirname "$0")/.." && pwd)/build/leakclient" 127.0.0.1 9 \
 	2>&1) || true
 check "$(printf '%s' "$out" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')" "0" \
-	"the shim alone fails every send rather than use the first hop"
-check "$(printf '%s' "$out" | grep -c 'carries only one')" "1" "and says why"
+	"the shim alone, first hop dead: every send fails"
 
 # NOTE: the noexec / security-policy case exercises the same refusal through the
 # PROT_EXEC probe, and is not covered here because creating a noexec mount needs

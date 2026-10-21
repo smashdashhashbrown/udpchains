@@ -138,6 +138,13 @@ static bool from_unconnected_peer(const struct udpc_fdent *e,
 	                        (const struct sockaddr *)&want);
 }
 
+/* Receive scratch for cfg: the largest payload, plus a worst-case header for
+ * every hop (D-42). */
+static size_t scratch_need(const struct udpc_config *cfg)
+{
+	return cfg->max_datagram + (size_t)(cfg->nextra + 1) * UDPC_SOCKS_HDR_MAX;
+}
+
 /* True for the errors that mean "this association is gone", which is what an
  * expired idle association looks like from here: the relay port stops
  * existing, so a connected UDP socket reports the resulting ICMP error. */
@@ -157,6 +164,7 @@ static ssize_t send_via(int fd, struct udpc_fdent *e, struct udpc_assoc *a,
 	struct sockaddr_storage relay;
 	struct msghdr msg;
 	ssize_t hlen, n;
+	size_t inner;
 	int i;
 
 	if (!udpc_assoc_relay_of(a, atomic_load_explicit(&e->family,
@@ -166,13 +174,16 @@ static ssize_t send_via(int fd, struct udpc_fdent *e, struct udpc_assoc *a,
 		return -1;
 	}
 
-	tls = udpc_tls_get(cfg->max_datagram + UDPC_SOCKS_HDR_MAX);
+	tls = udpc_tls_get(scratch_need(cfg));
 	if (tls == NULL) {
 		*out_errno = ENOMEM;
 		return -1;
 	}
 
-	hlen = udpc_socks_encode(tls->hdr, sizeof(tls->hdr), dst);
+	/* One header per hop, in one buffer: still a single iovec entry ahead
+	 * of the application's own (FR-CH-05). */
+	hlen = udpc_socks_encode_chain(tls->hdr, sizeof(tls->hdr), &a->chain, dst,
+	                               &inner);
 	if (hlen < 0) {
 		*out_errno = errno;
 		return -1;
@@ -231,7 +242,8 @@ static ssize_t send_via(int fd, struct udpc_fdent *e, struct udpc_assoc *a,
 		udpc_debug("fd %d: sent %zu payload bytes to %s (ATYP 0x%02x) "
 		           "via relay %s, %zd bytes on the wire",
 		           fd, paylen,
-		           udpc_addr_str(dst, dbuf, sizeof(dbuf)), tls->hdr[3],
+		           udpc_addr_str(dst, dbuf, sizeof(dbuf)),
+		           tls->hdr[inner + 3],
 		           udpc_addr_str((const struct sockaddr *)&relay, rbuf,
 		                         sizeof(rbuf)),
 		           n);
@@ -418,7 +430,7 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 		return -1;
 	}
 
-	tls = udpc_tls_get(cfg->max_datagram + UDPC_SOCKS_HDR_MAX);
+	tls = udpc_tls_get(scratch_need(cfg));
 	if (tls == NULL) {
 		udpc_assoc_unref(a);
 		errno = ENOMEM;
@@ -428,9 +440,11 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 	capacity = iov_total(iov, iovcnt);
 
 	for (;;) {
-		ssize_t n, hlen;
+		ssize_t n, hlen = -1;
 		size_t paylen, copied;
 		bool discard = false;
+		enum udpc_socks_drop why;
+		unsigned layer;
 
 		sciov.iov_base = tls->buf;
 		sciov.iov_len = tls->buflen;
@@ -477,8 +491,27 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 				          udpc_ratelimit_note(k, note, sizeof(note)));
 			discard = true;
 		} else {
-			hlen = udpc_socks_decode(tls->buf, (size_t)n, &hdr);
-			if (hlen < 0) {
+			/* D-41: every layer of a chain is checked before any of
+			 * the datagram is delivered, and failing any one drops
+			 * the whole of it.  A chain of one has one layer, which
+			 * is checked just as before. */
+			hlen = udpc_socks_decode_chain(tls->buf, (size_t)n,
+			                               &a->chain, &hdr, &layer, &why);
+			if (hlen < 0 && layer < a->chain.n) {
+				if (why == UDPC_DROP_SOURCE)
+					udpc_debug("dropping a relayed datagram: its "
+					           "layer %u of %u is not from hop "
+					           "%u's relay",
+					           layer, a->chain.n, layer + 1);
+				else
+					udpc_debug("dropping a relayed datagram: its "
+					           "layer %u of %u %s",
+					           layer, a->chain.n,
+					           why == UDPC_DROP_FRAG
+					                   ? "has FRAG set"
+					                   : "is malformed");
+				discard = true;
+			} else if (hlen < 0) {
 				udpc_debug("dropping a malformed relayed datagram "
 				           "(%zd bytes)",
 				           n);
@@ -520,7 +553,6 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 			continue;
 		}
 
-		hlen = udpc_socks_decode(tls->buf, (size_t)n, &hdr);
 		paylen = (size_t)n - (size_t)hlen;
 
 		/* FR-F-03 / FR-F-06: exactly one application datagram, and a

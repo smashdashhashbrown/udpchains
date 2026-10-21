@@ -92,6 +92,9 @@ start_fixtures() {
 	TMP=$(mktemp -d)
 	"$BUILD/socks5d" --port 0 --quiet > "$TMP/proxy.out" 2>&1 &
 	PIDS+=($!)
+	# A second hop, for the chained runs (FR-CH-T2).
+	"$BUILD/socks5d" --port 0 --quiet > "$TMP/proxy2.out" 2>&1 &
+	PIDS+=($!)
 	"$BUILD/udpecho" --port 0 --quiet > "$TMP/e1.out" 2>&1 &
 	PIDS+=($!)
 	# A SECOND IPv4 echo server, distinct from the first.  test_fidelity's
@@ -111,11 +114,12 @@ start_fixtures() {
 	local i
 	for ((i = 0; i < 200; i++)); do
 		PROXY=$(awk '/^PORT/{print $2; exit}' "$TMP/proxy.out" 2>/dev/null)
+		PROXY2=$(awk '/^PORT/{print $2; exit}' "$TMP/proxy2.out" 2>/dev/null)
 		ECHO1=$(awk '/^PORT/{print $2; exit}' "$TMP/e1.out" 2>/dev/null)
 		ECHO2=$(awk '/^PORT/{print $2; exit}' "$TMP/e2.out" 2>/dev/null)
 		ECHO6=$(awk '/^PORT/{print $2; exit}' "$TMP/e6.out" 2>/dev/null)
 		DNS=$(awk '/^PORT/{print $2; exit}' "$TMP/dns.out" 2>/dev/null)
-		[ -n "$PROXY" ] && [ -n "$ECHO1" ] && [ -n "$ECHO2" ] &&
+		[ -n "$PROXY" ] && [ -n "$PROXY2" ] && [ -n "$ECHO1" ] && [ -n "$ECHO2" ] &&
 			[ -n "$ECHO6" ] && [ -n "$DNS" ] && return 0
 		sleep 0.05
 	done
@@ -242,6 +246,21 @@ run_valgrind() {
 	rc=$?
 	report lifecycle "$TMP/vg_life.out" "$rc"
 
+	# FR-CH-T2: the chain codec and the n-hop association, under memcheck.
+	echo "--- matrix, 2 hops"
+	UDPCHAINS_PROXY="127.0.0.1:$PROXY,127.0.0.1:$PROXY2" \
+	LD_PRELOAD="$ROOT/libudpchains.so" "${VG[@]}" \
+		"$BUILD/test_matrix" "$ECHO1" "$ECHO6" > "$TMP/vg_matrix2.out" 2>&1
+	rc=$?
+	report "matrix, 2 hops" "$TMP/vg_matrix2.out" "$rc"
+
+	echo "--- lifecycle, 2 hops"
+	UDPCHAINS_PROXY="127.0.0.1:$PROXY,127.0.0.1:$PROXY2" \
+	LD_PRELOAD="$ROOT/libudpchains.so" "${VG[@]}" \
+		"$BUILD/test_lifecycle" "$ECHO1" "$ECHO2" > "$TMP/vg_life2.out" 2>&1
+	rc=$?
+	report "lifecycle, 2 hops" "$TMP/vg_life2.out" "$rc"
+
 	# D-22: the resolver -- its pool, both transports and every hook --
 	# under the real preloaded shim.  The timeout is raised because
 	# Valgrind runs everything an order of magnitude slower.
@@ -283,6 +302,15 @@ run_helgrind() {
 		"$BUILD/test_thread" "$ECHO1" > "$TMP/hg_thread.out" 2>&1
 	rc=$?
 	report thread "$TMP/hg_thread.out" "$rc"
+
+	echo "--- thread, 2 hops"
+	UDPCHAINS_PROXY="127.0.0.1:$PROXY,127.0.0.1:$PROXY2" \
+	LD_PRELOAD="$ROOT/libudpchains.so" \
+		valgrind --tool=helgrind --error-exitcode=99 --quiet \
+		--suppressions="$ROOT/tests/helgrind.supp" \
+		"$BUILD/test_thread" "$ECHO1" > "$TMP/hg_thread2.out" 2>&1
+	rc=$?
+	report "thread, 2 hops" "$TMP/hg_thread2.out" "$rc"
 
 	stop_fixtures
 	unset UDPCHAINS_PROXY UDPCHAINS_QUIET

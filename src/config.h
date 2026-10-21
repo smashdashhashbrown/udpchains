@@ -29,6 +29,7 @@
 #define UDPC_DEFAULT_MAX_DATAGRAM 8192  /* D-12: matches the reference proxy */
 #define UDPC_DEFAULT_PROXY_PORT 1080
 #define UDPC_DEFAULT_CONNECT_TIMEOUT_MS 5000
+#define UDPC_CONNECT_TIMEOUT_MAX_MS 600000
 #define UDPC_DEFAULT_DNS_PORT 53
 #define UDPC_DEFAULT_DNS_TIMEOUT_MS 5000 /* D-22: the whole lookup, all attempts */
 #define UDPC_DEFAULT_HOSTS_FILE "/etc/hosts"
@@ -50,6 +51,7 @@
 #define UDPC_SET_DNS_TIMEOUT (1u << 9)
 #define UDPC_SET_DNS_SEARCH (1u << 10)
 #define UDPC_SET_HOSTS_FILE (1u << 11)
+#define UDPC_SET_CHAIN_TIMEOUT (1u << 12)
 
 /* Hop 2 onwards of a chain (D-38).  Hop 1 is the top-level proxy and credential
  * fields of struct udpc_config, which a chain of one uses exactly as 0.1.0 did
@@ -76,6 +78,13 @@ struct udpc_config {
 	int verbosity;                  /* enum udpc_verbosity */
 	bool strict_loopback;           /* D-05 R2: promote warning to error */
 	int connect_timeout_ms;
+
+	/* D-45: how long setting up the whole chain may take, in ms; 0 means
+	 * no limit beyond each step's connect_timeout.  Unset, it is
+	 * connect_timeout for each hop of a chain of more than one, and no
+	 * limit for a chain of one, as in 0.1.0. */
+	bool chain_timeout_set;
+	int chain_timeout_ms;               /* when chain_timeout_set */
 
 	/* D-22: the resolver the shim queries through the proxy.  Numeric
 	 * only, since a named resolver would need resolving first.  There is

@@ -597,6 +597,75 @@ int main(void)
 		TAP_EQ_INT(n, 9, "and no per-hop variable is left behind");
 	}
 
+	TAP_GROUP("D-45: chain_timeout");
+	{
+		struct udpc_config base, over;
+		const char *v;
+
+		udpc_config_defaults(&cfg);
+		TAP_OK(!cfg.chain_timeout_set,
+		       "is unset by default, so it follows the chain");
+
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_set(&layer, "chain_timeout", "1500", &err), 0,
+		           "a value in ms is accepted");
+		TAP_OK(layer.chain_timeout_set && layer.chain_timeout_ms == 1500,
+		       "and kept");
+		TAP_EQ_INT(udpc_config_set(&layer, "chain_timeout", "0", &err), 0,
+		           "0 is accepted");
+		TAP_OK(layer.chain_timeout_set && layer.chain_timeout_ms == 0,
+		       "and is kept as set, meaning no limit");
+		TAP_EQ_INT(udpc_config_set(&layer, "chain_timeout", "4800000", &err), 0,
+		           "8 hops of the longest connect_timeout is accepted");
+		err = NULL;
+		TAP_EQ_INT(udpc_config_set(&layer, "chain_timeout", "4800001", &err), -1,
+		           "but no more");
+		TAP_OK(err != NULL && strstr(err, "chain_timeout") != NULL,
+		       "with an error naming the key");
+		TAP_EQ_INT(udpc_config_set(&layer, "chain_timeout", "-1", &err), -1,
+		           "a negative value is rejected");
+		TAP_EQ_INT(udpc_config_set(&layer, "chain_timeout", "2s", &err), -1,
+		           "and so is a unit");
+
+		udpc_config_defaults(&base);
+		udpc_config_set(&base, "chain_timeout", "0", &err);
+		udpc_config_init(&over);
+		udpc_config_set(&over, "connect_timeout", "2500", &err);
+		udpc_config_merge(&base, &over);
+		TAP_OK(base.chain_timeout_set && base.chain_timeout_ms == 0,
+		       "a layer that does not set it leaves it");
+		udpc_config_set(&over, "chain_timeout", "9000", &err);
+		udpc_config_merge(&base, &over);
+		TAP_EQ_INT(base.chain_timeout_ms, 9000, "a layer that sets it wins");
+
+		setenv("UDPCHAINS_CHAIN_TIMEOUT", "0", 1);
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), 0,
+		           "UDPCHAINS_CHAIN_TIMEOUT is read (%s)", err ? err : "ok");
+		TAP_OK(layer.chain_timeout_set && layer.chain_timeout_ms == 0,
+		       "including 0 for no limit");
+		unsetenv("UDPCHAINS_CHAIN_TIMEOUT");
+
+		udpc_config_defaults(&cfg);
+		udpc_config_set(&cfg, "proxy", "127.0.0.1:1080", &err);
+		udpc_config_finalize(&cfg, &err);
+		setenv("UDPCHAINS_CHAIN_TIMEOUT", "stale", 1);
+		TAP_EQ_INT(udpc_config_export(&cfg), 0, "unset, the config exports");
+		TAP_OK(getenv("UDPCHAINS_CHAIN_TIMEOUT") == NULL,
+		       "as unset, for the shim to work out from its chain");
+		udpc_config_set(&cfg, "chain_timeout", "0", &err);
+		udpc_config_export(&cfg);
+		v = getenv("UDPCHAINS_CHAIN_TIMEOUT");
+		TAP_EQ_STR(v ? v : "", "0", "no limit exports as 0");
+		udpc_config_set(&cfg, "chain_timeout", "2500", &err);
+		udpc_config_export(&cfg);
+		v = getenv("UDPCHAINS_CHAIN_TIMEOUT");
+		TAP_EQ_STR(v ? v : "", "2500", "and a value as itself");
+		unsetenv("UDPCHAINS_CHAIN_TIMEOUT");
+	}
+
 	{
 		char cmd[600];
 		snprintf(cmd, sizeof(cmd), "rm -rf %s", g_tmpdir);

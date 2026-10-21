@@ -58,6 +58,7 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-42](#d-42) | At most 8 hops; `max_datagram` stays the program's payload | FR-CH-13 |
 | [D-43](#d-43) | A chain's setup failures name the hop, once a second | FR-CH-12; extends D-33 |
 | [D-44](#d-44) | Later hops are declared the unspecified address, in the family they see | FR-P-05 per hop |
+| [D-45](#d-45) | Setup has an overall deadline, `chain_timeout`: by default `connect_timeout` per hop of a chain | FR-CH-02; settles a FUTURE-UDP-CHAINS §8 question |
 
 ---
 
@@ -1555,10 +1556,10 @@ and nothing within a hop depends on line order. Repeated `proxy =` lines would m
 line's meaning depend on where it sits; a `[ProxyList]` line has nowhere safe to put a password.
 FR-CH-14 can still accept `[ProxyList]` later as a second spelling.
 
-**Until chains are carried on the wire** (the steps after this one in
-[`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md)), a configuration of more than one hop is
-parsed and checked, and then refused by both the wrapper and the shim, so it can never run as a
-chain of one.
+**Until chains were carried on the wire** (step 4 of
+[`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) §7), a configuration of more than one hop
+was parsed and checked, and then refused by both the wrapper and the shim, so it could never run as
+a chain of one. Name lookups through a chain still fail closed until step 5 (FR-CH-11).
 
 ---
 
@@ -1720,3 +1721,62 @@ drops everything, which is the failure FR-P-05 exists to prevent.
 
 **Revisit if:** interop (FR-CH-T4) finds a proxy that needs a declared address to serve as a later
 hop, and that the address its predecessor connects from is also the one it sends UDP from.
+
+---
+
+## D-45
+### Setup has an overall deadline, `chain_timeout`: by default `connect_timeout` per hop of a chain
+
+**Date:** 2026-10-20, amended 2026-10-21 · **Status:** Accepted · FR-CH-02. Settles the
+setup-time question that [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) §8 left for
+step 4.
+
+**Context.** `connect_timeout` (5 s by default) bounds each wait of a handshake: the connect, and
+each reply. Hop *k* is reached through the *k*−1 hops before it, so a chain of *n* hops makes
+*n*(*n*+1)/2 handshakes, 36 for 8 hops. A chain whose hops are slow but alive, each step just inside
+its timeout, could take minutes to set up, and the program blocks on its first send for all of it.
+
+**Decision.**
+
+- **Every wait keeps its own `connect_timeout`,** as in 0.1.0.
+- **The whole setup must also finish within `chain_timeout`,** counted from the start of the
+  association, across all its handshakes. When that runs out, the wait in progress fails with
+  `ETIMEDOUT`, the hops already up are released, and the diagnostic names the hop being set up
+  (D-43). No wait runs past it, even if its own `connect_timeout` has longer to go.
+- **`chain_timeout` is a setting:** `chain_timeout` in the config file, `UDPCHAINS_CHAIN_TIMEOUT`
+  in the environment, in ms. The wrapper passes it to the shim like the other settings, and
+  passes "unset" on as unset. It has no command-line flag, as `connect_timeout` has none.
+  - **Unset,** it is `connect_timeout` × the number of hops for a chain of more than one, and
+    there is no overall deadline for a chain of one, so a single proxy behaves exactly as 0.1.0
+    (FR-CH-01): one whose every step is in time still succeeds, however long they take together.
+  - **Set to a number of ms,** it is the deadline, for any chain, a chain of one included. A
+    value below `connect_timeout` is allowed and shortens every wait with it.
+  - **Set to 0,** there is no overall deadline, for any chain.
+  - **It accepts 0 to 4,800,000:** up to 8 hops of the longest `connect_timeout`, the most the
+    default can come to.
+- **The same deadline bounds a `CONNECT` through the chain** for the resolver's TCP fallback (D-22).
+- **It applies to each attempt.** A failed setup is retried once, so a send can block for up to
+  about twice the deadline before it fails.
+
+**Why this default.** It scales with the chain, so adding hops does not start cutting a healthy
+chain off: each hop gets as long as a single proxy's slowest step.
+
+**Why a setting, and one total.** The default is a guess. A chain through slow hops, Tor or a
+satellite link, may need longer; a program that would rather fail fast may want less. A single
+number is the easiest to reason about: the most time a send can spend setting up.
+
+**Why it applies to a chain of one when set.** A single proxy is a chain of one, and silently
+ignoring a value the user wrote down would be surprising. Unset, 0.1.0's behaviour is kept.
+
+**Rejected.**
+
+- **A time per hop** (`hop_timeout` × hops). It scales by itself, but a non-uniform chain, one slow
+  hop among fast ones, fits it poorly, and it says less plainly how long a send can block.
+- **A multiplier** of `connect_timeout` × hops. The user has to do arithmetic to know the limit.
+- **A setting in each `[hop]` section,** summed. Hops given with `-p` or `UDPCHAINS_PROXY` cannot
+  carry one, and it is more than the problem needs.
+- **No overall deadline.** The program could block for minutes on a send with no error.
+- **As first decided, no setting at all,** leaving `connect_timeout` as the only knob. Raising it
+  to let a slow chain finish also lengthens every wait, which is not the same thing.
+
+**Revisit if:** interop shows the default cutting off real chains whose steps are each quick.

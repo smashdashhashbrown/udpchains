@@ -1,7 +1,7 @@
 /* assoc.h -- the association object (D-13, FR-P-02, FR-L-03, FR-L-04).
  *
- * One association per application socket, holding the TCP control connection
- * and the relay address.  Duplicated descriptors share it by refcount; it is
+ * One association per application socket, holding a control connection and a
+ * relay address for each hop of the chain (FR-CH-09, FR-CH-10).  Duplicated descriptors share it by refcount; it is
  * torn down when the last of them closes.
  *
  * It owns no data socket: FR-I-07 redirects the application's own fd to the
@@ -36,7 +36,7 @@ struct udpc_assoc {
 	_Atomic int refcount;       /* 0 while on the free list */
 	unsigned fork_generation;   /* global generation when established */
 	_Atomic long last_used;     /* CLOCK_MONOTONIC_COARSE seconds */
-	struct udpc_socks_conn conn;
+	struct udpc_socks_chain chain; /* every hop's control fd is a shim fd */
 	struct udpc_assoc *next_free;
 };
 

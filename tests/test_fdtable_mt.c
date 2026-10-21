@@ -157,11 +157,12 @@ static _Atomic long g_reads;
 static struct udpc_assoc *fake_assoc(void)
 {
 	struct udpc_assoc *a = udpc_assoc_alloc();
-	struct sockaddr_in *r = (struct sockaddr_in *)&a->conn.relay;
+	struct sockaddr_in *r = (struct sockaddr_in *)&a->chain.relay[0].sa;
 
 	r->sin_family = AF_INET;
 	r->sin_port = htons(1);
 	r->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	a->chain.n = 1;
 	return a;
 }
 

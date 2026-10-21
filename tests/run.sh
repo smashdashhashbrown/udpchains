@@ -70,13 +70,16 @@ SELECT="${*:-}"
 # --- fixtures ----------------------------------------------------------------
 
 PROXY_PORT=$(start_fixture proxy "$BUILD/socks5d" --port 0 --quiet)
+# Later hops for the chained runs (FR-CH-T2).
+PROXY2_PORT=$(start_fixture proxy2 "$BUILD/socks5d" --port 0 --quiet)
+PROXY3_PORT=$(start_fixture proxy3 "$BUILD/socks5d" --port 0 --quiet)
 ECHO1=$(start_fixture echo1 "$BUILD/udpecho" --port 0 --quiet)
 ECHO2=$(start_fixture echo2 "$BUILD/udpecho" --port 0 --quiet)
 ECHO6=$(start_fixture echo6 "$BUILD/udpecho" --port 0 -6 --quiet)
 # Replies from a different port than addressed -- the TFTP/SIP pattern.
 ECHOSW=$(start_fixture echosw "$BUILD/udpecho" --port 0 --switch-port --quiet)
 
-echo "fixtures: proxy=$PROXY_PORT echo1=$ECHO1 echo2=$ECHO2 echo6=$ECHO6 echosw=$ECHOSW"
+echo "fixtures: proxy=$PROXY_PORT proxy2=$PROXY2_PORT proxy3=$PROXY3_PORT echo1=$ECHO1 echo2=$ECHO2 echo6=$ECHO6 echosw=$ECHOSW"
 
 export UDPCHAINS_PROXY="127.0.0.1:$PROXY_PORT"
 export UDPCHAINS_QUIET=1
@@ -106,6 +109,61 @@ run_test TST-06-lifecycle \
 
 run_test TST-07-thread \
 	timeout 180 "$WRAPPER" "$BUILD/test_thread" "$ECHO1"
+
+# --- FR-CH-T2: the same tests through chains of fixture proxies --------------
+
+# Every test above that runs under the shim, again with UDPCHAINS_PROXY a
+# chain.  The third hop is given as localhost, so CONNECT carries a name (D-39)
+# and its relay is kept as loopback (D-40).
+through_chain() {
+	local chain=$1 rc=0
+
+	UDPCHAINS_PROXY="$chain" timeout 180 "$WRAPPER" "$BUILD/test_matrix" \
+		"$ECHO1" "$ECHO6" || rc=1
+	UDPCHAINS_PROXY="$chain" timeout 120 "$WRAPPER" "$BUILD/test_fidelity" \
+		"$ECHO1" "$ECHO2" "$ECHO6" || rc=1
+	UDPCHAINS_PROXY="$chain" timeout 60 "$WRAPPER" "$BUILD/test_portswitch" \
+		"$ECHOSW" || rc=1
+	UDPCHAINS_PROXY="$chain" timeout 120 "$WRAPPER" "$BUILD/test_lifecycle" \
+		"$ECHO1" "$ECHO2" || rc=1
+	UDPCHAINS_PROXY="$chain" timeout 180 "$WRAPPER" "$BUILD/test_thread" \
+		"$ECHO1" || rc=1
+	return $rc
+}
+
+run_test FR-CH-T2-2hop through_chain \
+	"127.0.0.1:$PROXY_PORT,127.0.0.1:$PROXY2_PORT"
+run_test FR-CH-T2-3hop through_chain \
+	"127.0.0.1:$PROXY_PORT,127.0.0.1:$PROXY2_PORT,localhost:$PROXY3_PORT"
+
+# FR-CH-08 / D-40: the loopback guard looks at the exit hop.  Every hop here is
+# on this host, but a chain's exit is reached through other hops, so with
+# strict_loopback a connected send to 127.0.0.1 is refused; through the same
+# first hop alone, which is local, it is not.
+exit_hop_guard() {
+	local out rc=0
+
+	out=$(UDPCHAINS_STRICT_LOOPBACK=yes \
+		UDPCHAINS_PROXY="127.0.0.1:$PROXY_PORT,127.0.0.1:$PROXY2_PORT" \
+		timeout 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO1" 2>&1)
+	if printf '%s\n' "$out" | grep -q '^ok send failed: Network is unreachable$'; then
+		echo "ok - a chain refuses a loopback destination under strict_loopback"
+	else
+		echo "not ok - a chain refuses a loopback destination under strict_loopback"
+		rc=1
+	fi
+	out=$(UDPCHAINS_STRICT_LOOPBACK=yes UDPCHAINS_PROXY="127.0.0.1:$PROXY_PORT" \
+		timeout 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO1" 2>&1)
+	if printf '%s\n' "$out" | grep -q '^LEAK-RISK send reported success'; then
+		echo "ok - a single local proxy still sends to it, as in 0.1.0"
+	else
+		echo "not ok - a single local proxy still sends to it, as in 0.1.0"
+		rc=1
+	fi
+	return $rc
+}
+
+run_test FR-CH-08-exit-hop exit_hop_guard
 
 # --- SEC-01 / SEC-02: the leak test (TST-03) ---------------------------------
 

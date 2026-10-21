@@ -2,9 +2,11 @@
 
 **Status:** in progress after 0.1.0. The requirements in §4 have moved to §2a of
 [`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the reference for them,
-and the design questions in §5 are decided in D-37 to D-42. Steps 1 to 3 of §7 are done: the
-records, chain configuration with its handoff to the shim, and chain setup in `socks5.c`. This
-document stays as the background and estimate.
+and the design questions in §5 are decided in D-37 to D-42. Steps 1 to 4 of §7 are done: the
+records, chain configuration with its handoff to the shim, chain setup in `socks5.c`, and the
+n-layer codec and association, with the integration tests passing through 2- and 3-hop chains.
+Until step 5, a name lookup that needs DNS fails closed under a chain. This document stays as the
+background and estimate.
 **Written:** 2026-10-19, against the 0.1.0 candidate (`aa30ddf`). Line counts and file references
 are as of that commit; recheck them before starting.
 
@@ -153,11 +155,9 @@ address, in the family D-44 chooses).
 - **Per-layer checking on receive** has to be exactly right; see decision 4 above.
 - **D-27 was only recently settled.** Remote resolution of later hops changes it again.
 - **Testing a real chain across hosts** needs at least two remote machines. D2 already needs one.
-- **Setup time.** Every step of chain setup (each connect, greeting, `CONNECT` and reply) has its
-  own `connect_timeout`, 5 s by default. An 8-hop chain is 36 handshakes, so a chain whose hops are
-  slow but alive can take far longer than `connect_timeout` to set up, and the program blocks for
-  that long on its first send. An overall deadline, such as `connect_timeout` times the number of
-  hops, would bound it. To decide in step 4, when the association uses chains.
+- **Setup time.** Decided in D-45: on top of each step's `connect_timeout`, setup must finish
+  within `chain_timeout`, by default `connect_timeout` times the number of hops of a chain of more
+  than one.
 - **Proxies that pin the declared address** need more than D-44 gives them. Whether any real proxy
   needs it as a later hop is for interop, as is whether any answers UDP ASSOCIATE with a named
   relay (D-40).

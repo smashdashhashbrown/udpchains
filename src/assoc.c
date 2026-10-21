@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -33,8 +34,23 @@ unsigned udpc_fork_generation(void)
 	return atomic_load_explicit(&g_fork_generation, memory_order_acquire);
 }
 
+/* Closes every hop's control connection: what tells each proxy to release its
+ * part of the association (FR-P-02).  Each is the shim's own descriptor, so it
+ * is released as one (D-26).  A walk, close() and plain stores: safe in a fork
+ * child handler (D-31). */
+static void close_controls(struct udpc_socks_chain *ch)
+{
+	unsigned k;
+
+	for (k = 0; k < ch->n && k < UDPC_CHAIN_MAX; k++) {
+		if (ch->control_fd[k] >= 0)
+			udpc_fd_shim_close(ch->control_fd[k]);
+		ch->control_fd[k] = -1;
+	}
+}
+
 /* D-31, for each of the child's table entries: let go of the parent's
- * control connection, and of a half-built association. */
+ * control connections, and of a half-built association. */
 static void child_drop_inherited(struct udpc_fdent *e)
 {
 	struct udpc_assoc *a = atomic_load_explicit(&e->assoc, memory_order_acquire);
@@ -47,10 +63,8 @@ static void child_drop_inherited(struct udpc_fdent *e)
 		atomic_store_explicit(&e->assoc, NULL, memory_order_release);
 		return;
 	}
-	if (a != NULL && a->conn.control_fd >= 0) {
-		udpc_fd_shim_close(a->conn.control_fd);
-		a->conn.control_fd = -1;
-	}
+	if (a != NULL)
+		close_controls(&a->chain);
 }
 
 static void atfork_child(void)
@@ -113,8 +127,13 @@ struct udpc_assoc *udpc_assoc_alloc(void)
 	 * even then it will find the entry pointing elsewhere and let go. */
 	a->next_free = NULL;
 	a->fork_generation = udpc_fork_generation();
-	memset(&a->conn, 0, sizeof(a->conn));
-	a->conn.control_fd = -1;
+	{
+		unsigned k;
+
+		memset(&a->chain, 0, sizeof(a->chain));
+		for (k = 0; k < UDPC_CHAIN_MAX; k++)
+			a->chain.control_fd[k] = -1;
+	}
 	atomic_store_explicit(&a->last_used, now_coarse(), memory_order_relaxed);
 	atomic_store_explicit(&a->refcount, 1, memory_order_release);
 	return a;
@@ -167,12 +186,11 @@ void udpc_assoc_unref(struct udpc_assoc *a)
 	if (a == NULL || a == ASSOC_ESTABLISHING)
 		return;
 	if (atomic_fetch_sub_explicit(&a->refcount, 1, memory_order_acq_rel) == 1) {
-		/* Last reference: closing the control connection is what tells
-		 * the proxy to release the association (FR-P-02).  It is the
-		 * shim's own descriptor, so it is released as one (D-26). */
+		/* Last reference: closing the control connections is what tells
+		 * the proxies to release the association (FR-P-02). */
 		atomic_thread_fence(memory_order_acquire);
-		udpc_fd_shim_close(a->conn.control_fd);
-		a->conn.control_fd = -1;
+		close_controls(&a->chain);
+		a->chain.n = 0;
 		free_push(a);
 	}
 }
@@ -204,7 +222,7 @@ bool udpc_assoc_relay_of(const struct udpc_assoc *a, int family,
 	 * socket has whatever family the application chose.  An AF_INET6 socket
 	 * with a proxy reached over IPv4 is entirely normal, so the relay
 	 * address is adapted to something this socket can actually reach. */
-	return udpc_addr_for_family((const struct sockaddr *)&a->conn.relay,
+	return udpc_addr_for_family((const struct sockaddr *)&a->chain.relay[0].sa,
 	                            family, out) == 0;
 }
 
@@ -227,14 +245,18 @@ static long now_coarse(void)
 /* D-05 R2: a loopback destination is resolved at the PROXY, so with a remote
  * proxy the datagram reaches the proxy host's loopback rather than this host's.
  * Silent misrouting is the same class of defect the project exists to remove,
- * so it is called out -- and can be promoted to a hard error. */
+ * so it is called out -- and can be promoted to a hard error.
+ *
+ * D-40: it is the EXIT hop that resolves it.  Only a chain of one can have its
+ * exit on this host; a longer chain's exit is reached through other hops, so a
+ * loopback destination there is always the far end's. */
 static int loopback_guard(const struct udpc_config *cfg, const struct udpc_fdent *e,
                           int *out_errno)
 {
 	char abuf[UDPC_ADDRSTRLEN];
 	const struct sockaddr *dst;
 
-	if (cfg->proxy_is_local)
+	if (cfg->nextra == 0 && cfg->proxy_is_local)
 		return 0;
 	if (!atomic_load_explicit(&e->connected, memory_order_acquire))
 		return 0;
@@ -244,17 +266,28 @@ static int loopback_guard(const struct udpc_config *cfg, const struct udpc_fdent
 		return 0;
 
 	if (cfg->strict_loopback) {
-		udpc_err("refusing loopback destination %s: the proxy is not on "
-		         "this host, so it would be resolved at the proxy "
-		         "(strict_loopback is on)",
-		         udpc_addr_str(dst, abuf, sizeof(abuf)));
+		if (cfg->nextra > 0)
+			udpc_err("refusing loopback destination %s: it would be "
+			         "resolved at the chain's last hop, not here "
+			         "(strict_loopback is on)",
+			         udpc_addr_str(dst, abuf, sizeof(abuf)));
+		else
+			udpc_err("refusing loopback destination %s: the proxy is not on "
+			         "this host, so it would be resolved at the proxy "
+			         "(strict_loopback is on)",
+			         udpc_addr_str(dst, abuf, sizeof(abuf)));
 		*out_errno = ENETUNREACH;
 		return -1;
 	}
 
-	udpc_warn("destination %s is loopback but the proxy is not on this "
-	          "host; it will be resolved at the proxy, not here",
-	          udpc_addr_str(dst, abuf, sizeof(abuf)));
+	if (cfg->nextra > 0)
+		udpc_warn("destination %s is loopback; it will be resolved at the "
+		          "chain's last hop, not here",
+		          udpc_addr_str(dst, abuf, sizeof(abuf)));
+	else
+		udpc_warn("destination %s is loopback but the proxy is not on this "
+		          "host; it will be resolved at the proxy, not here",
+		          udpc_addr_str(dst, abuf, sizeof(abuf)));
 	return 0;
 }
 
@@ -267,12 +300,12 @@ static int redirect_fd(int fd, int family, struct udpc_assoc *a, int *out_errno)
 	socklen_t rlen;
 	char rbuf[UDPC_ADDRSTRLEN];
 
-	if (udpc_addr_for_family((const struct sockaddr *)&a->conn.relay, family,
-	                         &relay) != 0) {
+	if (udpc_addr_for_family((const struct sockaddr *)&a->chain.relay[0].sa,
+	                         family, &relay) != 0) {
 		udpc_err("proxy returned relay %s, which an %s socket cannot "
 		         "reach",
-		         udpc_addr_str((const struct sockaddr *)&a->conn.relay, rbuf,
-		                       sizeof(rbuf)),
+		         udpc_addr_str((const struct sockaddr *)&a->chain.relay[0].sa,
+		                       rbuf, sizeof(rbuf)),
 		         family == AF_INET6 ? "AF_INET6" : "AF_INET");
 		*out_errno = EAFNOSUPPORT;
 		return -1;
@@ -373,12 +406,39 @@ static int reprivatize_socket(int fd, struct udpc_fdent *e, int *out_errno)
 	return 0;
 }
 
+/* The relays an association's datagrams pass, in order: hop 1's, which is what
+ * a chain of one has always printed, then each later hop's, by name where it
+ * is one -- "127.0.0.1:40001, then 10.0.0.5:40002, then proxy.internal:40003". */
+static void chain_path(const struct udpc_socks_chain *ch, char *buf, size_t len)
+{
+	char one[UDPC_ADDRSTRLEN];
+	size_t off = 0;
+	unsigned k;
+
+	buf[0] = '\0';
+	for (k = 0; k < ch->n && k < UDPC_CHAIN_MAX && off < len; k++) {
+		const struct udpc_socks_addr *r = &ch->relay[k];
+		int w;
+
+		if (r->named)
+			w = snprintf(buf + off, len - off, "%s%s:%u",
+			             k ? ", then " : "", r->host, r->port);
+		else
+			w = snprintf(buf + off, len - off, "%s%s", k ? ", then " : "",
+			             udpc_addr_str((const struct sockaddr *)&r->sa, one,
+			                           sizeof(one)));
+		if (w < 0)
+			break;
+		off += (size_t)w;
+	}
+}
+
 static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg,
                      int *out_errno)
 {
 	struct udpc_assoc *a;
 	const struct sockaddr *bind_addr = NULL;
-	char abuf[UDPC_ADDRSTRLEN], rbuf[UDPC_ADDRSTRLEN];
+	char abuf[UDPC_ADDRSTRLEN], rbuf[UDPC_CHAIN_MAX * (UDPC_ADDRSTRLEN + 270)];
 
 	if (loopback_guard(cfg, e, out_errno) != 0)
 		return -1;
@@ -398,7 +458,7 @@ static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg
 	/* The handshake is the shim's own traffic; the guard keeps the shim
 	 * transparent to itself (guard.h). */
 	UDPC_GUARD_ENTER();
-	if (udpc_socks_associate(cfg, bind_addr, &a->conn, out_errno) != 0) {
+	if (udpc_socks_associate_chain(cfg, bind_addr, &a->chain, out_errno) != 0) {
 		UDPC_GUARD_LEAVE();
 		udpc_assoc_unref(a);
 		/* SEC-01: the failure is reported on the application's call.
@@ -407,11 +467,17 @@ static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg
 	}
 	UDPC_GUARD_LEAVE();
 
-	/* D-26: the control connection is the shim's own descriptor.  Moved
-	 * out of the application's way and marked, so a close-all loop in the
-	 * application cannot take it -- and so this association can never
-	 * close a number the application has since been given. */
-	a->conn.control_fd = udpc_fd_shim_adopt(a->conn.control_fd);
+	/* D-26: the control connections are the shim's own descriptors.
+	 * Moved out of the application's way and marked, so a close-all loop
+	 * in the application cannot take them -- and so this association can
+	 * never close a number the application has since been given. */
+	{
+		unsigned k;
+
+		for (k = 0; k < a->chain.n; k++)
+			a->chain.control_fd[k] =
+				udpc_fd_shim_adopt(a->chain.control_fd[k]);
+	}
 
 	if (redirect_fd(fd, atomic_load_explicit(&e->family, memory_order_relaxed),
 	                a, out_errno) != 0) {
@@ -424,22 +490,19 @@ static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg
 	/* FR-C-06: one line per association, naming the destination -- so the
 	 * operator can see that proxying is actually happening.  The configured
 	 * datagram limit is reported too, because a mismatch with the proxy's
-	 * real limit shows up as silent drops (D-12). */
+	 * real limit shows up as silent drops (D-12).  For a chain, the relay
+	 * of every hop, in order (FR-CH-12). */
+	chain_path(&a->chain, rbuf, sizeof(rbuf));
 	if (atomic_load_explicit(&e->connected, memory_order_acquire))
 		udpc_info("association up: fd %d -> %s via relay %s "
 		          "(max_datagram %zu)",
 		          fd,
 		          udpc_addr_str((const struct sockaddr *)&e->app_dst, abuf,
 		                        sizeof(abuf)),
-		          udpc_addr_str((const struct sockaddr *)&a->conn.relay,
-		                        rbuf, sizeof(rbuf)),
-		          cfg->max_datagram);
+		          rbuf, cfg->max_datagram);
 	else
 		udpc_info("association up: fd %d via relay %s (max_datagram %zu)",
-		          fd,
-		          udpc_addr_str((const struct sockaddr *)&a->conn.relay,
-		                        rbuf, sizeof(rbuf)),
-		          cfg->max_datagram);
+		          fd, rbuf, cfg->max_datagram);
 
 	return 0;
 }
@@ -557,7 +620,7 @@ struct udpc_assoc *udpc_assoc_hold(int fd, struct udpc_fdent *e,
 	now = now_coarse();
 	if (now - last < UDPC_IDLE_PROBE_SECS)
 		return a;
-	if (udpc_socks_control_alive(&a->conn)) {
+	if (udpc_socks_chain_alive(&a->chain)) {
 		atomic_store_explicit(&a->last_used, now, memory_order_relaxed);
 		return a;
 	}

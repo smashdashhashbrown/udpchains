@@ -45,6 +45,19 @@ static int roundtrip(int fd, const char *what)
 	return n == (ssize_t)len && memcmp(buf, what, len) == 0;
 }
 
+/* Control connections per association: one for each hop of the chain the
+ * wrapper handed on in UDPCHAINS_PROXY (FR-CH-10).  1 for a single proxy. */
+static int chain_hops(void)
+{
+	const char *p = getenv("UDPCHAINS_PROXY");
+	int n = 1;
+
+	for (; p != NULL && *p != '\0'; p++)
+		if (*p == ',')
+			n++;
+	return n;
+}
+
 /* Counts the TCP sockets this process holds.  In a test running under the shim
  * these are exactly the shim's control connections, so the count tracks live
  * associations -- which is how a leak becomes visible. */
@@ -331,7 +344,7 @@ static void t_scm_rights_adopted(void)
 	connect(got, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
 	TAP_OK(roundtrip(got, "via-scm-rights"),
 	       "the received socket round-trips");
-	TAP_EQ_INT(count_tcp_sockets(NULL), before + 1,
+	TAP_EQ_INT(count_tcp_sockets(NULL), before + chain_hops(),
 	           "and it did so through its own association");
 	close(got);
 }
@@ -393,8 +406,8 @@ static void t_stale_entry_not_hijacked(void)
 	TAP_EQ_INT(read(cli, buf, sizeof(buf)), 5,
 	           "and a read returns the stream's bytes, not a discarded 'datagram'");
 	TAP_EQ_MEM(buf, "world", 5, "unaltered");
-	TAP_EQ_INT(count_tcp_sockets(NULL), before - 1 + 2,
-	           "the stranded association's control connection was released "
+	TAP_EQ_INT(count_tcp_sockets(NULL), before - chain_hops() + 2,
+	           "the stranded association's control connections were released "
 	           "(the 2 are this test's own TCP pair)");
 
 	close(cli);
@@ -416,7 +429,7 @@ static void t_other_close_routes(void)
 	TAP_OK(roundtrip(fd, "via-syscall"), "an association is up");
 	before = count_tcp_sockets(NULL);
 	TAP_EQ_INT(syscall(SYS_close, fd), 0, "syscall(SYS_close) succeeds");
-	TAP_EQ_INT(count_tcp_sockets(NULL), before - 1,
+	TAP_EQ_INT(count_tcp_sockets(NULL), before - chain_hops(),
 	           "and releases the association there and then");
 
 	fd = udp4();
@@ -424,7 +437,7 @@ static void t_other_close_routes(void)
 	TAP_OK(roundtrip(fd, "via-closefrom"), "another association is up");
 	before = count_tcp_sockets(NULL);
 	closefrom(fd);
-	TAP_EQ_INT(count_tcp_sockets(NULL), before - 1,
+	TAP_EQ_INT(count_tcp_sockets(NULL), before - chain_hops(),
 	           "closefrom releases it, and closes no control connection "
 	           "belonging to anything else");
 }

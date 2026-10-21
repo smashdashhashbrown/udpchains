@@ -535,6 +535,19 @@ static void note_no_dns(void)
 		         "resolve names directly (D-22)");
 }
 
+/* Until the resolver's own association is carried through a chain (step 5 of
+ * docs/FUTURE-UDP-CHAINS.md), a lookup that needs DNS fails with a chain
+ * rather than go through its first hop alone (D-37, FR-CH-11). */
+static void note_no_chain_dns(void)
+{
+	static atomic_flag once = ATOMIC_FLAG_INIT;
+
+	if (!atomic_flag_test_and_set(&once))
+		udpc_err("a name lookup needs DNS, which is not carried through a "
+		         "chain of proxies yet; refusing to resolve names through "
+		         "the first proxy alone or directly");
+}
+
 /* Runs a set of queries to completion.  Returns 0 with every answer delivered,
  * or -1 with *st set.  There is no path from here to a direct query. */
 static int transact(struct xfer *x, size_t nx, enum udpc_res_status *st)
@@ -551,6 +564,11 @@ static int transact(struct xfer *x, size_t nx, enum udpc_res_status *st)
 	}
 	if (!cfg->dns_set) {
 		note_no_dns();
+		*st = UDPC_RES_FAIL;
+		return -1;
+	}
+	if (cfg->nextra > 0) {
+		note_no_chain_dns();
 		*st = UDPC_RES_FAIL;
 		return -1;
 	}

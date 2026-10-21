@@ -199,4 +199,40 @@ void udpc_socks_fixup_hop_relay(struct udpc_socks_addr *relay,
 int udpc_socks_declared_family(const struct udpc_socks_addr *hop,
                                const struct udpc_socks_hdr *connect_reply);
 
+/* --- chain codec (FR-CH-05, FR-CH-06) -------------------------------------- */
+
+/* The most header bytes a chain can put in front of a payload. */
+#define UDPC_SOCKS_CHAIN_HDR_MAX (UDPC_CHAIN_MAX * UDPC_SOCKS_HDR_MAX)
+
+/* Encodes the headers a datagram to dst needs through ch: one per hop, the
+ * layer hop 1 reads outermost and naming hop 2's relay, and so on inwards,
+ * with dst in the innermost (FR-CH-05).  For a chain of one this is exactly
+ * udpc_socks_encode.  Returns the total length, or -1 with errno set; with
+ * inner_off non-NULL, stores where the innermost header starts. */
+ssize_t udpc_socks_encode_chain(uint8_t *buf, size_t buflen,
+                                const struct udpc_socks_chain *ch,
+                                const struct sockaddr *dst, size_t *inner_off);
+
+/* Why udpc_socks_decode_chain refused a datagram. */
+enum udpc_socks_drop {
+	UDPC_DROP_MALFORMED = 1, /* the layer does not decode */
+	UDPC_DROP_FRAG,          /* FRAG is not 0 (FR-P-04) */
+	UDPC_DROP_SOURCE         /* not from the relay it must come from */
+};
+
+/* Strips and checks a received datagram's headers, outermost first (D-41).
+ * Every layer but the innermost must decode, have FRAG 0, and name as its
+ * source the relay of the next hop (by port alone, when that relay is a
+ * name).  The innermost layer is decoded into *inner and left to the caller,
+ * as udpc_socks_decode's result is, FRAG included.
+ *
+ * Returns the total header length, where the payload starts; or -1 with
+ * *layer, from 1 for the outermost, and *why saying what was wrong.  A
+ * datagram refused here must be dropped whole (FR-CH-06).  For a chain of one
+ * this is exactly udpc_socks_decode. */
+ssize_t udpc_socks_decode_chain(const uint8_t *buf, size_t len,
+                                const struct udpc_socks_chain *ch,
+                                struct udpc_socks_hdr *inner, unsigned *layer,
+                                enum udpc_socks_drop *why);
+
 #endif /* UDPCHAINS_SOCKS5_H */

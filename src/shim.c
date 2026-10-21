@@ -37,17 +37,6 @@ static void shim_init(void)
 
 	udpc_log_set_level(g_cfg.verbosity);
 
-	/* D-38: until chains are carried on the wire, a longer chain fails
-	 * closed rather than running through its first hop alone. */
-	if (g_cfg.nextra > 0) {
-		udpc_err("a chain of %u proxies is configured, but this version "
-		         "carries only one",
-		         g_cfg.nextra + 1);
-		udpc_err("every UDP send from this program will fail rather than "
-		         "go through the first proxy alone");
-		UDPC_GUARD_LEAVE();
-		return;
-	}
 	atomic_store_explicit(&g_ready, true, memory_order_release);
 
 	udpc_debug("shim ready: proxy %s, max_datagram %zu, strict_loopback %s",

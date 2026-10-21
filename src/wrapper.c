@@ -53,6 +53,7 @@ static void usage(FILE *out)
 	        "environment:\n"
 	        "  UDPCHAINS_PROXY, UDPCHAINS_CONFIG, UDPCHAINS_MAX_DATAGRAM,\n"
 	        "  UDPCHAINS_STRICT_LOOPBACK, UDPCHAINS_CONNECT_TIMEOUT,\n"
+	        "  UDPCHAINS_CHAIN_TIMEOUT,\n"
 	        "  UDPCHAINS_USERNAME, UDPCHAINS_PASSWORD_FILE,\n"
 	        "  UDPCHAINS_DNS, UDPCHAINS_DNS_TIMEOUT, UDPCHAINS_DNS_SEARCH,\n"
 	        "  UDPCHAINS_HOSTS_FILE\n"
@@ -445,17 +446,6 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* D-38: until chains are carried on the wire, a longer chain is
-	 * refused rather than run as a chain of its first hop. */
-	if (cfg.nextra > 0) {
-		fprintf(stderr,
-		        "udpchains: a chain of %u proxies is configured, but this "
-		        "version carries only one.\n"
-		        "udpchains: refusing to run '%s' through the first alone.\n",
-		        cfg.nextra + 1, argv[i]);
-		return 1;
-	}
-
 	if (resolve_program(argv[i], program, sizeof(program)) != 0) {
 		fprintf(stderr, "udpchains: %s: not found or not executable\n",
 		        argv[i]);
@@ -485,6 +475,13 @@ int main(int argc, char **argv)
 	           udpc_addr_str((const struct sockaddr *)&cfg.proxy, addrbuf,
 	                         sizeof(addrbuf)),
 	           cfg.proxy_is_local ? " (local)" : "", cfg.max_datagram);
+	{
+		unsigned k;
+
+		/* Later hops as written: they are never resolved here (D-39). */
+		for (k = 0; k < cfg.nextra; k++)
+			udpc_debug("then hop %u: %s", k + 2, cfg.hops[k].spec);
+	}
 
 	/* D-28: exec the file that was checked, not a name.  execvp() would
 	 * search PATH a second time, and the setuid/capability check above

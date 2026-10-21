@@ -1,14 +1,15 @@
-/* test_chain.c -- chain setup against chained fixtures (FR-CH-01 to FR-CH-04,
- * FR-CH-07, FR-CH-09, FR-CH-12; D-37 to D-40, D-43, D-44).
+/* test_chain.c -- chain setup against chained fixtures, and the chain codec
+ * (FR-CH-01 to FR-CH-07, FR-CH-09, FR-CH-12; D-37 to D-41, D-43 to D-45).
  *
  * Links the shim's objects directly, like the other unit tests, and starts its
  * own fixture proxies from the directory it was built in, so it runs the same
  * under the suite and under the sanitisers.
  *
- * The datagram path does not carry chains yet (step 4 of
- * docs/FUTURE-UDP-CHAINS.md §7), so the round trips here wrap and unwrap the
- * layers by hand with the single-header codec.  What they prove is that the
- * relays chain setup returns are the ones a datagram must take.
+ * The round trips here wrap and unwrap the layers by hand with the
+ * single-header codec, independently of the chain codec they also test: what
+ * they prove is that the relays chain setup returns are the ones a datagram
+ * must take.  The datagram path itself is tested through chains by running the
+ * integration tests with a chain (FR-CH-T2, tests/run.sh).
  *
  * usage: test_chain           (from the build directory, or by path)
  */
@@ -20,12 +21,14 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "addr.h"
@@ -294,6 +297,82 @@ static int round_trip(const struct udpc_socks_chain *ch,
 	if (len - off != sizeof(payload) || memcmp(pkt + off, payload, len - off) != 0)
 		return good - 1;
 	return good;
+}
+
+/* Builds a reply as a 3-hop chain delivers it: layer 1 from l1, layer 2 from
+ * l2 (NULL: some address with port 3000, the named relay's in the D-41 tests),
+ * the innermost from src, then "data".  Returns its length. */
+static size_t build_reply(uint8_t *pkt, size_t len, const struct sockaddr *l1,
+                          const struct sockaddr *l2, const struct sockaddr_in *src)
+{
+	struct sockaddr_in some;
+	size_t off = 0;
+	ssize_t n;
+
+	make_v4(&some, "10.9.9.9", 3000);
+	n = udpc_socks_encode(pkt, len, l1);
+	off += (size_t)n;
+	n = udpc_socks_encode(pkt + off, len - off,
+	                      l2 != NULL ? l2 : (const struct sockaddr *)&some);
+	off += (size_t)n;
+	n = udpc_socks_encode(pkt + off, len - off, (const struct sockaddr *)src);
+	off += (size_t)n;
+	memcpy(pkt + off, "data", 4);
+	return off + 4;
+}
+
+/* A hop that answers every step, but slowly: each reply comes step_ms after
+ * the request.  It requires RFC 1929 authentication, so a handshake with it is
+ * three steps -- greeting, credentials, request -- each within its own timeout
+ * however long they take together (D-45).  Serves connections one at a time
+ * until the listener is closed. */
+struct slow_hop {
+	int listen_fd;
+	int step_ms;
+};
+
+/* One step: a request read, a pause, a reply written.  0 on success. */
+static int slow_step(int c, uint8_t *buf, size_t len, int step_ms,
+                     const uint8_t *reply, size_t replylen)
+{
+	if (read(c, buf, len) <= 0)
+		return -1;
+	usleep((useconds_t)step_ms * 1000);
+	return write(c, reply, replylen) == (ssize_t)replylen ? 0 : -1;
+}
+
+static void *slow_hop_main(void *arg)
+{
+	const struct slow_hop *sh = arg;
+	uint8_t buf[600];
+
+	for (;;) {
+		static const uint8_t method[2] = { 0x05, 0x02 }, auth_ok[2] = { 0x01, 0x00 };
+		static const uint8_t ok[10] = { 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1,
+			                        0x00, 0x09 };
+		int c = accept(sh->listen_fd, NULL, NULL);
+
+		if (c < 0)
+			return NULL;
+		/* Each read takes what the client sent for the step; the client
+		 * sends nothing more until it has the reply. */
+		if (slow_step(c, buf, sizeof(buf), sh->step_ms, method, 2) == 0 &&
+		    slow_step(c, buf, sizeof(buf), sh->step_ms, auth_ok, 2) == 0)
+			(void)slow_step(c, buf, sizeof(buf), sh->step_ms, ok, sizeof(ok));
+		/* Held open until the client lets go, like a control connection. */
+		while (read(c, buf, sizeof(buf)) > 0)
+			;
+		close(c);
+	}
+}
+
+static long long elapsed_ms(const struct timespec *t0)
+{
+	struct timespec t1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	return (long long)(t1.tv_sec - t0->tv_sec) * 1000 +
+	       (t1.tv_nsec - t0->tv_nsec) / 1000000;
 }
 
 /* Puts stderr in a file around a failing call, so its diagnostics can be
@@ -592,6 +671,169 @@ int main(int argc, char **argv)
 	}
 
 	/* ------------------------------------------------------------------ */
+	TAP_GROUP("FR-CH-05: one header per hop, outermost first");
+	{
+		struct udpc_socks_chain c3;
+		struct sockaddr_in dst;
+		uint8_t out[UDPC_SOCKS_CHAIN_HDR_MAX], one[UDPC_SOCKS_HDR_MAX];
+		size_t inner = 0;
+		ssize_t len;
+		/* RFC 1928 §7 three times over, written out by hand: hop 1 reads
+		 * the first and sends the rest to hop 2's relay, 10.0.0.5:2000;
+		 * hop 2 reads the second and sends the rest to hop 3's relay,
+		 * which is a name; hop 3 reads the last and sends the payload to
+		 * 192.0.2.1:53. */
+		static const uint8_t want[] = {
+			0x00, 0x00, 0x00, 0x01, 10, 0, 0, 5, 0x07, 0xd0,
+			0x00, 0x00, 0x00, 0x03, 14,
+			'p', 'r', 'o', 'x', 'y', '.', 'i', 'n', 't', 'e', 'r', 'n',
+			'a', 'l', 0x0b, 0xb8,
+			0x00, 0x00, 0x00, 0x01, 192, 0, 2, 1, 0x00, 0x35,
+		};
+
+		memset(&c3, 0, sizeof(c3));
+		c3.n = 3;
+		make_v4((struct sockaddr_in *)&c3.relay[0].sa, "127.0.0.1", 1000);
+		make_v4((struct sockaddr_in *)&c3.relay[1].sa, "10.0.0.5", 2000);
+		c3.relay[2].named = true;
+		snprintf(c3.relay[2].host, sizeof(c3.relay[2].host), "proxy.internal");
+		c3.relay[2].port = 3000;
+		make_v4(&dst, "192.0.2.1", 53);
+
+		len = udpc_socks_encode_chain(out, sizeof(out), &c3,
+		                              (struct sockaddr *)&dst, &inner);
+		TAP_EQ_INT(len, (ssize_t)sizeof(want),
+		           "three headers: 10 + 21 + 10 bytes");
+		TAP_EQ_MEM(out, want, sizeof(want),
+		           "byte for byte: hop 2's relay, hop 3's by name, the target");
+		TAP_EQ_INT(inner, 31, "the target's header starts after the other two");
+
+		errno = 0;
+		TAP_EQ_INT(udpc_socks_encode_chain(out, 20, &c3, (struct sockaddr *)&dst,
+		                                   NULL), -1,
+		           "a buffer too small for all three is refused");
+		TAP_EQ_INT(errno, ENOBUFS, "with ENOBUFS");
+
+		c3.n = 1;
+		len = udpc_socks_encode_chain(out, sizeof(out), &c3,
+		                              (struct sockaddr *)&dst, &inner);
+		TAP_OK(len == udpc_socks_encode(one, sizeof(one), (struct sockaddr *)&dst) &&
+		       len > 0 && memcmp(out, one, (size_t)len) == 0 && inner == 0,
+		       "a chain of one encodes exactly the single header");
+	}
+
+	/* ------------------------------------------------------------------ */
+	TAP_GROUP("D-41: every layer of a received datagram is checked");
+	{
+		struct udpc_socks_chain c3;
+		struct udpc_socks_hdr in;
+		struct sockaddr_in src, other;
+		struct sockaddr_in6 mapped;
+		uint8_t pkt[UDPC_SOCKS_CHAIN_HDR_MAX + 16];
+		enum udpc_socks_drop why;
+		unsigned layer;
+		size_t off;
+		ssize_t n, h;
+
+		memset(&c3, 0, sizeof(c3));
+		c3.n = 3;
+		make_v4((struct sockaddr_in *)&c3.relay[0].sa, "127.0.0.1", 1000);
+		make_v4((struct sockaddr_in *)&c3.relay[1].sa, "10.0.0.5", 2000);
+		c3.relay[2].named = true;
+		snprintf(c3.relay[2].host, sizeof(c3.relay[2].host), "proxy.internal");
+		c3.relay[2].port = 3000;
+		make_v4(&src, "192.0.2.1", 53);
+
+
+		off = build_reply(pkt, sizeof(pkt), (struct sockaddr *)&c3.relay[1].sa,
+		                  NULL, &src);
+		h = udpc_socks_decode_chain(pkt, off, &c3, &in, &layer, &why);
+		TAP_EQ_INT(h, (ssize_t)off - 4, "a genuine reply decodes, the payload after "
+		                                 "all three headers");
+		TAP_OK(in.addr_valid && ((struct sockaddr_in *)&in.addr)->sin_port ==
+		                            htons(53),
+		       "and the source reported is the innermost: the target");
+
+		make_v6(&mapped, "::ffff:10.0.0.5", 2000);
+		off = build_reply(pkt, sizeof(pkt), (struct sockaddr *)&mapped,
+		                  NULL, &src);
+		TAP_OK(udpc_socks_decode_chain(pkt, off, &c3, &in, &layer, &why) > 0,
+		       "hop 2's relay reported v4-mapped is the same relay");
+
+		make_v4(&other, "10.0.0.6", 2000);
+		off = build_reply(pkt, sizeof(pkt), (struct sockaddr *)&other,
+		                  NULL, &src);
+		TAP_EQ_INT(udpc_socks_decode_chain(pkt, off, &c3, &in, &layer, &why), -1,
+		           "layer 1 from another address is refused");
+		TAP_OK(layer == 1 && why == UDPC_DROP_SOURCE,
+		       "at layer 1, for its source");
+
+		make_v4(&other, "10.0.0.5", 2001);
+		off = build_reply(pkt, sizeof(pkt), (struct sockaddr *)&other,
+		                  NULL, &src);
+		TAP_EQ_INT(udpc_socks_decode_chain(pkt, off, &c3, &in, &layer, &why), -1,
+		           "layer 1 from the right address but another port is refused");
+
+		make_v4(&other, "10.0.0.5", 3001);
+		off = build_reply(pkt, sizeof(pkt), (struct sockaddr *)&c3.relay[1].sa,
+		                  (struct sockaddr *)&other, &src);
+		TAP_EQ_INT(udpc_socks_decode_chain(pkt, off, &c3, &in, &layer, &why), -1,
+		           "layer 2, from the wrong port for a relay known by name, "
+		           "is refused");
+		TAP_OK(layer == 2 && why == UDPC_DROP_SOURCE, "at layer 2");
+
+		/* A layer from a named relay can only be checked by port: its
+		 * address would need the name resolved here (D-39, D-41). */
+		make_v4(&other, "198.51.100.1", 3000);
+		off = build_reply(pkt, sizeof(pkt), (struct sockaddr *)&c3.relay[1].sa,
+		                  (struct sockaddr *)&other, &src);
+		TAP_OK(udpc_socks_decode_chain(pkt, off, &c3, &in, &layer, &why) > 0,
+		       "a named relay's layer is checked by port alone");
+
+		off = build_reply(pkt, sizeof(pkt), (struct sockaddr *)&c3.relay[1].sa,
+		                  NULL, &src);
+		pkt[10 + 2] = 1; /* layer 2's FRAG */
+		TAP_EQ_INT(udpc_socks_decode_chain(pkt, off, &c3, &in, &layer, &why), -1,
+		           "FRAG set at a middle layer is refused");
+		TAP_OK(layer == 2 && why == UDPC_DROP_FRAG, "at layer 2, for FRAG");
+
+		off = build_reply(pkt, sizeof(pkt), (struct sockaddr *)&c3.relay[1].sa,
+		                  NULL, &src);
+		pkt[20 + 2] = 1; /* the innermost layer's FRAG */
+		h = udpc_socks_decode_chain(pkt, off, &c3, &in, &layer, &why);
+		TAP_OK(h > 0 && in.frag == 1,
+		       "FRAG at the innermost layer is left in the header, for the "
+		       "caller to drop as for a single proxy (FR-P-04)");
+
+		off = build_reply(pkt, sizeof(pkt), (struct sockaddr *)&c3.relay[1].sa,
+		                  NULL, &src);
+		TAP_EQ_INT(udpc_socks_decode_chain(pkt, 15, &c3, &in, &layer, &why), -1,
+		           "a datagram cut short in layer 2 is refused");
+		TAP_OK(layer == 2 && why == UDPC_DROP_MALFORMED, "as malformed");
+		TAP_EQ_INT(udpc_socks_decode_chain(pkt, 25, &c3, &in, &layer, &why), -1,
+		           "and one cut short in the innermost");
+		TAP_EQ_INT(layer, 3, "at layer 3");
+
+		/* The defect D-41 exists to prevent: a datagram with fewer layers
+		 * than the chain, its header read as the next one's, or its payload
+		 * as a header.  One sent straight to hop 1's relay by anyone at all
+		 * arrives with hop 1's single layer naming the sender. */
+		n = udpc_socks_encode(pkt, sizeof(pkt), (struct sockaddr *)&src);
+		memcpy(pkt + n, "data-that-is-not-a-header", 25);
+		TAP_EQ_INT(udpc_socks_decode_chain(pkt, (size_t)n + 25, &c3, &in, &layer,
+		                                   &why), -1,
+		           "a datagram injected at hop 1's relay is refused, not "
+		           "delivered with its payload read as headers");
+
+		c3.n = 1;
+		n = udpc_socks_encode(pkt, sizeof(pkt), (struct sockaddr *)&src);
+		memcpy(pkt + n, "data", 4);
+		h = udpc_socks_decode_chain(pkt, (size_t)n + 4, &c3, &in, &layer, &why);
+		TAP_OK(h == n && udpc_socks_decode(pkt, (size_t)n + 4, &in) == n,
+		       "a chain of one decodes exactly the single header");
+	}
+
+	/* ------------------------------------------------------------------ */
 	TAP_GROUP("FR-CH-01: a chain of one is 0.1.0's association");
 	{
 		const char *const one[] = { a };
@@ -879,6 +1121,135 @@ int main(int argc, char **argv)
 		TAP_OK(fd >= 0, "a chain of one opens a stream as before");
 		if (fd >= 0)
 			close(fd);
+	}
+
+	/* ------------------------------------------------------------------ */
+	TAP_GROUP("D-45: a chain's setup has a deadline, and chain_timeout sets it");
+	{
+		struct slow_hop sh;
+		struct sockaddr_in la;
+		socklen_t ll = sizeof(la);
+		struct timespec t0;
+		pthread_t th;
+		char slow[32];
+		long long took;
+
+		sh.step_ms = 800;
+		sh.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+		make_v4(&la, "127.0.0.1", 0);
+		if (sh.listen_fd < 0 ||
+		    bind(sh.listen_fd, (struct sockaddr *)&la, sizeof(la)) != 0 ||
+		    listen(sh.listen_fd, 4) != 0 ||
+		    getsockname(sh.listen_fd, (struct sockaddr *)&la, &ll) != 0 ||
+		    pthread_create(&th, NULL, slow_hop_main, &sh) != 0) {
+			perror("slow hop");
+			stop_fixtures();
+			return 2;
+		}
+		snprintf(slow, sizeof(slow), "127.0.0.1:%u", ntohs(la.sin_port));
+
+		/* Alone, it is 0.1.0: three steps of 0.8 s, each within the 1 s
+		 * connect_timeout, so it succeeds after 2.4 s. */
+		{
+			const char *const one[] = { slow };
+
+			cfg = chain_cfg(one, 1);
+			cfg->connect_timeout_ms = 1000;
+			cfg->have_credentials = true;
+			snprintf(cfg->username, sizeof(cfg->username), "u");
+			snprintf(cfg->password, sizeof(cfg->password), "p");
+			e = 0;
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			TAP_EQ_INT(udpc_socks_associate_chain(cfg, NULL, &ch, &e), 0,
+			           "a slow proxy alone associates: every step is in time");
+			took = elapsed_ms(&t0);
+			TAP_OK(took >= 2300, "taking as long as its steps (%lld ms)", took);
+			udpc_socks_disconnect_chain(&ch);
+		}
+
+		/* chain_timeout raises a chain's deadline, or with 0 lifts it:
+		 * hop 2's 2.4 s then fits. */
+		{
+			const char *const two[] = { a, slow };
+			static const char *const values[] = { "3500", "0" };
+			unsigned i;
+
+			for (i = 0; i < 2; i++) {
+				const char *err = NULL;
+
+				cfg = chain_cfg(two, 2);
+				cfg->connect_timeout_ms = 1000;
+				hop_creds(cfg, 2, "u", "p");
+				TAP_EQ_INT(udpc_config_set(cfg, "chain_timeout", values[i], &err),
+				           0, "chain_timeout %s is accepted", values[i]);
+				e = 0;
+				clock_gettime(CLOCK_MONOTONIC, &t0);
+				TAP_EQ_INT(udpc_socks_associate_chain(cfg, NULL, &ch, &e), 0,
+				           "with chain_timeout %s, the slow hop 2 of 2 "
+				           "associates (%s)",
+				           values[i], strerror(e));
+				took = elapsed_ms(&t0);
+				TAP_OK(took >= 2300, "past the default 2 s (%lld ms)", took);
+				udpc_socks_disconnect_chain(&ch);
+			}
+		}
+
+		/* Set, chain_timeout applies to a chain of one too. */
+		{
+			const char *const one[] = { slow };
+			const char *err = NULL;
+
+			cfg = chain_cfg(one, 1);
+			cfg->connect_timeout_ms = 1000;
+			cfg->have_credentials = true;
+			snprintf(cfg->username, sizeof(cfg->username), "u");
+			snprintf(cfg->password, sizeof(cfg->password), "p");
+			udpc_config_set(cfg, "chain_timeout", "1500", &err);
+			e = 0;
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			TAP_EQ_INT(udpc_socks_associate_chain(cfg, NULL, &ch, &e), -1,
+			           "with chain_timeout 1500, the slow proxy alone is "
+			           "cut off");
+			took = elapsed_ms(&t0);
+			TAP_EQ_INT(e, ETIMEDOUT, "with ETIMEDOUT");
+			TAP_OK(took >= 1400 && took < 1800, "at 1.5 s (%lld ms)", took);
+			TAP_OK(chain_is_empty(&ch), "with nothing left associated");
+			udpc_socks_disconnect_chain(&ch);
+			/* The slow hop is still part-way through that
+			 * handshake; let it finish before the next one. */
+			usleep(1200 * 1000);
+		}
+
+		/* As hop 2 of 2, the same steps overrun the chain's 2 s. */
+		{
+			const char *const two[] = { a, slow };
+
+			cfg = chain_cfg(two, 2);
+			cfg->connect_timeout_ms = 1000;
+			hop_creds(cfg, 2, "u", "p");
+			next_report_window();
+			capture_begin(&saved);
+			e = 0;
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			TAP_EQ_INT(udpc_socks_associate_chain(cfg, NULL, &ch, &e), -1,
+			           "as hop 2 of 2, it is cut off by the chain's deadline");
+			took = elapsed_ms(&t0);
+			capture_end(saved);
+			TAP_EQ_INT(e, ETIMEDOUT, "with ETIMEDOUT");
+			TAP_OK(took >= 1800 && took < 2300,
+			       "at 2 s, connect_timeout for each of its hops (%lld ms)",
+			       took);
+			TAP_OK(strstr(g_stderr, "hop 2 of 2 (") != NULL,
+			       "naming hop 2 as where the time ran out");
+			TAP_OK(chain_is_empty(&ch), "with nothing left associated");
+			/* Had it associated after all, the slow hop would hold
+			 * its connection open, and the join below would wait. */
+			udpc_socks_disconnect_chain(&ch);
+		}
+
+		shutdown(sh.listen_fd, SHUT_RDWR);
+		close(sh.listen_fd);
+		pthread_join(th, NULL);
 	}
 
 	/* ------------------------------------------------------------------ */

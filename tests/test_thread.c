@@ -42,6 +42,19 @@ static int udp4(void)
 	return fd;
 }
 
+/* Control connections per association: one for each hop of the chain the
+ * wrapper handed on in UDPCHAINS_PROXY (FR-CH-10).  1 for a single proxy. */
+static int chain_hops(void)
+{
+	const char *p = getenv("UDPCHAINS_PROXY");
+	int n = 1;
+
+	for (; p != NULL && *p != '\0'; p++)
+		if (*p == ',')
+			n++;
+	return n;
+}
+
 static int count_tcp_sockets(void)
 {
 	DIR *d = opendir("/proc/self/fd");
@@ -269,7 +282,7 @@ int main(int argc, char **argv)
 		TAP_EQ_INT(atomic_load(&g_fail), 0,
 		           "no failures when %d threads race to establish",
 		           NTHREADS);
-		TAP_EQ_INT(count_tcp_sockets(), before + 1,
+		TAP_EQ_INT(count_tcp_sockets(), before + chain_hops(),
 		           "exactly ONE association results from the race, not %d",
 		           NTHREADS);
 	}
