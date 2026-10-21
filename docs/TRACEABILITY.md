@@ -18,14 +18,14 @@ verification) · `Deferred` (out of v1, D-08) · `Partial` (see note)
 | MUST | 49 | 47 | 2 | 0 |
 | SHOULD — in v1 | 10 | 10 | 0 | 0 |
 | SHOULD/COULD — deferred | 4 | — | — | 4 |
-| Added by decisions | 11 | 9 | 2 | 0 |
-| **v1 scope** | **70** | **66** | **4** | — |
+| Added by decisions | 12 | 10 | 2 | 0 |
+| **v1 scope** | **71** | **67** | **4** | — |
 
 The two **M** requirements without automated verification are NFR-03 (async-signal-safety) and
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 656 assertions across 17 groups (`tests/run.sh`), all passing, plus the 71-check
+**Test totals:** 713 assertions across 17 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
@@ -37,14 +37,14 @@ from a run rather than editing it by hand.
 | unit-fdtable | 22 |
 | unit-dns | 52 |
 | TST-01 hook matrix | 108 |
-| TST-05 fidelity | 116 |
+| TST-05 fidelity | 171 |
 | port switch (TFTP pattern) | 12 |
 | TST-06 lifecycle | 78 |
 | TST-07 threading | 9 |
 | FR-P-09 auth | 15 |
 | D-22 resolve | 11 checks, over four programs making 99 assertions of their own |
 | wrapper loadability | 12 |
-| TST-03 leak | 9 checks |
+| TST-03 leak | 11 checks |
 | fault injection | 17 |
 | TST-04 real tools | 2 run, 3 skipped (automated, against the fixture) |
 | NFR-04 latency benchmark | reported, not a gate (D-08) |
@@ -61,7 +61,7 @@ from a run rather than editing it by hand.
 | FR-I-03 | M | §2.3 | TST-02 | **Verified** — all 12 symbols exported, and only hooks are exported (D-35) |
 | FR-I-04 | M | §2.3, §3.3 | TST-02, TST-06, TST-03 | **Verified** — includes `close_range`. Review found three more routes (D-21): `fcntl(F_DUPFD)` duplicates, sockets received over `SCM_RIGHTS`, and sockets inherited without `/proc`, all untracked and sent directly. `fcntl`/`fcntl64` are now hooked, received sockets are adopted in `recvmsg`/`recvmmsg`, and a failed `dup2`/`dup3` no longer untracks its target. Later: `closefrom()` and the lifecycle calls of `syscall()` (D-23). TST-03 sends through each route with the proxy down |
 | FR-I-05 | M | §2.3, §3.1 | TST-05 | **Verified** — `getpeername` reports the app's destination, not the relay |
-| FR-I-06 | M | §2.2 | TST-05 | **Verified** — unix and TCP sockets pass through untouched |
+| FR-I-06 | M | §2.2 | TST-05, TST-03 | **Verified** — unix and TCP sockets pass through untouched; raw and packet sockets are refused with `EPERM` (D-36) |
 | FR-I-07 | M | §1, §4.1 | TST-02, TST-01 | **Verified** — TST-02 asserts `poll`/`select`/`epoll_wait`/`setsockopt` are **absent** |
 | FR-I-08 | S | — | — | **Deferred** (D-05) — TST-03 gates any future implementation |
 | FR-I-09 | C | §6.2 | TST-05 | **Deferred** as bypass; multicast/broadcast instead fail `ENETUNREACH` with a diagnostic (D-05 R1) |
@@ -169,6 +169,7 @@ from a run rather than editing it by hand.
 | ADD-08 | D-01 | — | inspection | **Implemented** — stated in README and DECISIONS; no contribution process exists yet to enforce it |
 | ADD-09 | D-14 | §4.3, §5.2 | unit-socks5, TST-05 | **Verified** — v4-mapped destinations encode as ATYP 0x01; the fixture now rejects the wrong form rather than forgiving it |
 | ADD-10 | D-22 | §11 | unit-dns, D-22-resolve, TST-03 | **Verified** — name lookups made through libc are answered locally or through the proxy, never by the host's resolver. With `dns` unset they fail `EAI_FAIL`; with the proxy down, `EAI_AGAIN`. Zero queries reach the resolver in either case, and `strace` shows no direct port-53 send in any mode. Truncated answers are repeated over SOCKS5 `CONNECT`. Supersedes D-04's "no DNS leak by construction", which was false on every supported glibc. The wire-level capture case is written but not yet run (it needs root) |
+| ADD-11 | D-36 | §2.3 | TST-05, TST-03, TST-02 | **Verified** — `syscall()` routes every socket, send and receive call to its hook; `dprintf` and `pwritev2`/`preadv2` are proxied; `fdopen`, `sendfile` and `splice` are refused on a UDP socket; `pidfd_getfd` copies are adopted; raw and packet sockets, `MSG_MORE` and `UDP_SEGMENT` are refused. The leak client's 27 sends all fail with the proxy down, against 11 that reached the destination before |
 
 ---
 

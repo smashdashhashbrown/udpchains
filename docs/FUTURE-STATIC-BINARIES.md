@@ -47,8 +47,8 @@ association handling and header code.
   UDP through the proxy.
 - **Static binaries generally:** musl builds, busybox, binaries copied into minimal containers.
 - **Anyone relying on the no-bypass guarantee.** Because the supervisor sees system calls rather
-  than libc functions, it can refuse routes the shim cannot see: `io_uring`, `sendfile` and
-  `splice`, `pidfd_getfd` and raw sockets (D-18, D-21). This mode would be the stronger of the two.
+  than libc functions, it can refuse the routes the shim still cannot see: `io_uring`, and system
+  calls made without libc (D-36). This mode would be the stronger of the two.
 
 **Not a sandbox.** A program that wants to escape can still do so, for example by racing its own
 memory between the supervisor's check and a call the supervisor lets through, or by talking to
@@ -134,8 +134,8 @@ hooks.
 | `resolve.c` (989), `dns.c` (333) | Port-53 redirection, if decision 5 chooses it. The shim's resolver hooks (`dnshooks.c`, 735) do not apply in this mode. | +100–200 |
 | system-call tables | x86-64, then aarch64. aarch64 has no `dup2`, and neither has `send` or `recv` (libc uses `sendto` and `recvfrom`). | +100–150 |
 
-**Decisions this revisits:** FR-I-01 (`LD_PRELOAD` as the only mechanism), D-18 (raw sockets,
-refused in this mode), D-21 (its residual bypasses become refusable), D-22 (the program's own
+**Decisions this revisits:** FR-I-01 (`LD_PRELOAD` as the only mechanism), D-36 (its refusals,
+made at the system call instead of at libc, and `io_uring` refusable too), D-22 (the program's own
 resolver runs), D-23 (cookie checks, now across processes), D-26 (protected descriptors, not
 needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mode), and NFR-03
 (signal safety, moot outside the process).

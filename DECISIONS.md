@@ -31,7 +31,7 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-15](#d-15) | A connected socket receives only from its connected peer | Fidelity gap vs. an unhooked socket |
 | [D-16](#d-16) | A loopback or wildcard `BND.ADDR` is replaced by the proxy's address | Interop defect found against a remote proxy |
 | [D-17](#d-17) | A non-`FREE` fd-table entry at claim time is stale, and recycled | Defect: closes that bypass the hook (libuv) |
-| [D-18](#d-18) | Raw sockets are not intercepted; documented, not refused | Gap — SEC-01 vs. `SOCK_RAW` |
+| [D-18](#d-18) | Raw sockets are not intercepted; documented, not refused (superseded by D-36) | Gap — SEC-01 vs. `SOCK_RAW` |
 | [D-19](#d-19) | The wrapper proves the shim is loadable, not merely readable | Defect found on a VPS |
 | [D-20](#d-20) | RFC 1929 username/password authentication | Supersedes the FR-P-09 deferral in D-08 |
 | [D-21](#d-21) | Every route a UDP socket enters by is hooked; an untrackable one is refused | Review C1–C3 |
@@ -49,6 +49,7 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-33](#d-33) | Diagnostics: rate-limited, errors-only under `-q`, never into a reused fd 2 | Review L4, L5 |
 | [D-34](#d-34) | A forked child binds its private socket again | Review L6 |
 | [D-35](#d-35) | Hidden symbols and hardening; the proxy name uses its first address | Review L7 |
+| [D-36](#d-36) | Routes around the hooks are proxied, refused or adopted; raw sockets are refused | D-18's successor, D-21's residual |
 
 ---
 
@@ -626,8 +627,8 @@ of the proxy or the protocol, and so was invisible to a suite that supplies its 
 ## D-18
 ### Raw sockets are not intercepted, and v1 documents that rather than refusing
 
-**Date:** 2026-08-19 · **Status:** Accepted for v1, with a named successor · Prompted by trying
-`nmap` under the shim.
+**Date:** 2026-08-19 · **Status:** Superseded by [D-36](#d-36), which refuses raw sockets as the
+"v2 should refuse" paragraph below proposed · Prompted by trying `nmap` under the shim.
 
 **Context.** `is_intercepted_kind` claims `SOCK_DGRAM` in `AF_INET`/`AF_INET6` and nothing else. A
 `SOCK_RAW` socket is therefore never claimed, so its traffic goes direct.
@@ -852,7 +853,8 @@ would not prove that, since an untracked socket round-trips directly.
 - Other glibc-internal paths still bypass the hooks: stdio (`fdopen` on a UDP socket), and glibc's
   own DNS resolver, which since 2.34 lives inside libc and creates, connects and sends on its sockets
   through internal aliases. The resolver case is a DNS leak and is recorded separately. The shim
-  cannot see `io_uring` or `sendfile`/`splice` either.
+  cannot see `io_uring` or `sendfile`/`splice` either. *(D-22 closed the resolver case; D-36 closed
+  stdio, `sendfile`, `splice` and `pidfd_getfd`. `io_uring` remains.)*
 - An adopted socket that another process also still holds is re-pointed at this process's relay
   when first used, which also affects the other holder. That is the same shared-file-description
   problem FR-L-04 solves for `fork`, and it is not solved here.
@@ -1391,3 +1393,86 @@ first address `getaddrinfo` returns for a proxy hostname.
 loads rather than on first call, which moves a few microseconds to start-up; the hooks' `RTLD_NEXT`
 lookups are unaffected. The stack protector costs a comparison on return from functions with local
 arrays. The performance group stays within the NFR-04 budget.
+
+---
+
+## D-36
+### The routes around the hooks are proxied, refused or adopted; raw sockets are refused
+
+**Date:** 2026-10-20 · **Status:** Accepted · Successor to D-18, and closes most of D-21's residual.
+Amends FR-I-06, which let raw sockets pass through.
+
+**Context.** D-18 documented raw sockets rather than refusing them, and named refusal as the next
+step. D-21 listed routes that send on a UDP socket without passing through a send hook: stdio,
+`sendfile`, `splice`, `pidfd_getfd`, `io_uring`. Running each under the shim with the proxy stopped
+showed a more precise picture than the README gave:
+
+- On a socket connected through the `connect()` hook, `sendfile`, `splice`, stdio and `dprintf`
+  failed with `EDESTADDRREQ` rather than leaking. The kernel socket has no destination of its own
+  until its association is up, and after that it points at the relay, where data without a header
+  is discarded.
+- They **did** leak on a socket whose kernel socket had a destination of its own: one connected
+  with `syscall(SYS_connect)`, which went straight to the kernel.
+- `syscall(SYS_sendto)` and `syscall(SYS_sendmsg)` with an explicit destination leaked on any
+  socket.
+- A socket copied with `pidfd_getfd` was untracked, so every send on it leaked.
+- Four routes were not in D-21's list at all: `dprintf` (glibc writes through an internal call),
+  `pwritev2` at offset −1 (which on a socket is `writev`), and glibc's public aliases `__write` and
+  `__send`, which a program can link against directly.
+
+In all, 11 of the leak client's 27 sends reached the destination with the proxy down.
+
+**Decision.**
+
+- **Raw and packet sockets are refused.** `SOCK_RAW` and `SOCK_PACKET` in `AF_INET`/`AF_INET6`,
+  and any `AF_PACKET` socket, fail with `EPERM` and a diagnostic. `EPERM` is what a program without
+  `CAP_NET_RAW` already gets, so programs take the fallback they would take unprivileged. Such a
+  socket inherited across `exec`, received over `SCM_RIGHTS` or copied with `pidfd_getfd` is
+  closed, as D-29 does for ICMP and UDP-Lite.
+- **`syscall()` routes every number that has a hook to that hook**: the socket calls (`connect`,
+  `bind`, `getpeername`, `getsockname`), every send and receive, `pwritev2` and `preadv2` (64-bit
+  only, where the offset fits one argument), `sendfile`, `splice` and `pidfd_getfd`. D-23 had
+  routed only the lifecycle calls.
+- **Proxied by another route:** `dprintf`, `vdprintf` and their fortified forms are formatted into
+  the thread's scratch buffer and sent through the send path as one datagram, or fail with
+  `EMSGSIZE` above `max_datagram`. `pwritev2` and `preadv2` at offset −1 become `writev` and
+  `readv`; any other offset is `ESPIPE`, as on any socket, and a non-zero `RWF_*` flag is
+  `EOPNOTSUPP`.
+- **Refused on a UDP socket, with `EINVAL`:** `fdopen`, `sendfile` and `sendfile64` (as the output),
+  and `splice` in either direction (out of a UDP socket it would deliver the SOCKS header as data).
+- **Adopted:** a socket returned by `pidfd_getfd`. The hook makes the system call itself, because
+  glibc's wrapper is newer than the 2.34 floor (NFR-01a).
+- **glibc's public aliases** `__write`, `__read`, `__send`, `__connect`, `__close`, `__dup2` and
+  `__fcntl` are hooked and forwarded to their hooks. The `GLIBC_PRIVATE` ones cannot be linked by a
+  program and are left alone.
+- **`MSG_MORE` and a `UDP_SEGMENT` control message are refused with `EOPNOTSUPP`.** Each would make
+  the kernel build one datagram from several sends, or several from one, and the SOCKS header
+  cannot follow either. `setsockopt` stays unhooked (FR-I-07), so `UDP_CORK` and `UDP_GRO` set that
+  way remain documented limitations.
+
+**Why stdio is refused rather than emulated.** A stream built with `fopencookie` could route stdio
+through the hooks, but `fileno()` on it returns −1, and stdio's buffering would decide where one
+datagram ends and the next begins. Refusing at `fdopen`, the one point stdio can be stopped, is
+simpler and says plainly that it is unsupported.
+
+**What remains.**
+
+- `io_uring`. glibc has no wrapper for it, and liburing makes its own system calls.
+- System calls made without libc's `syscall()`: Go, static binaries, inline assembly. These are
+  the subject of [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md).
+
+**Consequences.**
+
+- A privileged program that opens a raw or packet socket for a purpose unrelated to the traffic
+  being proxied (a DHCP client, a network monitor) now cannot open it under `udpchains`.
+- A program that writes to a UDP socket through stdio, `sendfile` or `splice` now gets an error
+  where before it either failed with `EDESTADDRREQ` or sent directly.
+- 20 more exported symbols. The symbol gate checks each.
+- TST-06's D-23 test closed a socket behind the shim's back with `fclose(fdopen(fd))`, which is
+  now refused. It closes with libc's own `close`, looked up by handle so the hook is not reached.
+- Tests: 55 more assertions in TST-05, 13 more routes in the leak client with 2 more leak-test
+  checks, and 20 more checks in the symbol gate. With the 0.1.0 shim, 11 of the leak client's
+  27 sends reach the destination with the proxy down; with this one, none do.
+
+**Revisit if:** another libc entry point is found that moves data through a descriptor without a
+hook, or glibc gains an `io_uring` wrapper.

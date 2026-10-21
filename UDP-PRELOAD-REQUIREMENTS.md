@@ -124,7 +124,7 @@ out below (FR-P-05, FR-P-06).
 | FR-I-03 | M | The following SHALL be hooked: **send** — `sendto`, `sendmsg`, `sendmmsg`, `send`, `write`, `writev`; **receive** — `recvfrom`, `recvmsg`, `recvmmsg`, `recv`, `read`, `readv`. | inspection (`nm -D`) |
 | FR-I-04 | M | The following SHALL be hooked for lifecycle: `socket`, `connect`, `bind`, `close`, `close_range`, `dup`, `dup2`, `dup3`. | inspection |
 | FR-I-05 | M | `getpeername` and `getsockname` SHALL be hooked and SHALL report the destination and local address the application believes it has, never the relay's. | unit |
-| FR-I-06 | M | Only `SOCK_DGRAM` sockets in `AF_INET`/`AF_INET6` SHALL be intercepted. All other sockets (TCP, unix, netlink, raw) SHALL pass through untouched. | unit |
+| FR-I-06 | M | Only `SOCK_DGRAM` sockets in `AF_INET`/`AF_INET6` SHALL be intercepted. All other sockets (TCP, unix, netlink) SHALL pass through untouched. Raw and packet sockets, which would send below UDP, SHALL be refused (amended by D-36; originally listed with those passed through). | unit |
 | FR-I-07 | M | **The application's own fd SHALL be redirected to the relay**; the shim SHALL NOT maintain a shadow socket. Consequence: `poll`, `select`, `epoll_wait` and friends need no hooking and SHALL NOT be hooked. | inspection, integration |
 | FR-I-08 | S | Traffic to loopback destinations SHALL bypass the proxy by default, configurable. (An app talking to `127.0.0.1` almost never wants that tunnelled.) | unit |
 | FR-I-09 | C | Multicast and broadcast destinations SHALL bypass the proxy, since SOCKS5 cannot express them. | unit |
@@ -217,7 +217,7 @@ Documenting these prevents scope creep and sets user expectations honestly.
 | Statically-linked binaries | No libc to interpose on. Unfixable by this approach. Not a permanent non-goal: a supervisor mode that does not use `LD_PRELOAD` is planned after 0.1.0, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
 | Go binaries | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. Planned with static binaries, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
 | setuid/setgid binaries | The loader drops `LD_PRELOAD`. See SEC-06. |
-| Direct `syscall()` users | Same reason. Only interception at the system-call boundary can see them; out of scope for v1. Planned with static binaries, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
+| System calls made without libc | Same reason. Calls through libc's `syscall()` are routed to the hooks (D-36); a program issuing its own system calls (inline assembly) is beyond any preload. Planned with static binaries, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
 | Faithful ancillary data (`IP_PKTINFO`, `IP_RECVERR`, ECN) | Describes a socket the application does not actually own; no honest emulation exists. Returned empty (FR-F-11). |
 | GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`) | Tier 3. Modern QUIC stacks use these; they will fall back or fail. |
 | QUIC performance | Even when functional, a UDP flow through a TCP-based tunnel inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery. |

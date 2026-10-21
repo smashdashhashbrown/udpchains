@@ -47,8 +47,6 @@ They are design limits, not defects. A report showing one is worse than document
 
 - RFC 1929 credentials cross the network in cleartext.
 - Datagrams to and from the proxy's relay are not authenticated or encrypted.
-- Raw sockets (`SOCK_RAW`) are not intercepted (D-18).
-- `io_uring`, `sendfile`/`splice`, stdio on a UDP socket (`fdopen`), and sockets copied from
-  another process with `pidfd_getfd` bypass the hooks and can send directly (D-21).
+- `io_uring` bypasses the hooks and can send directly (D-36).
 - A target confined by an LSM on `exec` may be denied the shim and run unproxied (D-19).
 - Statically linked binaries, Go binaries and programs issuing raw system calls are not covered.

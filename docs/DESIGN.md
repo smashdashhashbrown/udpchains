@@ -92,8 +92,12 @@ Required by FR-I-03/04/05, gated at build time by TST-02 (`nm -D`).
 | Receive | `recvfrom`, `recvmsg`, `recvmmsg`, `recv`, `read`, `readv` |
 | Receive, fortified | `__recvfrom_chk`, `__recv_chk`, `__read_chk` (D-21) |
 | Lifecycle | `socket`, `connect`, `bind`, `close`, `close_range`, `closefrom`, `dup`, `dup2`, `dup3`, `fcntl`, `fcntl64` (D-21, D-23) |
-| Lifecycle via `syscall()` | `syscall` — only its `close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl` and `socket` numbers, routed to the hooks above; every other number goes straight to the kernel (D-23) |
+| Via `syscall()` | `syscall` — every number with a hook is routed to that hook: the lifecycle calls (D-23), and since D-36 the socket, send and receive calls, `sendfile`, `splice` and `pidfd_getfd`; every other number goes straight to the kernel |
 | Introspection | `getpeername`, `getsockname` |
+| Proxied by another route (D-36) | `dprintf`, `vdprintf`, `__dprintf_chk`, `__vdprintf_chk` (formatted, then one datagram through the send path); `pwritev2`, `pwritev64v2`, `preadv2`, `preadv64v2` (at offset −1, as `writev` and `readv`) |
+| Refused on a UDP socket (D-36) | `sendfile`, `sendfile64`, `splice`, `fdopen` — `EINVAL` |
+| Adopted (D-36) | `pidfd_getfd` |
+| glibc's public aliases (D-36) | `__write`, `__read`, `__send`, `__connect`, `__close`, `__dup2`, `__fcntl`, each forwarded to its hook |
 
 The fortified variants are what a `_FORTIFY_SOURCE` build calls in place of `recvfrom`, `recv` and
 `read`. glibc implements them with internal calls that no preload can see, so they are hooked
@@ -102,10 +106,15 @@ separately and funnel into the same receive path. `fcntl` is hooked only for `F_
 through.
 
 A UDP socket can also enter the process without passing through any of these hooks: it can be
-inherited across `exec`, or received as `SCM_RIGHTS` ancillary data. Inherited sockets are adopted at
-start-up, from `/proc/self/fd` or, without `/proc`, by probing the descriptor table. Received
-sockets are adopted by the `recvmsg`/`recvmmsg` hooks before the call returns. A socket that cannot
-be tracked is closed, never left to send directly (D-21).
+inherited across `exec`, received as `SCM_RIGHTS` ancillary data, or copied from another process
+with `pidfd_getfd`. Inherited sockets are adopted at start-up, from `/proc/self/fd` or, without
+`/proc`, by probing the descriptor table. Received sockets are adopted by the `recvmsg`/`recvmmsg`
+hooks before the call returns, and copied ones by the `pidfd_getfd` hook. A socket that cannot be
+tracked is closed, never left to send directly (D-21). So is a raw or packet socket, and the
+`socket()` hook refuses to create one with `EPERM` (D-36).
+
+What still reaches the kernel without a hook: `io_uring`, which has no glibc wrapper, and system
+calls made without libc's `syscall()` (D-36).
 
 **FR-I-02 is structural, not a checklist item.** Send and receive hooks are implemented in pairs, and
 the internal implementation funnels every send variant into one `udpc_core_send()` and every
@@ -465,7 +474,7 @@ debug level, no hex dumps. Lengths, addresses and header fields only.
 ## 8. Non-goals restated
 
 From §8 of the requirements, listed here because they constrain the design: statically-linked
-binaries, Go binaries, setuid/setgid targets, direct `syscall()` users, faithful ancillary data,
+binaries, Go binaries, setuid/setgid targets, system calls made without libc, faithful ancillary data,
 GSO/GRO, QUIC performance, TCP proxying, proxy chains. D-04 once put the resolver's TCP fallback
 outside scope as well; D-22 superseded that, and the shim's own resolver retries over SOCKS5
 `CONNECT` (§11). An application's own TCP DNS is still not proxied. The README states these plainly (acceptance criterion 6, D-05 R4).

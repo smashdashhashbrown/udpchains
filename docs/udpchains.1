@@ -245,31 +245,38 @@ port forward carries the control connection but not the UDP relay traffic.
 Report vulnerabilities privately, as described in
 .IR SECURITY.md .
 .SH LIMITATIONS
-Cannot help statically\-linked binaries, Go binaries, or programs issuing raw
-syscalls: there is no libc call to interpose on. Refuses setuid, setgid and
+Cannot help statically\-linked binaries, Go binaries, or programs making
+system calls without libc: there is no libc call to interpose on.
+Calls made through libc's
+.BR syscall (2)
+are routed to the hooks. Refuses setuid, setgid and
 capability\-endowed binaries, because the loader ignores
 .B LD_PRELOAD
 for them and running them would mean running them unproxied.
 .PP
-.B Raw sockets are not intercepted.
-A program using
-.B SOCK_RAW
-reaches the network directly. See
-.I DECISIONS.md
-D\-18.
+.B Raw and packet sockets are refused
+with
+.BR EPERM ,
+as they are without
+.BR CAP_NET_RAW .
 .PP
-.B Some sends bypass the shim.
-.BR io_uring ,
-.BR sendfile (2)
-and
+.B io_uring
+sends go straight to the kernel and bypass the shim.
+On a UDP socket,
+.BR sendfile (2),
 .BR splice (2)
-onto a UDP socket, and stdio on one
-.RB ( fdopen (3)),
-never reach an interposed function: on a socket not yet used through the
-shim, each sends directly, with no diagnostic.
-A socket copied from another process with
+and
+.BR fdopen (3)
+are refused with
+.BR EINVAL ;
+.BR dprintf (3)
+and
+.BR pwritev2 (2)
+are proxied, and a socket copied with
 .BR pidfd_getfd (2)
-is never tracked, so every send on it goes directly.
+is tracked. See
+.I DECISIONS.md
+D\-36.
 .PP
 TCP is not proxied. Multicast and broadcast fail with
 .BR ENETUNREACH .
@@ -283,9 +290,18 @@ is returned empty.
 UDP servers do not work: a server's socket is pointed at the proxy's relay,
 which its clients cannot reach.
 .PP
-.BR MSG_MORE ,
+.B MSG_MORE
+and a
+.B UDP_SEGMENT
+control message are refused with
+.BR EOPNOTSUPP .
 .BR UDP_CORK ,
-GSO and GRO corrupt data rather than failing.
+.B UDP_SEGMENT
+and
+.B UDP_GRO
+set with
+.BR setsockopt (2)
+corrupt data rather than failing.
 The first send or receive on a socket blocks while the proxy handshake runs,
 even on a non\-blocking socket.
 .B strict_loopback

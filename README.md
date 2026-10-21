@@ -182,26 +182,30 @@ To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 |---|---|
 | Statically linked binaries | No libc to interpose on. Planned after 0.1.0 as a supervisor mode ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)). |
 | Go binaries | Go makes system calls directly, not through libc. Planned with static binaries. |
-| Programs sending through `syscall()` | Same reason. Planned with static binaries. Creating, duplicating and closing descriptors through `syscall()` is tracked; sends and receives are not. |
+| Programs making system calls without libc (inline assembly) | Same reason. Planned with static binaries. Calls through libc's `syscall()` are proxied. |
 | setuid, setgid and file-capability binaries | The loader ignores `LD_PRELOAD` for them. `udpchains` refuses to run them. |
 | `ping` (ICMP datagram sockets), UDP-Lite | SOCKS5 cannot carry them. Socket creation fails with `EPROTONOSUPPORT`. |
-| Raw sockets (`nmap`, `traceroute`) | Not intercepted; traffic is sent **directly**. See below. |
+| Raw and packet sockets (`nmap`, `traceroute`) | SOCKS5 cannot carry them. Socket creation fails with `EPERM`, as it does without `CAP_NET_RAW`. |
 
 ### Traffic that bypasses the shim
 
-Every intercepted datagram is proxied or fails; there is no bypass list. These are not
+Every intercepted datagram is proxied or fails; there is no bypass list. Two routes are not
 intercepted:
 
-- **Raw sockets** (`SOCK_RAW`). Sent directly, with no diagnostic. Requires `CAP_NET_RAW`, so
-  unprivileged programs cannot do this, but a privileged process can reach the network directly.
-- **`io_uring`**, **`sendfile`/`splice`** onto a UDP socket, and **stdio** on a UDP socket
-  (`fdopen` then `fwrite`). On a socket not yet used through the shim, these send directly. On one
-  already pointed at the relay, the data arrives without a header and is lost. `fread` on such a
-  socket returns the SOCKS header as data.
-- **Sockets copied from another process with `pidfd_getfd`.** Not tracked; every send goes
-  directly.
+- **`io_uring`.** Sends submitted through a ring go straight to the kernel. glibc has no wrapper to
+  interpose on.
+- **System calls made without libc** (inline assembly, Go, static binaries).
 
-None of these needs root (`pidfd_getfd` needs permission to trace the other process).
+Calls that move data without a send or receive call are handled instead:
+
+| Call | On a UDP socket |
+|---|---|
+| `syscall()` with a socket, send or receive number | proxied, as the call itself |
+| `dprintf`, `vdprintf` | proxied, as one datagram |
+| `pwritev2`, `preadv2` at offset −1 | proxied, as `writev` and `readv` |
+| `__write`, `__send` and glibc's other public aliases | proxied, as the call itself |
+| `sendfile`, `splice`, `fdopen` (stdio) | refused with `EINVAL` |
+| `pidfd_getfd` | the copy is tracked like any other socket |
 
 ### Refused or limited traffic
 
@@ -221,9 +225,11 @@ None of these needs root (`pidfd_getfd` needs permission to trace the other proc
 ### Behaviour that differs from an unproxied program
 
 - **Ancillary data** (`msg_control`: `IP_PKTINFO`, `IP_RECVERR`, ECN) is returned empty.
-- **`MSG_MORE`, `UDP_CORK`, GSO and GRO (`UDP_SEGMENT`, `UDP_GRO`) corrupt data.** They are not
-  refused. Each call gets its own SOCKS header. QUIC rejects the damaged datagrams; plain UDP
-  programs do not.
+- **`MSG_MORE` and a `UDP_SEGMENT` control message are refused** with `EOPNOTSUPP`: each send
+  needs its own SOCKS header.
+- **`UDP_CORK`, `UDP_SEGMENT` and `UDP_GRO` set with `setsockopt` corrupt data.** `setsockopt` is
+  not intercepted, so they are not refused. QUIC rejects the damaged datagrams; plain UDP programs
+  do not.
 - **QUIC** through a TCP-based tunnel performs poorly even when it works.
 - **The first send or receive blocks** during the proxy handshake, even on a non-blocking socket.
   `connect_timeout` applies to each handshake step. A failed association setup is retried once.
@@ -235,10 +241,9 @@ None of these needs root (`pidfd_getfd` needs permission to trace the other proc
   still holds the port, the child sends from another port and warns once.
 - **A socket shared with another process** (inherited across `exec`, or passed over a Unix socket)
   is redirected for both processes on first use.
-- **A socket closed without a hook seeing it** (`fclose()` on an `fdopen()`ed socket, a raw
-  `close` system call) keeps its association until its descriptor number is used again, or the
-  program exits. `close()`, `close_range()`, `closefrom()` and `syscall(SYS_close)` release it at
-  once.
+- **A socket closed without a hook seeing it** (a `close` system call made without libc) keeps its
+  association until its descriptor number is used again, or the program exits. `close()`,
+  `close_range()`, `closefrom()` and `syscall(SYS_close)` release it at once.
 - **The shim's own descriptors are at 768 and up** (lower if the file limit is under 1024). The
   program cannot close them: `close()` gives `EBADF`, `close_range` skips them, `dup2()` onto one
   gives `EBUSY`. They are close-on-exec.
@@ -289,7 +294,7 @@ destination beyond this host's loopback.
   says so.
 - Proxy chains (multi-hop UDP). Planned after 0.1.0
   ([`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md)).
-- Static and Go binaries and `syscall()` users. Planned after 0.1.0
+- Static and Go binaries, and system calls made without libc. Planned after 0.1.0
   ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)).
 - Loopback and multicast bypass. Deferred ([`DECISIONS.md`](DECISIONS.md) D-05).
 

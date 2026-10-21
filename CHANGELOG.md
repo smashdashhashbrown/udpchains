@@ -9,6 +9,37 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) and mapped in
 [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
 
+## [Unreleased]
+
+### Changed
+
+- **Raw and packet sockets are refused** with `EPERM` and a diagnostic: `SOCK_RAW` and
+  `SOCK_PACKET` in `AF_INET`/`AF_INET6`, and any `AF_PACKET` socket. One inherited, received or
+  copied is closed. A privileged program that opens one now fails to (D-36, superseding D-18).
+- **`MSG_MORE` and a `UDP_SEGMENT` control message are refused** with `EOPNOTSUPP`, rather than
+  corrupting the datagram (D-36).
+- **`fdopen`, `sendfile` and `splice` are refused on a UDP socket** with `EINVAL` (D-36).
+
+### Fixed
+
+- **Sends that could reach the destination directly** with the proxy down (D-36). With the proxy
+  stopped, 11 of the leak client's 27 sends got through; now none do.
+  - `syscall()` with a socket, send or receive number went straight to the kernel. It is now routed
+    to the hook.
+  - `dprintf`, `vdprintf` and their fortified forms, and `pwritev2`/`preadv2` at offset −1, wrote
+    without a hook. They are now proxied.
+  - glibc's public aliases `__write`, `__read`, `__send`, `__connect`, `__close`, `__dup2` and
+    `__fcntl` bypassed the hooks. They are now hooked.
+  - A socket copied with `pidfd_getfd` was untracked. It is now adopted.
+  - `sendfile`, `splice` and stdio sent directly on a socket connected outside the `connect()` hook.
+    They are now refused.
+
+### Verification
+
+- 713 assertions across 17 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
+  leak client tries 13 more routes, and the leak test checks the raw-socket refusal. Clean under
+  ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
+
 ## [0.1.0] — 2026-10-20
 
 First release.
