@@ -50,6 +50,12 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-34](#d-34) | A forked child binds its private socket again | Review L6 |
 | [D-35](#d-35) | Hidden symbols and hardening; the proxy name uses its first address | Review L7 |
 | [D-36](#d-36) | Routes around the hooks are proxied, refused or adopted; raw sockets are refused | D-18's successor, D-21's residual |
+| [D-37](#d-37) | Chains are strict: a dead hop fails the call | FR-CH-02 |
+| [D-38](#d-38) | A chain is configured as `[hop]` sections, repeated `-p`, or a list in `UDPCHAINS_PROXY` | FR-CH-01, FR-CH-03 |
+| [D-39](#d-39) | Hops after the first are resolved by the hop before them, never here | FR-CH-04; amends D-27 |
+| [D-40](#d-40) | The relay fixup applies per hop; the loopback guard looks at the exit hop | FR-CH-07, FR-CH-08; amends D-16, D-05 R2 |
+| [D-41](#d-41) | Every layer of a received datagram is checked, or the datagram is dropped | FR-CH-06 |
+| [D-42](#d-42) | At most 8 hops; `max_datagram` stays the program's payload | FR-CH-13 |
 
 ---
 
@@ -1476,3 +1482,160 @@ simpler and says plainly that it is unsupported.
 
 **Revisit if:** another libc entry point is found that moves data through a descriptor without a
 hook, or glibc gains an `io_uring` wrapper.
+
+---
+
+## D-37
+### Chains are strict: a dead hop fails the call
+
+**Date:** 2026-10-20 · **Status:** Accepted · FR-CH-02.
+
+**Context.** proxychains offers `strict_chain`, `dynamic_chain` (skip dead proxies) and
+`random_chain`. The last two change the path a datagram takes without telling the program.
+
+**Decision.** udpchains supports strict chains only. Every hop must be reached, negotiated and
+associated, in order, or the call fails with an `errno`, and the diagnostic names the hop that
+failed. There is no setting to skip, reorder or randomise hops.
+
+**Why.** A skipped hop is a different path, and the hops a user lists are usually the point: each
+is a foothold into the next network. Skipping one either fails later in a confusing way or, worse,
+reaches the target by a route the user did not intend. This is D-05's argument against a bypass
+list, applied to the chain.
+
+**Revisit if:** a user needs failover between equivalent first hops. That would be a list of
+alternatives for one hop, not a looser chain.
+
+---
+
+## D-38
+### A chain is configured as `[hop]` sections, repeated `-p`, or a list in `UDPCHAINS_PROXY`
+
+**Date:** 2026-10-20 · **Status:** Accepted · FR-CH-01, FR-CH-03. Chosen by the maintainer from
+three formats: `[hop]` sections, repeated `proxy =` lines, and a `[ProxyList]` stanza.
+
+**Decision.**
+
+- **Config file.** The top-level `proxy`, `username`, `password` and `password_file` are hop 1,
+  exactly as in 0.1.0. Each `[hop]` section adds the next hop, and may hold only `proxy` (required),
+  `username`, `password` and `password_file`. A `[hop]` section needs a top-level `proxy` before it.
+  Other keys inside a `[hop]` section are an error, since they would look per-hop and are not.
+
+  ```ini
+  proxy = a.example:1080
+  username = alice
+  password_file = ~/.a.pw
+
+  [hop]
+  proxy = 10.0.0.5:1080
+  username = bob
+  password_file = ~/.b.pw
+  ```
+
+- **Command line.** `-p` may be repeated; the first is hop 1. Credentials are never accepted on the
+  command line (SEC-03).
+- **Environment.** `UDPCHAINS_PROXY` takes a comma-separated list. Hop *n*'s credentials, for *n*
+  from 2, are `UDPCHAINS_USERNAME_<n>`, `UDPCHAINS_PASSWORD_FILE_<n>` and `UDPCHAINS_PASSWORD_<n>`;
+  hop 1 keeps the unsuffixed names.
+- **Precedence** (FR-C-02). The list of hops comes whole from the highest layer that names a proxy:
+  a command line `-p` replaces a file's chain rather than editing it. Each hop's credentials come
+  from the highest layer that sets them, as hop 1's do in 0.1.0.
+- **Handoff to the shim** (D-27, D-25). The wrapper exports `UDPCHAINS_PROXY` as the list, hop 1 as
+  the address it resolved and later hops as written (D-39). Each hop's password is passed on by
+  location: `UDPCHAINS_PASSWORD_FILE_<n>`, or `UDPCHAINS_PASSWORD_CONFIG_<n>` naming the config file
+  whose *n*th hop holds it inline. A chain of one exports exactly the variables 0.1.0 exports.
+
+**Why `[hop]` sections.** A 0.1.0 file keeps its meaning without change, which FR-CH-01 requires,
+and nothing within a hop depends on line order. Repeated `proxy =` lines would make a `username`
+line's meaning depend on where it sits; a `[ProxyList]` line has nowhere safe to put a password.
+FR-CH-14 can still accept `[ProxyList]` later as a second spelling.
+
+**Until chains are carried on the wire** (the steps after this one in
+[`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md)), a configuration of more than one hop is
+parsed and checked, and then refused by both the wrapper and the shim, so it can never run as a
+chain of one.
+
+---
+
+## D-39
+### Hops after the first are resolved by the hop before them, never here
+
+**Date:** 2026-10-20 · **Status:** Accepted · FR-CH-04. Amends D-27.
+
+**Context.** D-27 has the wrapper resolve the proxy's name once and hand every program the address.
+For hop 1 that stands: it is the one host this machine must reach.
+
+**Decision.** Hop *k* (*k* ≥ 2) is reached through hop *k*−1, which is asked for it by `CONNECT`
+with the address as written: a numeric address as `ATYP 0x01` or `0x04`, a name as `ATYP 0x03`.
+The name is never looked up on this host. The wrapper checks only its form (host, or `[v6]`, and a
+port from 1 to 65535) and exports it unchanged.
+
+**Why.** A local lookup tells this host's resolver, and anyone watching it, which proxies the chain
+uses. And an internal name may resolve only inside the network behind the previous hop, which is
+often why the chain exists.
+
+**Consequence.** A misspelt later hop is reported by the hop before it (a `CONNECT` reply code),
+when the chain is first used, not by the wrapper before the program starts.
+
+---
+
+## D-40
+### The relay fixup applies per hop; the loopback guard looks at the exit hop
+
+**Date:** 2026-10-20 · **Status:** Accepted · FR-CH-07, FR-CH-08. Amends D-16 and D-05 R2.
+
+**Context.** D-16 replaces a wildcard `BND.ADDR`, or a loopback one from a proxy that is not on this
+host, with the proxy's own address. D-05 R2 warns about a loopback destination when the proxy is not
+local, because the proxy is where it will be resolved. Both read one flag, `proxy_is_local`.
+
+**Decision.**
+
+- **The flag is split.** *First hop is local* drives D-16 for hop 1, unchanged. *Exit is local*
+  drives D-05 R2: true only for a chain of one whose proxy is on this host. For a longer chain, a
+  loopback destination always warns, and `strict_loopback` refuses it.
+- **Hop *k* (*k* ≥ 2):** a wildcard `BND.ADDR` means hop *k*'s address as given, which may be a
+  name, carried as `ATYP 0x03` in the outer header. A loopback `BND.ADDR` is used only if hop *k*
+  was itself given as a loopback address, so that it is on the same host as hop *k*−1; otherwise it
+  is replaced by hop *k*'s address.
+
+**Open question.** Whether real proxies accept a name (`ATYP 0x03`) in a UDP header, which the
+wildcard case with a named hop needs. Interop will tell (FR-CH-T4).
+
+---
+
+## D-41
+### Every layer of a received datagram is checked, or the datagram is dropped
+
+**Date:** 2026-10-20 · **Status:** Accepted · FR-CH-06.
+
+**Decision.** A datagram from hop 1's relay is unwrapped outermost first. Each layer must have
+`RSV` 0 and `FRAG` 0, be well formed, and, for every layer but the innermost, name as its source
+the relay of the next hop as fixed up by D-40. A failure at any layer drops the whole datagram;
+nothing is delivered from it, and it is counted like any other dropped datagram. Only the innermost
+source reaches the program.
+
+Where the next relay is known only by name (D-40's wildcard case), the layer's address cannot be
+compared without resolving the name here, which D-39 forbids. Its port is compared, and the README
+says so.
+
+**Why.** This is where a chain could repeat a defect two tools in the comparison have: a header
+delivered as payload. An unchecked inner layer would also let anyone who can reach an intermediate
+relay inject datagrams with a forged inner source.
+
+---
+
+## D-42
+### At most 8 hops; `max_datagram` stays the program's payload
+
+**Date:** 2026-10-20 · **Status:** Accepted · FR-CH-13.
+
+**Decision.**
+
+- **At most 8 hops.** Each hop adds a TCP connection per socket (D-26's protected range holds about
+  256), a handshake to every connection setup, and up to 262 bytes of header. Eight is far beyond
+  any practical pivot.
+- **`max_datagram` keeps its meaning:** the largest payload the program may send. The shim's buffers
+  grow by the worst-case header for each hop.
+- **No automatic adjustment.** Each hop's buffer limits its payload plus the headers inside it, so
+  the smallest buffer in the chain decides what fits (D-12: configured, not discovered). The README
+  will say how to choose `max_datagram` for a chain.
+

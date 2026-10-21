@@ -142,7 +142,35 @@ out below (FR-P-05, FR-P-06).
 | FR-P-07 | M | When the application supplies a hostname the shim SHALL forward it as `ATYP=0x03` for proxy-side resolution rather than resolving locally. Where only an address is available (the normal UDP case) `ATYP=0x01`/`0x04` SHALL be used. | unit |
 | FR-P-08 | S | If the proxy has expired an idle association, the next send SHALL transparently re-associate rather than failing. | integration |
 | FR-P-09 | S | SOCKS5 username/password authentication (RFC 1929) SHALL be supported when configured. | unit |
-| FR-P-10 | C | Multiple proxies in a chain, as proxychains offers. Not required for v1; UDP chaining is only meaningful hop-by-hop and the complexity is disproportionate. **Planned after 0.1.0:** draft requirements, design impact and estimate in [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md). | — |
+| FR-P-10 | C | Multiple proxies in a chain, as proxychains offers. Not required for v1; UDP chaining is only meaningful hop-by-hop and the complexity is disproportionate. **In progress after 0.1.0:** the requirements are §2a, the design is D-37 to D-42. | — |
+
+
+## 2a. Functional requirements — Multi-hop chains (FR-P-10)
+
+Added after 0.1.0. Priorities are within this feature: **M** means chains are not done without
+it. Design: D-37 to D-42 in [`DECISIONS.md`](DECISIONS.md); background and estimate in
+[`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md).
+
+| ID | Pri | Requirement | Verify |
+|---|---|---|---|
+| FR-CH-01 | M | The configuration SHALL accept an ordered list of proxies: `[hop]` sections in a config file, `-p` repeated on the command line, a comma-separated `UDPCHAINS_PROXY` (D-38). A list of one SHALL behave exactly as 0.1.0 does: same wire bytes, same errors, same diagnostics, same environment handed to the program. | unit, integration |
+| FR-CH-02 | M | **Strict chains only.** If any hop cannot be reached, negotiated or associated, the call SHALL fail with an `errno`. There SHALL be no mode that skips a dead hop (D-37). | integration |
+| FR-CH-03 | M | Hop k (k ≥ 2) SHALL be reached by SOCKS5 `CONNECT` through hops 1 to k-1, and negotiated inside that tunnel, each hop with its own credentials. Credentials SHALL NOT be accepted on the command line (SEC-03), and the wrapper SHALL pass on where each password is, never the password (D-25, D-38). | integration |
+| FR-CH-04 | M | The address of hop k (k ≥ 2) SHALL be sent to hop k-1 as given, a name as `ATYP 0x03`, and SHALL NOT be resolved on this host (D-39). | unit, integration |
+| FR-CH-05 | M | A sent datagram SHALL carry n headers: the target innermost, then each hop's relay outwards. The payload SHALL still not be copied (D-11). | unit |
+| FR-CH-06 | M | On receive, every layer SHALL be checked: `FRAG` is 0, the header is well formed, and its source is the relay the next layer belongs to. A datagram failing any check at any layer SHALL be dropped and never partly delivered. Only the innermost source SHALL be reported to the program (D-41). | unit |
+| FR-CH-07 | M | The D-16 relay fixup SHALL apply per hop. A wildcard relay from hop k means hop k's own address. A loopback relay from hop k (k ≥ 2) is usable only if hop k was itself given as a loopback address; otherwise it SHALL be replaced by hop k's address (D-40). | unit |
+| FR-CH-08 | M | The loopback guard (D-05 R2) SHALL consider the **exit** hop: a loopback destination is resolved there (D-40). | unit |
+| FR-CH-09 | M | All n control connections SHALL be checked for liveness. The loss of any one SHALL count as the loss of the association, and re-association (FR-P-08) SHALL rebuild the whole chain. | integration |
+| FR-CH-10 | M | A forked child SHALL close its copies of all n control connections (D-31). All n SHALL be protected shim descriptors (D-26), and running out of protected descriptors SHALL be diagnosed, never become a direct send. | integration |
+| FR-CH-11 | M | Name resolution (D-22) SHALL use the chain: UDP queries through the chained relays, and the TCP fallback through a chained `CONNECT`. | integration |
+| FR-CH-12 | M | Diagnostics SHALL name the hop that failed. `-v` SHALL show the full path of each association. Never payload (NFR-05). | manual |
+| FR-CH-13 | S | Chains SHALL be at most 8 hops, and the README SHALL explain that the smallest buffer of any hop limits the datagram size, on top of 10 to 22 bytes of header per hop (more for a hop given by name) (D-42). | unit, inspection |
+| FR-CH-14 | S | The `[ProxyList]` stanza of FR-C-04 SHALL be accepted, so proxychains configurations carry over, for the strict-chain parts it shares. | unit |
+| FR-CH-T1 | M | The leak test (SEC-02) SHALL be repeated with each hop of a 3-hop chain dead in turn, also on the wire (`test_failclosed_capture.sh`). Nothing may reach the destination. | integration |
+| FR-CH-T2 | M | The hook matrix and the fidelity, lifecycle and thread tests SHALL pass through 2- and 3-hop fixture chains. | integration |
+| FR-CH-T3 | M | Fault tests SHALL cover: expiry at a middle hop, `FRAG` set at an inner layer, a forged inner source behind a genuine outer one, and a hop refusing `CONNECT`. | integration |
+| FR-CH-T4 | S | `make interop` SHALL run chains of real proxies, and record which can serve as an intermediate hop. | manual |
 
 ## 3. Functional requirements — Syscall fidelity
 
@@ -181,7 +209,7 @@ indistinguishable from an unhooked socket.
 | FR-C-01 | M | A wrapper executable SHALL provide `udpchains [-f config] <program> [args…]`, setting `LD_PRELOAD` and exec-ing the program. | integration |
 | FR-C-02 | M | Configuration SHALL be read from, in precedence order: command line, environment (`UDPCHAINS_PROXY`, `UDPCHAINS_CONFIG`), config file, built-in default. | unit |
 | FR-C-03 | M | An unparseable or missing configuration SHALL cause a clear diagnostic and refuse to run the program, rather than running it unproxied. | unit |
-| FR-C-04 | S | The config file SHALL accept a `proxychains.conf`-like `[ProxyList]` stanza so existing muscle memory transfers. Deferred with FR-P-10, whose chains it would list (FR-CH-14 in [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md)). | manual |
+| FR-C-04 | S | The config file SHALL accept a `proxychains.conf`-like `[ProxyList]` stanza so existing muscle memory transfers. Deferred with FR-P-10, whose chains it would list (FR-CH-14, §2a). | manual |
 | FR-C-05 | M | Diagnostics SHALL go to stderr with a recognizable prefix, at a verbosity set by `UDPCHAINS_QUIET`/`-q` and `UDPCHAINS_DEBUG`/`-v`. | manual |
 | FR-C-06 | S | At default verbosity the shim SHALL print one line per association established, naming the destination — so the operator can see that proxying is actually happening. | manual |
 
@@ -222,7 +250,7 @@ Documenting these prevents scope creep and sets user expectations honestly.
 | GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`) | Tier 3. Modern QUIC stacks use these; they will fall back or fail. |
 | QUIC performance | Even when functional, a UDP flow through a TCP-based tunnel inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery. |
 | TCP proxying | `proxychains-ng` already does this well. Composing the two is acceptable; reimplementing is not. |
-| Proxy chains (multi-hop UDP) | FR-P-10. Disproportionate complexity for v1. Not a permanent non-goal: planned after 0.1.0, see [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md). |
+| Proxy chains (multi-hop UDP) | FR-P-10. Disproportionate complexity for v1. Not a permanent non-goal: in progress after 0.1.0, see §2a. |
 
 ## 9. Testing
 
