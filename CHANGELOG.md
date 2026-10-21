@@ -13,7 +13,7 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Added
 
-- **Multi-hop chains** (D-37 to D-45), in progress. A single proxy behaves exactly as before.
+- **Multi-hop chains** (D-37 to D-46), in progress. A single proxy behaves exactly as before.
   - **Configuration:** `[hop]` sections in a config file, repeated `-p`, a comma-separated
     `UDPCHAINS_PROXY`, and credentials per hop, passed on by location like hop 1's (D-38).
   - **Setup:** each hop is reached by `CONNECT` through the hops before it and negotiated with
@@ -27,8 +27,11 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     layer of a reply is checked before any of it is delivered (D-41). The association holds a
     control connection per hop; losing any one loses the association, and a forked child closes
     all of them. The loopback guard considers the chain's last hop (D-40).
-  - **Not yet:** name lookups that need DNS fail under a chain, rather than go through its first
-    hop alone. The README and man page do not describe chains yet.
+  - **Name lookups** go through the chain, UDP queries and the TCP fallback alike (FR-CH-11).
+  - **Descriptors:** when the shim's protected range fills, as a long chain can make it, its
+    connection stays where it is, still protected, and a warning says so (D-46). At a low number
+    it can make a program's `dup2` onto that number fail with `EBUSY`; the warning names it.
+  - **Not yet:** the README and man page do not describe chains.
 
 ### Changed
 
@@ -55,12 +58,16 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 1700 assertions across 21 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
+- 1751 assertions across 21 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
   leak client tries 13 more routes, and the leak test checks the raw-socket refusal. The chain
   configuration adds 89 to unit-config and 5 to the wrapper tests, and chain setup has a new
   group, unit-chain, with 135, against chained fixture proxies. The integration tests run again
   through 2- and 3-hop fixture chains, 378 assertions each, and Valgrind and Helgrind run through
-  2 hops. Clean under ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
+  2 hops. Name lookups are tested through 2 hops (13 more resolver checks), the leak test runs
+  with each hop of a 3-hop chain dead in turn (12 more), and the fault tests add the chain's
+  faults and a full descriptor range (26 more). Clean under ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
+  On the wire, as root, the capture script saw no datagram and no lookup leave with each hop of a
+  3-hop chain dead in turn.
 
 ## [0.1.0] — 2026-10-20
 

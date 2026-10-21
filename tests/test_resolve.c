@@ -364,6 +364,10 @@ int main(int argc, char **argv)
 		t_res();
 		t_concurrency_and_fork();
 		t_getaddrinfo_a();
+	} else if (strcmp(mode, "one") == 0) {
+		TAP_GROUP("one lookup, for the shim's own account of it");
+		TAP_EQ_INT(gai("a.test", NULL, AF_INET, 0, SOCK_DGRAM, NULL, 0, NULL), 0,
+		           "a.test resolves");
 	} else if (strcmp(mode, "nodns") == 0) {
 		t_names_fail(EAI_FAIL, "D-22: no resolver configured -- names fail closed");
 	} else if (strcmp(mode, "down") == 0) {
@@ -376,7 +380,7 @@ int main(int argc, char **argv)
 		           EAI_AGAIN,
 		           "a truncated answer fails: its TCP retry cannot be proxied");
 	} else {
-		fprintf(stderr, "usage: test_resolve main|nodns|down|noconnect\n");
+		fprintf(stderr, "usage: test_resolve main|one|nodns|down|noconnect\n");
 		return 2;
 	}
 	TAP_DONE();

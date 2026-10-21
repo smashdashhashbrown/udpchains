@@ -351,25 +351,64 @@ static int band_base(void)
 	return cap >= 1024 ? 768 : (int)(cap / 2);
 }
 
+/* FR-CH-10: a chain holds a control connection per hop for every socket, so
+ * the band can fill.  Neither case below is a route to a direct send -- the
+ * descriptor still carries the shim's own traffic to hop 1 -- but each loses
+ * part of D-26's protection, so each is reported (D-46). */
+static struct udpc_ratelimit g_rl_band;
+
+static void note_unmoved(int fd, int base, int err)
+{
+	char note[64];
+	unsigned n = udpc_ratelimit(&g_rl_band);
+
+	if (n == 0)
+		return;
+	udpc_warn("no free descriptor at %d or above for the shim's own "
+	          "connection (%s), so it stays at fd %d among the program's "
+	          "descriptors; still protected from its close and dup2 calls "
+	          "(D-46)%s",
+	          base, strerror(err), fd, udpc_ratelimit_note(n, note, sizeof(note)));
+}
+
+static void note_unmarked(int fd)
+{
+	char note[64];
+	unsigned n = udpc_ratelimit(&g_rl_band);
+
+	if (n == 0)
+		return;
+	udpc_warn("the shim's own connection at fd %d cannot be marked as "
+	          "its own, so a close-all loop in the program could take it; "
+	          "the association would then be re-established (D-46)%s",
+	          fd, udpc_ratelimit_note(n, note, sizeof(note)));
+}
+
 int udpc_fd_shim_adopt(int fd)
 {
 	struct udpc_fdent *e;
-	int hi, st;
+	int base, hi, st;
 
 	if (fd < 0)
 		return fd;
 
-	hi = REAL_FCNTL(fd, F_DUPFD_CLOEXEC, band_base());
+	base = band_base();
+	hi = REAL_FCNTL(fd, F_DUPFD_CLOEXEC, base);
 	if (hi >= 0 && (unsigned)hi < UDPC_FD_MAX) {
 		REAL_CLOSE(fd);
 		fd = hi;
 	} else if (hi >= 0) {
 		REAL_CLOSE(hi);
+		note_unmoved(fd, base, EMFILE);
+	} else if (fd < base) {
+		note_unmoved(fd, base, errno);
 	}
 
 	e = entry_for(fd, true);
-	if (e == NULL)
-		return fd; /* cannot be marked: works, but unprotected */
+	if (e == NULL) {
+		note_unmarked(fd); /* works, but unprotected */
+		return fd;
+	}
 
 	/* The kernel just gave us this number, so anything recorded against it
 	 * is stale. */

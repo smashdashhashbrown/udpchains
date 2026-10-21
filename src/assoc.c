@@ -406,39 +406,12 @@ static int reprivatize_socket(int fd, struct udpc_fdent *e, int *out_errno)
 	return 0;
 }
 
-/* The relays an association's datagrams pass, in order: hop 1's, which is what
- * a chain of one has always printed, then each later hop's, by name where it
- * is one -- "127.0.0.1:40001, then 10.0.0.5:40002, then proxy.internal:40003". */
-static void chain_path(const struct udpc_socks_chain *ch, char *buf, size_t len)
-{
-	char one[UDPC_ADDRSTRLEN];
-	size_t off = 0;
-	unsigned k;
-
-	buf[0] = '\0';
-	for (k = 0; k < ch->n && k < UDPC_CHAIN_MAX && off < len; k++) {
-		const struct udpc_socks_addr *r = &ch->relay[k];
-		int w;
-
-		if (r->named)
-			w = snprintf(buf + off, len - off, "%s%s:%u",
-			             k ? ", then " : "", r->host, r->port);
-		else
-			w = snprintf(buf + off, len - off, "%s%s", k ? ", then " : "",
-			             udpc_addr_str((const struct sockaddr *)&r->sa, one,
-			                           sizeof(one)));
-		if (w < 0)
-			break;
-		off += (size_t)w;
-	}
-}
-
 static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg,
                      int *out_errno)
 {
 	struct udpc_assoc *a;
 	const struct sockaddr *bind_addr = NULL;
-	char abuf[UDPC_ADDRSTRLEN], rbuf[UDPC_CHAIN_MAX * (UDPC_ADDRSTRLEN + 270)];
+	char abuf[UDPC_ADDRSTRLEN], rbuf[UDPC_SOCKS_CHAIN_PATH_MAX];
 
 	if (loopback_guard(cfg, e, out_errno) != 0)
 		return -1;
@@ -492,7 +465,7 @@ static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg
 	 * datagram limit is reported too, because a mismatch with the proxy's
 	 * real limit shows up as silent drops (D-12).  For a chain, the relay
 	 * of every hop, in order (FR-CH-12). */
-	chain_path(&a->chain, rbuf, sizeof(rbuf));
+	udpc_socks_chain_path(&a->chain, rbuf, sizeof(rbuf));
 	if (atomic_load_explicit(&e->connected, memory_order_acquire))
 		udpc_info("association up: fd %d -> %s via relay %s "
 		          "(max_datagram %zu)",

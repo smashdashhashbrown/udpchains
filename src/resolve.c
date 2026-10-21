@@ -36,7 +36,7 @@ struct pool_ent {
 	bool used;  /* holds a live association */
 	bool busy;  /* owned by a lookup, or being established */
 	bool stale; /* inherited across fork: close, never use */
-	int ctl_fd;
+	struct udpc_socks_chain chain; /* a control connection per hop */
 	int udp_fd;
 	long last_used; /* CLOCK_MONOTONIC seconds */
 };
@@ -130,54 +130,65 @@ static void init_once(void)
 
 static void ent_close(struct pool_ent *e)
 {
+	unsigned k;
+
 	udpc_fd_shim_close(e->udp_fd);
-	udpc_fd_shim_close(e->ctl_fd);
-	e->udp_fd = e->ctl_fd = -1;
+	for (k = 0; k < e->chain.n && k < UDPC_CHAIN_MAX; k++)
+		udpc_fd_shim_close(e->chain.control_fd[k]);
+	e->udp_fd = -1;
+	e->chain.n = 0;
 	e->used = e->stale = false;
 }
 
-/* Opens a UDP association and a socket connected to its relay.  The handshake
- * is the shim's own traffic, so it runs under the re-entry guard (guard.h). */
+/* Opens a UDP association through every hop of the chain, and a socket
+ * connected to hop 1's relay (FR-CH-11).  The handshake is the shim's own
+ * traffic, so it runs under the re-entry guard (guard.h). */
 static int ent_establish(const struct udpc_config *cfg, struct pool_ent *e,
                          int *err)
 {
-	struct udpc_socks_conn conn;
-	char rbuf[UDPC_ADDRSTRLEN], dbuf[UDPC_ADDRSTRLEN];
+	struct udpc_socks_chain ch;
+	const struct sockaddr *relay;
+	char rbuf[UDPC_SOCKS_CHAIN_PATH_MAX], dbuf[UDPC_ADDRSTRLEN];
 	socklen_t rlen;
+	unsigned k;
 	int udp, rc;
 
 	UDPC_GUARD_ENTER();
-	rc = udpc_socks_associate(cfg, NULL, &conn, err);
+	rc = udpc_socks_associate_chain(cfg, NULL, &ch, err);
 	UDPC_GUARD_LEAVE();
 	if (rc != 0)
 		return -1;
 
-	rlen = udpc_sa_len((const struct sockaddr *)&conn.relay);
-	udp = REAL_SOCKET(conn.relay.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-	if (udp < 0 || rlen == 0 ||
-	    REAL_CONNECT(udp, (const struct sockaddr *)&conn.relay, rlen) != 0) {
+	relay = (const struct sockaddr *)&ch.relay[0].sa;
+	rlen = udpc_sa_len(relay);
+	udp = REAL_SOCKET(relay->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (udp < 0 || rlen == 0 || REAL_CONNECT(udp, relay, rlen) != 0) {
 		*err = (udp < 0 || rlen == 0) ? (udp < 0 ? errno : EAFNOSUPPORT)
 		                              : errno;
 		if (udp >= 0)
 			REAL_CLOSE(udp);
-		REAL_CLOSE(conn.control_fd);
+		for (k = 0; k < ch.n; k++)
+			REAL_CLOSE(ch.control_fd[k]);
 		return -1;
 	}
 
-	/* Both are the shim's own descriptors, kept out of the application's
+	/* All are the shim's own descriptors, kept out of the application's
 	 * way and out of its close-all loops (D-26). */
-	e->ctl_fd = udpc_fd_shim_adopt(conn.control_fd);
+	e->chain = ch;
+	for (k = 0; k < ch.n; k++)
+		e->chain.control_fd[k] = udpc_fd_shim_adopt(ch.control_fd[k]);
 	e->udp_fd = udpc_fd_shim_adopt(udp);
 	e->used = true;
 	e->stale = false;
 	e->last_used = (long)(now_ms() / 1000);
 
-	/* FR-C-06: one line per association, resolver ones included. */
+	/* FR-C-06: one line per association, resolver ones included, naming
+	 * every hop's relay (FR-CH-12). */
+	udpc_socks_chain_path(&e->chain, rbuf, sizeof(rbuf));
 	udpc_info("resolver association up: dns %s via relay %s",
 	          udpc_addr_str((const struct sockaddr *)&cfg->dns, dbuf,
 	                        sizeof(dbuf)),
-	          udpc_addr_str((const struct sockaddr *)&conn.relay, rbuf,
-	                        sizeof(rbuf)));
+	          rbuf);
 	return 0;
 }
 
@@ -211,7 +222,8 @@ static int acquire(const struct udpc_config *cfg, long long deadline, int *err)
 			struct pool_ent *e = &g_pool[empty];
 
 			e->busy = true;
-			e->ctl_fd = e->udp_fd = -1;
+			e->chain.n = 0;
+			e->udp_fd = -1;
 			pthread_mutex_unlock(&g_mu);
 			if (ent_establish(cfg, e, err) == 0)
 				return empty;
@@ -247,16 +259,13 @@ static void release(int i, bool broken)
 }
 
 /* FR-P-08, for the pool: an entry idle long enough to have been expired by the
- * proxy is checked before use, and replaced if the proxy has dropped it. */
+ * proxy is checked before use, and replaced if any hop has dropped it
+ * (FR-CH-09). */
 static int revalidate(const struct udpc_config *cfg, struct pool_ent *e, int *err)
 {
-	struct udpc_socks_conn probe;
-
 	if ((long)(now_ms() / 1000) - e->last_used < UDPC_IDLE_PROBE_SECS)
 		return 0;
-	memset(&probe, 0, sizeof(probe));
-	probe.control_fd = e->ctl_fd;
-	if (udpc_socks_control_alive(&probe))
+	if (udpc_socks_chain_alive(&e->chain))
 		return 0;
 
 	udpc_debug("resolver association expired by the proxy; re-associating");
@@ -305,13 +314,17 @@ static int udp_exchange(const struct udpc_config *cfg, struct pool_ent *e,
                         struct xfer *x, size_t nx, long long deadline,
                         bool *broken, int *err)
 {
-	uint8_t hdr[UDPC_SOCKS_HDR_MAX];
-	uint8_t rx[UDP_RX_MAX];
+	uint8_t hdr[UDPC_SOCKS_CHAIN_HDR_MAX];
+	/* Room for an answer as a chain of one has always had it, plus a
+	 * header for each later hop. */
+	uint8_t rx[UDP_RX_MAX + UDPC_SOCKS_CHAIN_HDR_MAX - UDPC_SOCKS_HDR_MAX];
+	size_t rxcap = UDP_RX_MAX + (e->chain.n - 1) * UDPC_SOCKS_HDR_MAX;
 	ssize_t hl;
 	size_t i;
 	int attempt;
 
-	hl = udpc_socks_encode(hdr, sizeof(hdr), (const struct sockaddr *)&cfg->dns);
+	hl = udpc_socks_encode_chain(hdr, sizeof(hdr), &e->chain,
+	                             (const struct sockaddr *)&cfg->dns, NULL);
 	if (hl < 0) {
 		*err = errno;
 		return -1;
@@ -350,27 +363,36 @@ static int udp_exchange(const struct udpc_config *cfg, struct pool_ent *e,
 			return 0;
 
 		while (pending > 0 && (now = now_ms()) < adl) {
-			struct pollfd pfd[2];
+			struct pollfd pfd[1 + UDPC_CHAIN_MAX];
 			struct udpc_socks_hdr sh;
+			enum udpc_socks_drop why;
+			unsigned k, layer;
 			ssize_t n, sl;
 			size_t len;
-			bool clipped;
+			bool clipped, gone = false;
 
 			pfd[0].fd = e->udp_fd;
 			pfd[0].events = POLLIN;
 			pfd[0].revents = 0;
-			pfd[1].fd = e->ctl_fd;
-			pfd[1].events = POLLRDHUP;
-			pfd[1].revents = 0;
-			if (poll(pfd, 2, (int)(adl - now)) < 0) {
+			for (k = 0; k < e->chain.n; k++) {
+				pfd[1 + k].fd = e->chain.control_fd[k];
+				pfd[1 + k].events = POLLRDHUP;
+				pfd[1 + k].revents = 0;
+			}
+			if (poll(pfd, 1 + e->chain.n, (int)(adl - now)) < 0) {
 				if (errno == EINTR)
 					continue;
 				*err = errno;
 				return -1;
 			}
-			/* The proxy ties the association to the control
-			 * connection (§0.5); once that closes, no reply is coming. */
-			if (pfd[1].revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) {
+			/* Each hop ties its association to its control
+			 * connection (§0.5); once any closes, no reply is
+			 * coming (FR-CH-09). */
+			for (k = 0; k < e->chain.n; k++)
+				if (pfd[1 + k].revents &
+				    (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL))
+					gone = true;
+			if (gone) {
 				*broken = true;
 				*err = ECONNRESET;
 				return -1;
@@ -378,7 +400,7 @@ static int udp_exchange(const struct udpc_config *cfg, struct pool_ent *e,
 			if (!(pfd[0].revents & (POLLIN | POLLERR)))
 				continue;
 
-			n = REAL_RECV(e->udp_fd, rx, sizeof(rx), MSG_DONTWAIT | MSG_TRUNC);
+			n = REAL_RECV(e->udp_fd, rx, rxcap, MSG_DONTWAIT | MSG_TRUNC);
 			if (n < 0) {
 				if (association_gone(errno)) {
 					*broken = true;
@@ -387,14 +409,17 @@ static int udp_exchange(const struct udpc_config *cfg, struct pool_ent *e,
 				}
 				continue;
 			}
-			clipped = (size_t)n > sizeof(rx);
-			len = clipped ? sizeof(rx) : (size_t)n;
+			clipped = (size_t)n > rxcap;
+			len = clipped ? rxcap : (size_t)n;
 
 			/* Everything below is untrusted: from the relay, but
-			 * claiming to be from the resolver.  It must say so in
-			 * its SOCKS header and then answer an outstanding query
-			 * exactly (dns.h), or it is dropped. */
-			sl = udpc_socks_decode(rx, len, &sh);
+			 * claiming to be from the resolver.  Every layer must
+			 * come from the hop it names (D-41), the innermost must
+			 * say it is from the resolver, and the answer must then
+			 * match an outstanding query exactly (dns.h), or it is
+			 * dropped. */
+			sl = udpc_socks_decode_chain(rx, len, &e->chain, &sh, &layer,
+			                             &why);
 			if (sl < 0 || sh.frag != 0 || !sh.addr_valid ||
 			    !from_resolver((const struct sockaddr *)&sh.addr, cfg))
 				continue;
@@ -535,19 +560,6 @@ static void note_no_dns(void)
 		         "resolve names directly (D-22)");
 }
 
-/* Until the resolver's own association is carried through a chain (step 5 of
- * docs/FUTURE-UDP-CHAINS.md), a lookup that needs DNS fails with a chain
- * rather than go through its first hop alone (D-37, FR-CH-11). */
-static void note_no_chain_dns(void)
-{
-	static atomic_flag once = ATOMIC_FLAG_INIT;
-
-	if (!atomic_flag_test_and_set(&once))
-		udpc_err("a name lookup needs DNS, which is not carried through a "
-		         "chain of proxies yet; refusing to resolve names through "
-		         "the first proxy alone or directly");
-}
-
 /* Runs a set of queries to completion.  Returns 0 with every answer delivered,
  * or -1 with *st set.  There is no path from here to a direct query. */
 static int transact(struct xfer *x, size_t nx, enum udpc_res_status *st)
@@ -564,11 +576,6 @@ static int transact(struct xfer *x, size_t nx, enum udpc_res_status *st)
 	}
 	if (!cfg->dns_set) {
 		note_no_dns();
-		*st = UDPC_RES_FAIL;
-		return -1;
-	}
-	if (cfg->nextra > 0) {
-		note_no_chain_dns();
 		*st = UDPC_RES_FAIL;
 		return -1;
 	}

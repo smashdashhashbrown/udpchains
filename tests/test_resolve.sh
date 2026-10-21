@@ -54,6 +54,7 @@ start() {
 # NOT --quiet: dnsd's query log is the evidence.
 DNS=$(start dnsd "$DNSD" --port 0)
 PROXY=$(start proxy "$SOCKS5D" --port 0 --quiet)
+PROXY2=$(start proxy2 "$SOCKS5D" --port 0 --quiet)
 NOCONNECT=$(start noconnect "$SOCKS5D" --port 0 --quiet --no-connect)
 
 queries() { grep -c "^QUERY $1" "$TMP/dnsd.err" 2>/dev/null || true; }
@@ -63,12 +64,17 @@ cat > "$TMP/hosts" <<EOF
 203.0.113.5	hostsonly.test
 EOF
 
-# Runs the probe in one mode under the shim.  Extra arguments are env settings.
+# The wrapper's -p arguments for a proxy, or a comma-separated chain of them.
+popts() { echo "$1" | sed 's/^/-p /; s/,/ -p /g'; }
+
+# Runs the probe in one mode under the shim.  proxy may be a chain, as
+# host:port,host:port.  Extra arguments are env settings.
 probe() {
 	mode=$1; proxy=$2; shift 2
+	# shellcheck disable=SC2046 # popts is split into words on purpose
 	env -u UDPCHAINS_DNS "$@" UDPCHAINS_HOSTS_FILE="$TMP/hosts" \
 		UDPCHAINS_DNS_SEARCH=search.test UDPCHAINS_DNS_TIMEOUT=2000 \
-		timeout 120 "$WRAPPER" -p "$proxy" "$PROBE" "$mode" \
+		timeout 120 "$WRAPPER" $(popts "$proxy") "$PROBE" "$mode" \
 		> "$TMP/$mode.tap" 2>&1
 	rc=$?
 	sed 's/^/#   /' "$TMP/$mode.tap"
@@ -107,18 +113,76 @@ else
 fi
 check "no TCP query reached the resolver" "$(queries tcp)" "$before"
 
+# --- FR-CH-11: lookups through a chain ----------------------------------------
+CHAIN="127.0.0.1:$PROXY,127.0.0.1:$PROXY2"
+
+echo "# chain main: every entry point, through 2 hops"
+udp_before=$(queries udp)
+tcp_before=$(queries tcp)
+if probe main "$CHAIN" UDPCHAINS_DNS="127.0.0.1:$DNS"; then
+	ok "test_resolve main passes through 2 hops"
+else
+	notok "test_resolve main through 2 hops"
+fi
+[ "$(queries udp)" -gt "$udp_before" ] && ok "dnsd answered UDP queries through the chain" \
+	|| notok "dnsd saw no UDP queries through the chain"
+[ "$(queries tcp)" -gt "$tcp_before" ] && ok "dnsd answered TCP queries through a chained CONNECT" \
+	|| notok "dnsd saw no TCP query through the chain: the truncation fallback did not run"
+# shellcheck disable=SC2046
+UDPCHAINS_DNS="127.0.0.1:$DNS" UDPCHAINS_HOSTS_FILE="$TMP/hosts" \
+	timeout 60 "$WRAPPER" -v $(popts "$CHAIN") "$PROBE" one > "$TMP/one.tap" 2>&1
+grep -q "resolver association up: dns 127.0.0.1:$DNS via relay .*, then " "$TMP/one.tap" &&
+	ok "the resolver's association line names both relays (FR-CH-12)" ||
+	notok "no resolver association line naming both relays"
+# FR-CH-T1 for lookups: each hop dead in turn.  Hop 2 dead means hop 1's
+# CONNECT to it fails; either way the chain is never set up.
+for dead in "127.0.0.1:9,127.0.0.1:$PROXY2" "127.0.0.1:$PROXY,127.0.0.1:9"; do
+	echo "# chain down: $dead"
+	before=$(queries "")
+	if probe down "$dead" UDPCHAINS_DNS="127.0.0.1:$DNS"; then
+		ok "test_resolve down passes with $dead"
+	else
+		notok "test_resolve down with $dead"
+	fi
+	check "no query reached the resolver" "$(queries "")" "$before"
+done
+
+echo "# chain noconnect: the exit hop refuses CONNECT"
+before=$(queries tcp)
+if probe noconnect "127.0.0.1:$PROXY,127.0.0.1:$NOCONNECT" UDPCHAINS_DNS="127.0.0.1:$DNS"; then
+	ok "test_resolve noconnect passes with the exit hop refusing CONNECT"
+else
+	notok "test_resolve noconnect with the exit hop refusing CONNECT"
+fi
+check "no TCP query reached the resolver" "$(queries tcp)" "$before"
+
+echo "# chain noconnect: hop 1 refuses CONNECT, so hop 2 cannot be reached"
+before=$(queries "")
+if probe down "127.0.0.1:$NOCONNECT,127.0.0.1:$PROXY2" UDPCHAINS_DNS="127.0.0.1:$DNS"; then
+	ok "test_resolve down passes with hop 1 refusing CONNECT"
+else
+	notok "test_resolve down with hop 1 refusing CONNECT"
+fi
+check "no query reached the resolver" "$(queries "")" "$before"
+
 # strace sees every connect/send the probe makes.  None may name the resolver's
 # port, or port 53: a query addressed to a resolver directly is a leak whatever
 # answers it.
 if command -v strace > /dev/null 2>&1; then
-	for m in main down; do
-		if [ $m = main ]; then p="127.0.0.1:$PROXY"; else p="127.0.0.1:9"; fi
+	# chain: main through 2 hops, where the process connects only to hop 1.
+	for m in main down chain; do
+		case $m in
+		main) p="127.0.0.1:$PROXY"; mode=main ;;
+		down) p="127.0.0.1:9"; mode=down ;;
+		chain) p=$CHAIN; mode=main ;;
+		esac
+		# shellcheck disable=SC2046
 		env -u UDPCHAINS_DNS UDPCHAINS_DNS="127.0.0.1:$DNS" \
 			UDPCHAINS_HOSTS_FILE="$TMP/hosts" UDPCHAINS_DNS_SEARCH=search.test \
 			UDPCHAINS_DNS_TIMEOUT=2000 \
 			timeout 180 strace -f -qq -o "$TMP/strace.$m" \
 			-e trace=connect,sendto,sendmsg,sendmmsg \
-			"$WRAPPER" -p "$p" "$PROBE" $m > /dev/null 2>&1
+			"$WRAPPER" $(popts "$p") "$PROBE" $mode > /dev/null 2>&1
 		direct=$(grep -cE "htons\((53|$DNS)\)" "$TMP/strace.$m" || true)
 		check "strace ($m): the process never addressed a resolver directly" \
 			"$direct" "0"

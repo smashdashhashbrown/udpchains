@@ -1071,7 +1071,9 @@ static int open_tunnel(const struct udpc_config *cfg, const struct budget *b,
 		dlen = encode_target(dst, sizeof(dst), &h->addr);
 		if (dlen < 0 ||
 		    request(fd, b, CMD_CONNECT, dst, (size_t)dlen, &bnd) != 0) {
-			snprintf(what, sizeof(what), "hop %u could not reach it", j);
+			/* Refused or unreachable: the reply code says
+			 * which, as the errno. */
+			snprintf(what, sizeof(what), "hop %u's CONNECT to it failed", j);
 			hop_failed(h, what, errno);
 			goto fail;
 		}
@@ -1325,6 +1327,31 @@ bool udpc_socks_chain_alive(const struct udpc_socks_chain *chain)
 		if (!control_alive(chain->control_fd[k]))
 			return false;
 	return true;
+}
+
+void udpc_socks_chain_path(const struct udpc_socks_chain *ch, char *buf,
+                           size_t len)
+{
+	char one[UDPC_ADDRSTRLEN];
+	size_t off = 0;
+	unsigned k;
+
+	buf[0] = '\0';
+	for (k = 0; k < ch->n && k < UDPC_CHAIN_MAX && off < len; k++) {
+		const struct udpc_socks_addr *r = &ch->relay[k];
+		int w;
+
+		if (r->named)
+			w = snprintf(buf + off, len - off, "%s%s:%u",
+			             k ? ", then " : "", r->host, r->port);
+		else
+			w = snprintf(buf + off, len - off, "%s%s", k ? ", then " : "",
+			             udpc_addr_str((const struct sockaddr *)&r->sa, one,
+			                           sizeof(one)));
+		if (w < 0)
+			break;
+		off += (size_t)w;
+	}
 }
 
 /* --- chain codec (FR-CH-05, FR-CH-06) -------------------------------------- */

@@ -25,7 +25,7 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 1700 assertions across 21 groups (`tests/run.sh`), all passing, plus the 91-check
+**Test totals:** 1751 assertions across 21 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
@@ -46,10 +46,10 @@ from a run rather than editing it by hand.
 | FR-CH-T2 through 3 hops, the third given as `localhost` | 378 |
 | FR-CH-08 exit-hop loopback guard | 2 checks |
 | FR-P-09 auth | 15 |
-| D-22 resolve | 11 checks, over four programs making 99 assertions of their own |
+| D-22 resolve | 24 checks, over nine program runs making 211 assertions of their own |
 | wrapper loadability | 17 |
-| TST-03 leak | 11 checks |
-| fault injection | 17 |
+| TST-03 leak | 23 checks |
+| fault injection | 43 |
 | TST-04 real tools | 2 run, 3 skipped (automated, against the fixture) |
 | NFR-04 latency benchmark | reported, not a gate (D-08) |
 | TST-02 symbol check | 71 (build gate, `make check`) |
@@ -166,13 +166,13 @@ from a run rather than editing it by hand.
 | ADD-01 | D-05 R1 | §6.2 | TST-05 | **Verified** — multicast and broadcast fail `ENETUNREACH` with a specific diagnostic; IPv4 and IPv6 |
 | ADD-02 | D-05 R2 | §6.3 | unit-config | **Verified** — proxy locality is computed at config time; `strict_loopback` promotes the warning to an error |
 | ADD-03 | D-05 R4 | — | manual | **Verified** — README "What does not work" |
-| ADD-04 | D-06 | §9.1 | — | **Verified** — fixture with fault-injection modes; `test_faults.sh` runs four scenarios, plus the D-33 diagnostics checks |
+| ADD-04 | D-06 | §9.1 | — | **Verified** — fixture with fault-injection modes; `test_faults.sh` runs four scenarios against a single proxy and six against a 3-hop chain (FR-CH-T3, FR-CH-10), plus the D-33 diagnostics checks |
 | ADD-05 | D-10 | §7.1 | unit-config | **Verified** |
 | ADD-06 | D-12 | §5.4, §7.3 | TST-05, faults | **Verified** — includes the case where the proxy's real limit is smaller than the configured one |
 | ADD-07 | D-04 | — | manual | **Verified** — README documents unproxied resolver TCP fallback |
 | ADD-08 | D-01 | — | inspection | **Implemented** — stated in README and DECISIONS; no contribution process exists yet to enforce it |
 | ADD-09 | D-14 | §4.3, §5.2 | unit-socks5, TST-05 | **Verified** — v4-mapped destinations encode as ATYP 0x01; the fixture now rejects the wrong form rather than forgiving it |
-| ADD-10 | D-22 | §11 | unit-dns, D-22-resolve, TST-03 | **Verified** — name lookups made through libc are answered locally or through the proxy, never by the host's resolver. With `dns` unset they fail `EAI_FAIL`; with the proxy down, `EAI_AGAIN`. Zero queries reach the resolver in either case, and `strace` shows no direct port-53 send in any mode. Truncated answers are repeated over SOCKS5 `CONNECT`. Supersedes D-04's "no DNS leak by construction", which was false on every supported glibc. The wire-level capture case is written but not yet run (it needs root) |
+| ADD-10 | D-22 | §11 | unit-dns, D-22-resolve, TST-03 | **Verified** — name lookups made through libc are answered locally or through the proxy, never by the host's resolver. With `dns` unset they fail `EAI_FAIL`; with the proxy down, `EAI_AGAIN`. Zero queries reach the resolver in either case, and `strace` shows no direct port-53 send in any mode. Truncated answers are repeated over SOCKS5 `CONNECT`. Supersedes D-04's "no DNS leak by construction", which was false on every supported glibc. On the wire too: the capture script's lookup cases pass, most recently on 2026-10-21, through a single proxy and a 3-hop chain |
 | ADD-11 | D-36 | §2.3 | TST-05, TST-03, TST-02 | **Verified** — `syscall()` routes every socket, send and receive call to its hook; `dprintf` and `pwritev2`/`preadv2` are proxied; `fdopen`, `sendfile` and `splice` are refused on a UDP socket; `pidfd_getfd` copies are adopted; raw and packet sockets, `MSG_MORE` and `UDP_SEGMENT` are refused. The leak client's 27 sends all fail with the proxy down, against 11 that reached the destination before |
 
 ---
@@ -184,21 +184,24 @@ means no code yet.
 
 | ID | Pri | Test | Status |
 |---|---|---|---|
-| FR-CH-01 | M | unit-config, unit-chain, wrapper loadability, every single-proxy group | **Partial** — `[hop]` sections, repeated `-p` and a `UDPCHAINS_PROXY` list are parsed, merged and handed to the shim (D-38), and run; a chain of one exports exactly what 0.1.0 did, encodes and decodes exactly its single header, prints its diagnostics and, unless `chain_timeout` is set, has no overall setup deadline (D-45). Every single-proxy group passes unchanged. `[ProxyList]` (FR-CH-14) and name lookups (FR-CH-11) not yet |
-| FR-CH-02 | M | unit-config, unit-chain | **Partial** — chain setup fails as a whole if any hop cannot be reached, negotiated or associated, and releases the hops already up (D-37), within a deadline that `chain_timeout` sets, raises or lifts (D-45); the shim uses it for every association. Leak tests with each hop dead are FR-CH-T1, step 5 |
+| FR-CH-01 | M | unit-config, unit-chain, wrapper loadability, every single-proxy group | **Partial** — `[hop]` sections, repeated `-p` and a `UDPCHAINS_PROXY` list are parsed, merged and handed to the shim (D-38), and run; a chain of one exports exactly what 0.1.0 did, encodes and decodes exactly its single header, prints its diagnostics and, unless `chain_timeout` is set, has no overall setup deadline (D-45). Every single-proxy group passes unchanged. `[ProxyList]` (FR-CH-14) not yet |
+| FR-CH-02 | M | unit-config, unit-chain, TST-03, faults | **Verified** against fixtures — chain setup fails as a whole if any hop cannot be reached, negotiated or associated, and releases the hops already up (D-37), within a deadline that `chain_timeout` sets, raises or lifts (D-45); the shim uses it for every association. With each hop of a 3-hop chain dead in turn, or one refusing `CONNECT`, every send and lookup fails and nothing reaches the destination or the resolver (FR-CH-T1, FR-CH-T3) |
 | FR-CH-03 | M | unit-config, unit-chain, FR-CH-T2 | **Verified** against fixtures — each hop's credentials are configured and passed on by location, never by value (D-25, D-38); each hop is reached by `CONNECT` through the hops before it and negotiated with its own credentials. Real proxies as later hops: FR-CH-T4 |
 | FR-CH-04 | M | unit-config, unit-chain, FR-CH-T2 | **Verified** against fixtures — later hops are checked for form and never resolved here, and are sent to the previous hop as written, a name as `ATYP 0x03` (D-39); the 3-hop runs reach their third hop by name |
 | FR-CH-05 | M | unit-chain, FR-CH-T2 | **Verified** — one header per hop, outermost first, byte for byte against RFC 1928 §7; built in the per-thread header buffer and sent as one iovec entry ahead of the application's, so the payload is not copied (D-11), and in the `IOV_MAX` fallback as before |
-| FR-CH-06 | M | unit-chain, FR-CH-T2 | **Partial** — every layer is checked on receive: well formed, `FRAG` 0, and from the next hop's relay, by port alone for a named relay; a failure drops the whole datagram (D-41). Unit-tested layer by layer, including a datagram injected at hop 1's relay. Fixture fault tests (FR-CH-T3) are step 5 |
+| FR-CH-06 | M | unit-chain, FR-CH-T2, faults | **Verified** — every layer is checked on receive: well formed, `FRAG` 0, and from the next hop's relay, by port alone for a named relay; a failure drops the whole datagram (D-41). Unit-tested layer by layer. Against fixtures: `FRAG` set by the middle hop and by the exit hop, and a forged datagram sent to hop 2's relay that names the echo server inside, are all dropped, and the shim says at which layer. With the source check removed, all 5 forgeries were delivered |
 | FR-CH-07 | M | unit-socks5, unit-chain, FR-CH-T2 | **Verified** against fixtures — the per-hop fixup is implemented and unit-tested for every case D-40 lists, `localhost` counting as loopback, and a relay that becomes a name (this host's own) is crossed against fixtures |
 | FR-CH-08 | M | FR-CH-08 exit-hop | **Verified** — the loopback guard looks at the exit hop: under a chain, `strict_loopback` refuses a loopback destination even though every hop is on this host, and a single local proxy still sends to it (D-40) |
-| FR-CH-09 | M | unit-chain, FR-CH-T2 | **Partial** — an association is alive only while every hop's control connection is, a later hop's expiry is seen through the tunnel, and a dead association is rebuilt whole by the FR-P-08 path. Expiry at a middle hop under fault injection (FR-CH-T3) is step 5 |
-| FR-CH-10 | M | FR-CH-T2 | **Partial** — every hop's control connection is a protected shim descriptor (D-26) and a forked child closes all of them (D-31); the lifecycle tests pass through 2 and 3 hops. Diagnosing exhaustion of the protected range is step 5 |
-| FR-CH-11 | M | unit-chain | **Partial** — the TCP fallback's `CONNECT` tunnels through the chain. UDP queries are step 5: until then a lookup that needs DNS fails under a chain, with a diagnostic, rather than go through the first hop alone |
-| FR-CH-12 | M | unit-chain | **Partial** — chain setup names the failing hop, once a second, with no vaguer line after a specific one, and a chain of one keeps 0.1.0's diagnostics (D-43). The association line names every hop's relay in order; checked by hand, not by a test |
+| FR-CH-09 | M | unit-chain, FR-CH-T2, faults | **Verified** — an association is alive only while every hop's control connection is, a later hop's expiry is seen through the tunnel, and a dead association is rebuilt whole by the FR-P-08 path. The middle hop of 3 expiring its association is transparent to the program, and the association is set up again through all 3 hops |
+| FR-CH-10 | M | FR-CH-T2, faults | **Verified** — every hop's control connection is a protected shim descriptor (D-26) and a forked child closes all of them (D-31); the lifecycle tests pass through 2 and 3 hops. When the protected range is full, the connection stays where it is, still protected, and a warning says so; with no descriptor at all the send fails with `EMFILE` (D-46). Tested at a soft limit of 64 through 3 hops: the exit hop relayed exactly the datagrams reported sent, and the destination received exactly those |
+| FR-CH-11 | M | unit-chain, D-22-resolve, TST-03 | **Verified** against fixtures — the resolver's associations are set up through every hop, and its queries carry a header per hop and are checked layer by layer (D-41); the TCP fallback's `CONNECT` tunnels through the chain. Every entry point resolves through 2 hops, over UDP and TCP; with either hop dead, or hop 1 refusing `CONNECT`, every lookup needing DNS fails and none reaches the resolver; `strace` shows no direct send to a resolver. Under Valgrind through 2 hops |
+| FR-CH-12 | M | unit-chain, D-22-resolve, faults | **Verified** — chain setup names the failing hop, once a second, with no vaguer line after a specific one, and a chain of one keeps 0.1.0's diagnostics (D-43); a hop refusing `CONNECT` is named with the refusal. The association line names every hop's relay in order, for datagram and resolver associations alike |
 | FR-CH-13 | S | unit-config | **Partial** — at most 8 hops is enforced (D-42); README guidance not written |
 | FR-CH-14 | S | — | **Not started** |
-| FR-CH-T1 to T4 | — | — | **Not started** |
+| FR-CH-T1 | M | TST-03, capture | **Verified** — `test_leak.sh` runs the leak client and the resolver probe with each hop of a 3-hop chain dead in turn: no datagram reaches the destination, no query the resolver. On the wire, on 2026-10-21, `tests/test_failclosed_capture.sh` captured zero packets to the destination and zero port-53 packets asking for the looked-up name with each hop dead in turn, against positive controls that captured 28 and 8 |
+| FR-CH-T2 | M | FR-CH-T2-2hop, FR-CH-T2-3hop | **Verified** — the matrix, fidelity, port-switch, lifecycle and threading tests through 2 and 3 hops |
+| FR-CH-T3 | M | faults | **Verified** — expiry at the middle hop, `FRAG` at the middle and innermost layers, a forged inner source behind a genuine outer one, and a hop refusing `CONNECT` |
+| FR-CH-T4 | S | — | **Not started** (step 6) |
 
 ---
 

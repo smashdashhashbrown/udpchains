@@ -273,6 +273,17 @@ run_valgrind() {
 	rc=$?
 	report resolve "$TMP/vg_resolve.out" "$rc"
 
+	# FR-CH-11: the pool holding a control connection per hop, and the
+	# TCP fallback's CONNECT tunnelled through the chain.
+	echo "--- resolve, 2 hops"
+	UDPCHAINS_PROXY="127.0.0.1:$PROXY,127.0.0.1:$PROXY2" \
+	UDPCHAINS_DNS="127.0.0.1:$DNS" UDPCHAINS_DNS_SEARCH=search.test \
+	UDPCHAINS_DNS_TIMEOUT=20000 UDPCHAINS_HOSTS_FILE="$TMP/hosts" \
+	LD_PRELOAD="$ROOT/libudpchains.so" "${VG[@]}" \
+		"$BUILD/test_resolve" main > "$TMP/vg_resolve2.out" 2>&1
+	rc=$?
+	report "resolve, 2 hops" "$TMP/vg_resolve2.out" "$rc"
+
 	stop_fixtures
 	unset UDPCHAINS_PROXY UDPCHAINS_QUIET
 }

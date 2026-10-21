@@ -2,11 +2,11 @@
 
 **Status:** in progress after 0.1.0. The requirements in §4 have moved to §2a of
 [`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the reference for them,
-and the design questions in §5 are decided in D-37 to D-42. Steps 1 to 4 of §7 are done: the
-records, chain configuration with its handoff to the shim, chain setup in `socks5.c`, and the
-n-layer codec and association, with the integration tests passing through 2- and 3-hop chains.
-Until step 5, a name lookup that needs DNS fails closed under a chain. This document stays as the
-background and estimate.
+and the design questions in §5 are decided in D-37 to D-42. Steps 1 to 5 of §7 are done: the
+records, chain configuration with its handoff to the shim, chain setup in `socks5.c`, the
+n-layer codec and association, with the integration tests passing through 2- and 3-hop chains,
+and name lookups through the chain, with the leak and fault tests, including the wire capture
+with each hop dead. This document stays as the background and estimate.
 **Written:** 2026-10-19, against the 0.1.0 candidate (`aa30ddf`). Line counts and file references
 are as of that commit; recheck them before starting.
 

@@ -59,6 +59,7 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-43](#d-43) | A chain's setup failures name the hop, once a second | FR-CH-12; extends D-33 |
 | [D-44](#d-44) | Later hops are declared the unspecified address, in the family they see | FR-P-05 per hop |
 | [D-45](#d-45) | Setup has an overall deadline, `chain_timeout`: by default `connect_timeout` per hop of a chain | FR-CH-02; settles a FUTURE-UDP-CHAINS §8 question |
+| [D-46](#d-46) | When the shim's descriptor range is full, its connection stays where it is, protected, and that is reported | FR-CH-10; extends D-26 |
 
 ---
 
@@ -1675,7 +1676,9 @@ retry, so a line per failure would repeat once per send.
 
 - **In a chain, every setup failure prints one line naming the hop:** its position, the chain's
   length and its address as given, then what failed and the `errno`. For example:
-  `hop 2 of 3 (10.0.0.5:1080): hop 1 could not reach it: Connection refused`.
+  `hop 2 of 3 (10.0.0.5:1080): hop 1's CONNECT to it failed: Connection refused`. The `errno`
+  is hop 1's reply code: refused, unreachable, or `Operation not supported` from a hop that does
+  not do `CONNECT` at all.
 - **At error level,** so `-q` does not hide it: with it hidden, the `errno` would not say which hop
   to look at.
 - **At most one a second,** shared by all hops, as D-33 limits repeated warnings. The next line
@@ -1780,3 +1783,58 @@ ignoring a value the user wrote down would be surprising. Unset, 0.1.0's behavio
   to let a slow chain finish also lengthens every wait, which is not the same thing.
 
 **Revisit if:** interop shows the default cutting off real chains whose steps are each quick.
+
+---
+
+## D-46
+### When the shim's descriptor range is full, its connection stays where it is, protected, and that is reported
+
+**Date:** 2026-10-21 · **Status:** Accepted · FR-CH-10. Extends D-26.
+
+**Context.** D-26 moves each of the shim's own descriptors into a range starting at 768, or at half
+the soft limit when that is below 1024, and marks it, so the program's close and `dup2` calls
+cannot take it. With the usual limit of 1024 the range holds 256. A single proxy uses one per
+socket, which a program would hit its own limit long before filling. A chain uses one per hop per
+socket: 85 sockets through 3 hops, 32 through 8. Until now, a descriptor that could not be moved
+stayed where it was without a word, and one that could not be marked was left unprotected.
+
+**Decision.**
+
+- **The connection is kept, at the number it has.** It is still marked, so the program's `close`
+  is refused and its `dup2` onto it fails, as in D-26. What it loses is being out of the way: it
+  takes a low number the program might otherwise have been given. This was already the code's
+  fallback; D-46 makes it a decision and reports it.
+- **That is reported** as a warning naming the range and the descriptor, at most once a second,
+  as D-33 limits repeated warnings.
+- **A descriptor that cannot be marked** (above the fd table's 2^20, or out of memory) is also
+  kept and reported: a close-all loop in the program could take it, and the association would
+  then be set up again on the next send (FR-P-08).
+- **With no descriptor at all,** setup fails and the program's send fails with `EMFILE`, naming
+  the hop in a chain (D-43). Nothing is ever sent directly (SEC-01).
+
+**Cost.** A low number is not only cosmetic. Low numbers are the ones programs choose on purpose:
+shells redirect onto 3 to 9 (`exec 5>file`), and daemons `dup2` onto fixed numbers for their
+children. D-26's `EBUSY` for a `dup2` onto a shim descriptor was a remote case in the 768+ range;
+with the shim's connection at, say, fd 5, it is a likely one, and a program that does not expect
+`dup2` to fail may stop. The warning is there so that such a failure can be traced to the shim.
+It is never a leak: the descriptor still carries only the shim's traffic to hop 1.
+
+**Rejected.**
+
+- **Failing the association when the range is full.** It would keep D-26's guarantee exactly,
+  but a program that would otherwise run fails at its 86th socket through 3 hops, every time,
+  where the cost above is a failure only if the program `dup2`s onto that number. D-37's
+  strictness is about where traffic goes; this is only about which number a descriptor gets.
+- **Raising the soft limit, or the range,** for the program. The range cannot go above the soft
+  limit, so this means `setrlimit` on the program's behalf: its children inherit it, and
+  `select()` breaks above 1024. D-26 already rejects growing the descriptor table.
+- **Leaving it silent,** as before. The same behaviour, but a user whose program fails a `dup2`
+  with `EBUSY` would have nothing to connect it to.
+- **A setting choosing between keeping and failing.** Not until a program is found that needs it.
+
+**Verified by** `test_faults.sh`: with the soft limit at 64 and a 3-hop chain, the range (32 to 63)
+fills after ten sockets. Fifteen associations work, the warning is printed, the send that finds no
+descriptor fails with `EMFILE`, and the exit hop relayed exactly the datagrams reported sent.
+
+**Revisit if:** a real program is found to need more than the range holds, through a chain, or
+fails a `dup2` onto a shim connection that stayed at a low number.

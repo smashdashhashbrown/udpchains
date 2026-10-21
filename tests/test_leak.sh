@@ -164,6 +164,53 @@ check "all 8 raw and packet socket attempts fail with EPERM" \
 check "and the shim says why" \
 	"$(echo "$OUT" | grep -q 'refusing a raw' && echo yes || echo no)" "yes"
 
+echo "# FR-CH-T1: a 3-hop chain with each hop dead in turn"
+# The live hops are real fixture proxies; the dead one is the dead proxy above.
+# Hop 1 dead is like scenario 1.  Hop 2 or 3 dead, hop 1 is up and asked to
+# reach it: a chain that fell back to the hops it could reach would send
+# through those, so the destination would still see datagrams.
+start_proxy() {
+	local name=$1 i port=""
+	: > "$TMP/$name.out"
+	"$BUILD/socks5d" --port 0 --quiet > "$TMP/$name.out" 2>&1 &
+	echo $! >> "$TMP/pids"
+	for ((i = 0; i < 100; i++)); do
+		port=$(awk '/^PORT/{print $2; exit}' "$TMP/$name.out" 2>/dev/null)
+		[ -n "$port" ] && break
+		sleep 0.05
+	done
+	echo "127.0.0.1:$port"
+}
+LIVE1=$(start_proxy live1)
+LIVE2=$(start_proxy live2)
+for dead in 1 2 3; do
+	case $dead in
+	1) CHAIN="$DEAD_PROXY,$LIVE1,$LIVE2" ;;
+	2) CHAIN="$LIVE1,$DEAD_PROXY,$LIVE2" ;;
+	3) CHAIN="$LIVE1,$LIVE2,$DEAD_PROXY" ;;
+	esac
+	ECHOC=$(start_echo "chain$dead")
+	OUT=$(UDPCHAINS_PROXY="$CHAIN" UDPCHAINS_QUIET=1 \
+		timeout 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHOC" 2>&1)
+	echo "$OUT" | sed 's/^/#   /'
+	SENT_OK=$(echo "$OUT" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')
+	check "hop $dead of 3 dead: every send fails" "${SENT_OK:-x}" "0"
+	sleep 0.3
+	check "hop $dead of 3 dead: ZERO datagrams reached the destination" \
+		"$(received "chain$dead")" "0"
+
+	# And name lookups, as scenario 4 (FR-CH-11).
+	before=$(grep -c '^QUERY' "$TMP/dnsd.log")
+	OUT=$(UDPCHAINS_PROXY="$CHAIN" UDPCHAINS_QUIET=1 UDPCHAINS_DNS="127.0.0.1:$DPORT" \
+		UDPCHAINS_HOSTS_FILE="$TMP/hosts" UDPCHAINS_DNS_TIMEOUT=2000 \
+		timeout 60 "$WRAPPER" "$BUILD/test_resolve" down 2>&1)
+	RC=$?
+	echo "$OUT" | sed 's/^/#   /'
+	check "hop $dead of 3 dead: every lookup that needs DNS fails" "$RC" "0"
+	check "hop $dead of 3 dead: ZERO queries reached the resolver" \
+		"$(grep -c '^QUERY' "$TMP/dnsd.log")" "$before"
+done
+
 echo "# TST-03 control: the same client DOES reach the destination unproxied"
 # Without this, the test could pass because the client is broken rather than
 # because the shim is working.

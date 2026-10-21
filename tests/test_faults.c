@@ -8,6 +8,10 @@
  *   reassoc <port> <idle_secs>   FR-P-08 transparent re-association
  *   frag    <port>               FR-P-04 FRAG != 0 is discarded
  *   maxdgram <port>              proxy's limit smaller than ours
+ *   forged  <port> <secs>        FR-CH-T3: under a chain, nothing forged at a
+ *                                later hop's relay is delivered (D-41)
+ *   forge   <port> <relayport>   the forger: run WITHOUT the shim
+ *   fdband  <port> <limit>       FR-CH-10: the shim's descriptors run out
  */
 #include "tap.h"
 
@@ -18,6 +22,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -222,6 +227,119 @@ int main(int argc, char **argv)
 		TAP_OK(roundtrip(fd, "parent-after"),
 		       "and the parent's association is untouched");
 		close(fd);
+	} else if (strcmp(mode, "forged") == 0) {
+		/* Run under a 3-hop chain.  test_faults.sh, seeing READY, runs
+		 * the forge mode below against hop 2's relay: a datagram that
+		 * hop 2 wraps as from the forger, and hop 1 as from hop 2's
+		 * relay -- a genuine outer layer.  Inside is a header claiming
+		 * the echo server, which, were the layers under the outermost
+		 * not checked (D-41), the shim would take as the innermost and
+		 * deliver.  It is from the echo server's address, so even a
+		 * connected socket would accept it. */
+		int secs = (argc > 3) ? atoi(argv[3]) : 4;
+		int delivered = 0;
+		time_t end;
+
+		TAP_GROUP("FR-CH-T3: a forged inner source behind a genuine outer one");
+
+		fd = udp4(1);
+		connect(fd, (struct sockaddr *)&g_echo, sizeof(g_echo));
+		TAP_OK(roundtrip(fd, "genuine"), "traffic flows through the chain");
+
+		printf("# READY\n");
+		fflush(stdout);
+		end = time(NULL) + secs;
+		while (time(NULL) < end) {
+			char buf[128];
+
+			if (recv(fd, buf, sizeof(buf), 0) >= 0)
+				delivered++;
+		}
+		TAP_EQ_INT(delivered, 0,
+		           "nothing sent to hop 2's relay is delivered, though it "
+		           "names the echo server inside");
+		TAP_OK(roundtrip(fd, "genuine-after"),
+		       "and genuine traffic still flows");
+		close(fd);
+	} else if (strcmp(mode, "forge") == 0) {
+		/* Not under the shim.  RFC 1928 §7 header naming 127.0.0.1 and
+		 * the echo port, then a payload. */
+		struct sockaddr_in relay;
+		uint8_t dgram[64] = { 0, 0, 0, 0x01, 127, 0, 0, 1 };
+		size_t len = 10;
+		int i, sent = 0;
+
+		TAP_GROUP("the forger");
+		memcpy(dgram + 8, &g_echo.sin_port, 2);
+		memcpy(dgram + len, "forged", 6);
+		len += 6;
+		memset(&relay, 0, sizeof(relay));
+		relay.sin_family = AF_INET;
+		relay.sin_port = htons((uint16_t)atoi(argv[3]));
+		inet_pton(AF_INET, "127.0.0.1", &relay.sin_addr);
+		fd = socket(AF_INET, SOCK_DGRAM, 0);
+		for (i = 0; i < 5; i++)
+			if (sendto(fd, dgram, len, 0, (struct sockaddr *)&relay,
+			           sizeof(relay)) == (ssize_t)len)
+				sent++;
+		TAP_EQ_INT(sent, 5, "5 forged datagrams sent to port %u",
+		           ntohs(relay.sin_port));
+		close(fd);
+	} else if (strcmp(mode, "fdband") == 0) {
+		/* FR-CH-10, D-46.  Under a chain each socket's association holds
+		 * a control connection per hop, in the shim's range: half the
+		 * soft limit and up, here.  Sockets are opened and sent on
+		 * until descriptors run out.  test_faults.sh checks that the
+		 * range filling was reported, that associations kept working
+		 * past it, and that every send reported as sent went through
+		 * the chain. */
+		struct rlimit rl;
+		int limit = (argc > 3) ? atoi(argv[3]) : 64;
+		int sent_ok = 0, err = 0, spare, s;
+
+		TAP_GROUP("FR-CH-10: the shim's descriptors run out");
+
+		getrlimit(RLIMIT_NOFILE, &rl);
+		rl.rlim_cur = (rlim_t)limit;
+		TAP_EQ_INT(setrlimit(RLIMIT_NOFILE, &rl), 0,
+		           "the soft limit is lowered to %d", limit);
+		/* Held back, so that whichever runs out first -- the program's
+		 * socket() or the shim's connections -- the last send below
+		 * has a socket and the shim has nothing. */
+		spare = dup(0);
+
+		for (;;) {
+			s = socket(AF_INET, SOCK_DGRAM, 0);
+			if (s < 0)
+				break;
+			if (sendto(s, "band", 4, 0, (struct sockaddr *)&g_echo,
+			           sizeof(g_echo)) != 4) {
+				err = errno;
+				break;
+			}
+			sent_ok++;
+		}
+		if (s < 0) {
+			close(spare);
+			s = socket(AF_INET, SOCK_DGRAM, 0);
+			errno = 0;
+			if (sendto(s, "band", 4, 0, (struct sockaddr *)&g_echo,
+			           sizeof(g_echo)) == 4)
+				sent_ok++;
+			else
+				err = errno;
+		}
+		/* Exiting closes every control connection, and a hop that
+		 * sees its close first tears the association down with the
+		 * last datagram still unforwarded.  The count must match. */
+		sleep(1);
+		printf("# sent_ok=%d\n", sent_ok);
+		TAP_OK(sent_ok > 0, "%d sockets sent before descriptors ran out",
+		       sent_ok);
+		TAP_EQ_INT(err, EMFILE,
+		           "then the shim, with no descriptor for a hop, fails the "
+		           "send with EMFILE (%s)",
+		           strerror(err));
 	} else {
 		fprintf(stderr, "unknown mode %s\n", mode);
 		return 2;

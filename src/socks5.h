@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <sys/socket.h>
 
+#include "addr.h"
 #include "config.h"
 
 /* Largest possible header: RSV(2) + FRAG(1) + ATYP(1) + len(1) + domain(255) +
@@ -179,6 +180,17 @@ void udpc_socks_disconnect_chain(struct udpc_socks_chain *chain);
 /* True while every control connection is open: losing any hop loses the
  * association (FR-CH-09). */
 bool udpc_socks_chain_alive(const struct udpc_socks_chain *chain);
+
+/* Room for udpc_socks_chain_path's longest result: a named relay is up to 255
+ * bytes of name and ":65535", and each after the first adds ", then ". */
+#define UDPC_SOCKS_CHAIN_PATH_MAX (UDPC_CHAIN_MAX * (UDPC_ADDRSTRLEN + 270))
+
+/* Writes the relays a chain's datagrams pass, in order, for the association
+ * line (FR-C-06, FR-CH-12): hop 1's, which is what a chain of one has always
+ * printed, then each later hop's, by name where it is one -- "127.0.0.1:40001,
+ * then 10.0.0.5:40002, then proxy.internal:40003". */
+void udpc_socks_chain_path(const struct udpc_socks_chain *ch, char *buf,
+                           size_t len);
 
 /* The D-16 fixup for hop k >= 2 (D-40).  relay is numeric, as hop k returned
  * it; hop is hop k's address as given.  A wildcard relay becomes hop's address

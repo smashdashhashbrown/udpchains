@@ -209,6 +209,35 @@ else
 	notok "working proxy: nothing reached the destination at all; the relay path is broken"
 fi
 
+# --- 4b. a 3-hop chain with each hop dead in turn (FR-CH-T1) ------------------
+#
+# The live hops are fixture proxies on this host.  With hop 2 or 3 dead, hop 1
+# is up: a chain that fell back to the hops it could reach would put the
+# datagrams on the wire, relayed from here.
+: > "$TMP/live2.out"
+"$BUILD/socks5d" --port 0 --quiet > "$TMP/live2.out" 2>&1 &
+PIDS+=($!)
+L2PORT=""
+for ((i = 0; i < 100; i++)); do
+	L2PORT=$(awk '/^PORT/{print $2; exit}' "$TMP/live2.out" 2>/dev/null)
+	[ -n "$L2PORT" ] && break
+	sleep 0.05
+done
+for dead in 1 2 3; do
+	case $dead in
+	1) chain="127.0.0.1:9,127.0.0.1:$LPORT,127.0.0.1:$L2PORT" ;;
+	2) chain="127.0.0.1:$LPORT,127.0.0.1:9,127.0.0.1:$L2PORT" ;;
+	3) chain="127.0.0.1:$LPORT,127.0.0.1:$L2PORT,127.0.0.1:9" ;;
+	esac
+	got=$(capture_run "chain$dead" env "UDPCHAINS_PROXY=$chain" UDPCHAINS_QUIET=1 \
+		"$WRAPPER" "$BUILD/leakclient" "$DEST" "$DPORT")
+	sent=$(sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p' "$TMP/chain$dead.client")
+	[ "${sent:-x}" = "0" ] && ok "hop $dead of 3 dead: every send fails" \
+		|| notok "hop $dead of 3 dead: $sent sends succeeded, want 0"
+	[ "${got:-1}" -eq 0 ] && ok "hop $dead of 3 dead: ZERO packets on the wire" \
+		|| notok "LEAK: $got packets reached the wire with hop $dead of 3 dead"
+done
+
 # --- 5. name lookups (D-22) ---------------------------------------------------
 #
 # glibc's resolver makes its socket calls through internal aliases, so before
@@ -292,6 +321,27 @@ if command -v getent > /dev/null 2>&1; then
 		[ "${got:-1}" -eq 0 ] && ok "lookup with the proxy down: ZERO packets to port 53 asking for its name" \
 			|| notok "LEAK: $got packets to port 53 asking for $name with the proxy down"
 		dns_note_other "${other:-0}"
+
+		# FR-CH-T1: each hop of a 3-hop chain dead in turn.
+		for dead in 1 2 3; do
+			case $dead in
+			1) chain="127.0.0.1:9,127.0.0.1:$LPORT,127.0.0.1:$L2PORT" ;;
+			2) chain="127.0.0.1:$LPORT,127.0.0.1:9,127.0.0.1:$L2PORT" ;;
+			3) chain="127.0.0.1:$LPORT,127.0.0.1:$L2PORT,127.0.0.1:9" ;;
+			esac
+			name=$(dns_name)
+			read -r got other < <(dns_capture_run "dnschain$dead" "$name" \
+				env "UDPCHAINS_PROXY=$chain" \
+				UDPCHAINS_DNS=192.0.2.53 UDPCHAINS_QUIET=1 \
+				"$WRAPPER" getent ahosts "$name")
+			[ "$(resolved "dnschain$dead")" = "0" ] \
+				&& ok "lookup with hop $dead of 3 dead: fails" \
+				|| notok "lookup with hop $dead of 3 dead: it RESOLVED"
+			[ "${got:-1}" -eq 0 ] \
+				&& ok "lookup with hop $dead of 3 dead: ZERO packets to port 53 asking for its name" \
+				|| notok "LEAK: $got packets to port 53 asking for $name with hop $dead of 3 dead"
+			dns_note_other "${other:-0}"
+		done
 
 		name=$(dns_name)
 		read -r got other < <(dns_capture_run dnsunset "$name" \

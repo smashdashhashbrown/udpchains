@@ -1044,9 +1044,10 @@ int main(int argc, char **argv)
 		TAP_EQ_INT(e, ECONNREFUSED,
 		           "with ECONNREFUSED, from hop 1's CONNECT reply");
 		TAP_OK(strstr(g_stderr, "hop 2 of 2 (") != NULL &&
-		       strstr(g_stderr, "hop 1 could not reach it") != NULL,
-		       "the diagnostic names hop 2, and hop 1 as what failed "
-		       "to reach it");
+		       strstr(g_stderr, "hop 1's CONNECT to it failed: "
+		                        "Connection refused") != NULL,
+		       "the diagnostic names hop 2, and hop 1's CONNECT as "
+		       "what failed");
 		TAP_OK(chain_is_empty(&ch), "no hop is left associated");
 		TAP_EQ_INT(lowest_free_fd(), before, "and nothing open");
 
