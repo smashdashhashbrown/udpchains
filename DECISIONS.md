@@ -60,6 +60,7 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-44](#d-44) | Later hops are declared the unspecified address, in the family they see | FR-P-05 per hop |
 | [D-45](#d-45) | Setup has an overall deadline, `chain_timeout`: by default `connect_timeout` per hop of a chain | FR-CH-02; settles a FUTURE-UDP-CHAINS §8 question |
 | [D-46](#d-46) | When the shim's descriptor range is full, its connection stays where it is, protected, and that is reported | FR-CH-10; extends D-26 |
+| [D-47](#d-47) | A proxychains.conf is read as it is, for the strict chain of `socks5` hops it shares | FR-CH-14, FR-C-04 |
 
 ---
 
@@ -1555,7 +1556,7 @@ three formats: `[hop]` sections, repeated `proxy =` lines, and a `[ProxyList]` s
 **Why `[hop]` sections.** A 0.1.0 file keeps its meaning without change, which FR-CH-01 requires,
 and nothing within a hop depends on line order. Repeated `proxy =` lines would make a `username`
 line's meaning depend on where it sits; a `[ProxyList]` line has nowhere safe to put a password.
-FR-CH-14 can still accept `[ProxyList]` later as a second spelling.
+FR-CH-14 can still accept `[ProxyList]` later as a second spelling. (D-47 does.)
 
 **Until chains were carried on the wire** (step 4 of
 [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) §7), a configuration of more than one hop
@@ -1840,3 +1841,63 @@ descriptor fails with `EMFILE`, and the exit hop relayed exactly the datagrams r
 
 **Revisit if:** a real program is found to need more than the range holds, through a chain, or
 fails a `dup2` onto a shim connection that stayed at a low number.
+
+---
+
+## D-47
+### A proxychains.conf is read as it is, for the strict chain of `socks5` hops it shares
+
+**Date:** 2026-10-21 · **Status:** Accepted · FR-CH-14, FR-C-04. Chosen by the maintainer: a real
+`proxychains.conf` rather than only its `[ProxyList]` stanza inside a udpchains file; directives
+without an equivalent warned about rather than refused or dropped silently; inline passwords
+allowed, as `password =` is.
+
+**Context.** FR-C-04 asks that proxychains users' configuration carry over, and was deferred with
+chains (D-08). D-38 chose `[hop]` sections as udpchains' own format, and noted that a `[ProxyList]`
+line has nowhere safe to put a password. Written from the format as proxychains documents it:
+directives one to a line, then `[ProxyList]` with one proxy to a line, `type host port [user
+pass]`, separated by spaces or tabs. Never from its source (D-01).
+
+**Decision.**
+
+- **`udpchains -f proxychains.conf` works.** The file is read by the same reader as any config
+  file, and is never looked for by default. `[ProxyList]` lists the hops in order, the first being
+  hop 1. Each hop fills the same fields a `[hop]` section does, so everything after reading —
+  merging, the handoff to the shim, passwords by location (D-25), at most 8 hops (D-42) — is
+  unchanged.
+- **Only `socks5` lines.** `socks4`, `http` and `raw` cannot carry UDP and are errors naming the
+  line. A bare IPv6 address is bracketed; a name is kept as written (D-39).
+- **proxychains' directives,** before `[ProxyList]`:
+  - `strict_chain` is accepted: it is what udpchains does.
+  - `dynamic_chain`, `random_chain` and `round_robin_chain` are errors (D-37).
+  - `quiet_mode` sets `quiet`; `tcp_connect_time_out` sets `connect_timeout`.
+  - `chain_len`, `tcp_read_time_out`, `proxy_dns` and its variants, `remote_dns_subnet`,
+    `localnet` and `dnat` are not applied, and the wrapper names each in a warning saying what
+    happens instead. None of them can cause a direct send: `localnet`'s traffic goes through the
+    proxies or fails (D-05), and names are looked up at `dns` through them, or fail.
+  - udpchains' own `key = value` settings may sit beside them.
+- **Inline credentials** (`socks5 host port user pass`) are accepted, with the rule an inline
+  `password =` has: a warning if others can read the file, and the password passed on by naming
+  the file, never by value (D-25). A password containing a space or tab, or starting with `#`,
+  cannot be written on such a line; `[hop]` sections with `password_file` can hold any.
+- **One way per file.** `[ProxyList]` with `proxy =` or `[hop]` sections, a second
+  `[ProxyList]`, an empty one, or a setting after it are errors. `-p` and `UDPCHAINS_PROXY` still
+  replace the file's chain whole (D-38).
+- **The warnings are the wrapper's.** A shim reading the same file for a password says nothing,
+  as for permission warnings (D-33).
+
+**Rejected.**
+
+- **Only the `[ProxyList]` stanza, in a udpchains file.** Every real proxychains.conf has
+  directives, so none would load without editing; "carry over" would mean copy and trim.
+- **Refusing directives udpchains does not apply.** Nothing in the file would be silently not
+  honoured, but almost every real file would fail to load, for settings that are about TCP or
+  proxychains' DNS and cannot make udpchains send anything directly.
+- **Ignoring them silently.** A user relying on `localnet` or `proxy_dns` would get no hint.
+- **Refusing inline passwords.** Keeps D-38's objection absolute, but no authenticated
+  proxychains.conf would carry over, and the inline `password =` already has the same exposure.
+
+**Verified by** `unit-config` (a file of proxychains' shape, read and handed to the shim; each
+refusal with its line) and `test_auth.sh` (a proxychains.conf whose hop 2 requires the login on its
+line: the datagram round-trips, the proxy logs the login, the password is passed on by naming the
+file, three directives are warned about once each, and a `dynamic_chain` file runs nothing).

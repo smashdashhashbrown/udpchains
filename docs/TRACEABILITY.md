@@ -25,14 +25,14 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 1751 assertions across 21 groups (`tests/run.sh`), all passing, plus the 91-check
+**Test totals:** 1839 assertions across 21 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
 | Group | Assertions |
 |---|---|
 | unit-addr | 51 |
-| unit-config | 143 |
+| unit-config | 226 |
 | unit-socks5 | 88 |
 | unit-chain | 135 |
 | unit-fdtable | 22 |
@@ -45,7 +45,7 @@ from a run rather than editing it by hand.
 | FR-CH-T2 through 2 hops: matrix, fidelity, port switch, lifecycle, threading | 378 |
 | FR-CH-T2 through 3 hops, the third given as `localhost` | 378 |
 | FR-CH-08 exit-hop loopback guard | 2 checks |
-| FR-P-09 auth | 15 |
+| FR-P-09 auth | 20 |
 | D-22 resolve | 24 checks, over nine program runs making 211 assertions of their own |
 | wrapper loadability | 17 |
 | TST-03 leak | 23 checks |
@@ -119,7 +119,7 @@ from a run rather than editing it by hand.
 | FR-C-01 | M | §7.2 | TST-04 | **Verified** |
 | FR-C-02 | M | §7.1 | unit-config | **Verified** — layered merge; a lower layer never clobbers a higher one with a value it did not set |
 | FR-C-03 | M | §7.1 | unit-config, TST-03 | **Verified** — no proxy, unknown key, or malformed line all refuse to run |
-| FR-C-04 | S | — | unit-config | **Deferred** (D-08) — a `[ProxyList]` line gives a message naming the deferral |
+| FR-C-04 | S | — | unit-config, FR-P-09-auth | **Verified** as FR-CH-14 (D-47) — a `proxychains.conf` is read as it is, for its strict chain of `socks5` hops |
 | FR-C-05 | M | §7.3 | manual, TST-faults | **Verified** — `udpchains:` prefix on stderr, `-q` (errors only) / `-v`. Repeated warnings are rate-limited, and nothing is written to a descriptor 2 that is no longer the original stderr (D-33) |
 | FR-C-06 | S | §7.3 | manual | **Verified** — one line per association, naming destination, relay and the configured limit |
 
@@ -184,7 +184,7 @@ means no code yet.
 
 | ID | Pri | Test | Status |
 |---|---|---|---|
-| FR-CH-01 | M | unit-config, unit-chain, wrapper loadability, every single-proxy group | **Partial** — `[hop]` sections, repeated `-p` and a `UDPCHAINS_PROXY` list are parsed, merged and handed to the shim (D-38), and run; a chain of one exports exactly what 0.1.0 did, encodes and decodes exactly its single header, prints its diagnostics and, unless `chain_timeout` is set, has no overall setup deadline (D-45). Every single-proxy group passes unchanged. `[ProxyList]` (FR-CH-14) not yet |
+| FR-CH-01 | M | unit-config, unit-chain, wrapper loadability, every single-proxy group | **Verified** — `[hop]` sections, repeated `-p` and a `UDPCHAINS_PROXY` list are parsed, merged and handed to the shim (D-38), and run; a chain of one exports exactly what 0.1.0 did, encodes and decodes exactly its single header, prints its diagnostics and, unless `chain_timeout` is set, has no overall setup deadline (D-45). Every single-proxy group passes unchanged. A proxychains.conf's `[ProxyList]` too (FR-CH-14) |
 | FR-CH-02 | M | unit-config, unit-chain, TST-03, faults | **Verified** against fixtures — chain setup fails as a whole if any hop cannot be reached, negotiated or associated, and releases the hops already up (D-37), within a deadline that `chain_timeout` sets, raises or lifts (D-45); the shim uses it for every association. With each hop of a 3-hop chain dead in turn, or one refusing `CONNECT`, every send and lookup fails and nothing reaches the destination or the resolver (FR-CH-T1, FR-CH-T3) |
 | FR-CH-03 | M | unit-config, unit-chain, FR-CH-T2 | **Verified** against fixtures — each hop's credentials are configured and passed on by location, never by value (D-25, D-38); each hop is reached by `CONNECT` through the hops before it and negotiated with its own credentials. Through real proxies too: Dante, then 3proxy, each requiring its own login (FR-CH-T4) |
 | FR-CH-04 | M | unit-config, unit-chain, FR-CH-T2 | **Verified** against fixtures — later hops are checked for form and never resolved here, and are sent to the previous hop as written, a name as `ATYP 0x03` (D-39); the 3-hop runs reach their third hop by name. Each of the seven real proxies, as hop 1, resolved a hop 2 given by name, for `CONNECT` and in UDP headers (FR-CH-T4) |
@@ -197,7 +197,7 @@ means no code yet.
 | FR-CH-11 | M | unit-chain, D-22-resolve, TST-03 | **Verified** against fixtures — the resolver's associations are set up through every hop, and its queries carry a header per hop and are checked layer by layer (D-41); the TCP fallback's `CONNECT` tunnels through the chain. Every entry point resolves through 2 hops, over UDP and TCP; with either hop dead, or hop 1 refusing `CONNECT`, every lookup needing DNS fails and none reaches the resolver; `strace` shows no direct send to a resolver. Under Valgrind through 2 hops |
 | FR-CH-12 | M | unit-chain, D-22-resolve, faults | **Verified** — chain setup names the failing hop, once a second, with no vaguer line after a specific one, and a chain of one keeps 0.1.0's diagnostics (D-43); a hop refusing `CONNECT` is named with the refusal. The association line names every hop's relay in order, for datagram and resolver associations alike |
 | FR-CH-13 | S | unit-config, inspection, FR-CH-T4 | **Verified** — at most 8 hops is enforced (D-42). The README explains choosing `max_datagram` for a chain: hop *i* of *n* carries the headers of the *n* − *i* hops after it, 10 bytes each for an IPv4 relay, 22 for IPv6, more for a named one. `make interop` measured exactly that limit, and truncation one byte above it, in every chain where a hop truncates |
-| FR-CH-14 | S | — | **Not started** |
+| FR-CH-14 | S | unit-config, FR-P-09-auth | **Verified** — `-f` takes a proxychains.conf as it is (D-47). Its `socks5` lines are the hops, in order, with inline credentials passed on by naming the file (D-25); `strict_chain` is accepted, the other chain modes and non-`socks5` proxies refused with the line, `quiet_mode` and `tcp_connect_time_out` applied, and the directives without an equivalent warned about once, by the wrapper. Unit-tested on a file of proxychains' shape and 21 refusals; end to end, a chain whose hop 2 requires the login on its line carries a datagram |
 | FR-CH-T1 | M | TST-03, capture | **Verified** — `test_leak.sh` runs the leak client and the resolver probe with each hop of a 3-hop chain dead in turn: no datagram reaches the destination, no query the resolver. On the wire, on 2026-10-21, `tests/test_failclosed_capture.sh` captured zero packets to the destination and zero port-53 packets asking for the looked-up name with each hop dead in turn, against positive controls that captured 28 and 8 |
 | FR-CH-T2 | M | FR-CH-T2-2hop, FR-CH-T2-3hop | **Verified** — the matrix, fidelity, port-switch, lifecycle and threading tests through 2 and 3 hops |
 | FR-CH-T3 | M | faults | **Verified** — expiry at the middle hop, `FRAG` at the middle and innermost layers, a forged inner source behind a genuine outer one, and a hop refusing `CONNECT` |

@@ -202,6 +202,48 @@ and may hold only
 and
 .BR password .
 .IP
+A
+.I proxychains.conf
+can be given to
+.B \-f
+as it is.
+Each
+.B socks5
+line of its
+.B [ProxyList]
+is a hop, with its username and password if it has them;
+.BR socks4 ,
+.B http
+and
+.B raw
+lines are errors, since they cannot carry UDP.
+.B strict_chain
+is accepted, and
+.BR dynamic_chain ,
+.B random_chain
+and
+.B round_robin_chain
+are errors.
+.B quiet_mode
+and
+.B tcp_connect_time_out
+set
+.B quiet
+and
+.BR connect_timeout .
+Its other directives, such as
+.B proxy_dns
+and
+.BR localnet ,
+are not applied, and each is named in a warning.
+A file has either a
+.B [ProxyList]
+or
+.B proxy
+and
+.B [hop]
+sections, not both.
+.IP
 Comments are whole lines only, beginning with
 .B #
 or
@@ -424,6 +466,14 @@ Send through a chain of two proxies, the second reached through the first:
 .RS
 .EX
 udpchains \-p 10.0.0.1:1080 \-p 10.1.0.5:1080 dig @9.9.9.9 example.com
+.EE
+.RE
+.PP
+Use the chain in an existing proxychains configuration:
+.PP
+.RS
+.EX
+udpchains \-f /etc/proxychains.conf dig @9.9.9.9 example.com
 .EE
 .RE
 .PP

@@ -82,7 +82,8 @@ dns = 9.9.9.9
   (`proxy = 10.0.0.1:1080 # office`) is an error. A `#` inside a value (`abc#def`) is kept, so
   put a password containing ` #` in `password_file`.
 - An unknown key is an error.
-- `[hop]` sections configure a [chain](#chains).
+- `[hop]` sections configure a [chain](#chains). A `proxychains.conf` can be given to `-f` as
+  it is; see [proxychains.conf](#proxychainsconf).
 - `udpchains` sets `UDPCHAINS_RESOLVED` and `UDPCHAINS_PASSWORD_CONFIG` for the program it runs.
   Do not set them by hand.
 
@@ -147,6 +148,36 @@ password_file = ~/.hop2.pw
 - **Name lookups** (`dns`) go through the chain too. The resolver sees queries from the exit hop.
 - **A loopback destination is resolved at the exit hop,** so with a chain it always warns, and
   `strict_loopback` refuses it.
+
+### proxychains.conf
+
+`udpchains -f /etc/proxychains.conf <program>` reads a proxychains configuration as it is, for the
+strict chain of `socks5` proxies it lists. It is never read unless named.
+
+```
+strict_chain
+proxy_dns
+tcp_connect_time_out 8000
+
+[ProxyList]
+socks5  10.0.0.1     1080
+socks5  10.1.0.5     1080  bob  secret
+```
+
+- **Each `socks5` line is a hop,** in order, with its login if it has one. `socks4`, `http` and
+  `raw` proxies cannot carry UDP and are errors.
+- **`strict_chain` is accepted.** `dynamic_chain`, `random_chain` and `round_robin_chain` are
+  errors: chains are strict.
+- **`quiet_mode` and `tcp_connect_time_out`** become `quiet` and `connect_timeout`.
+- **The other directives are not applied,** and a warning names each: `proxy_dns` (set `dns`),
+  `localnet` (there is no bypass; that traffic goes through the proxies or fails), `chain_len`,
+  `tcp_read_time_out`, `remote_dns_subnet`, `dnat`. udpchains' own settings, such as
+  `dns = 9.9.9.9`, can be added before `[ProxyList]`.
+- **A login on a line is treated like `password =`:** a warning if others can read the file, and
+  the password is never put in the program's environment. One containing a space or starting with
+  `#` needs `[hop]` sections and `password_file` instead.
+- A file has either `[ProxyList]` or `proxy =` and `[hop]` sections, not both. `-p` and
+  `UDPCHAINS_PROXY` still replace the file's chain.
 
 ### Datagram size through a chain
 
@@ -378,8 +409,6 @@ host's loopback.
 
 - SOCKS5 authentication methods other than none (`0x00`) and username/password (`0x02`),
   including GSSAPI (`0x01`). A proxy selecting one is refused with a diagnostic.
-- `proxychains.conf`-style `[ProxyList]` configuration. A `[ProxyList]` line is an error that
-  says so.
 - Chains that skip a dead hop or pick hops at random (proxychains' `dynamic_chain` and
   `random_chain`). Chains are strict ([`DECISIONS.md`](DECISIONS.md) D-37).
 - Static and Go binaries, and system calls made without libc. Planned after 0.1.0

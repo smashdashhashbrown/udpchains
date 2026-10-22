@@ -32,6 +32,11 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   - **Descriptors:** when the shim's protected range fills, as a long chain can make it, its
     connection stays where it is, still protected, and a warning says so (D-46). At a low number
     it can make a program's `dup2` onto that number fail with `EBUSY`; the warning names it.
+  - **proxychains.conf:** `udpchains -f proxychains.conf` reads one as it is, for its strict
+    chain of `socks5` hops, inline logins included. `strict_chain` is accepted; the other chain
+    modes and `socks4`, `http` and `raw` proxies are errors naming the line; `quiet_mode` and
+    `tcp_connect_time_out` are applied; the other directives, such as `proxy_dns` and
+    `localnet`, are named in a warning and not applied (D-47, FR-CH-14).
   - **Real proxies:** `make interop` also runs chains of the seven proxies it tests. Each works
     as a middle hop and as the exit hop, and all seven work as one chain. The largest datagram
     through a chain is each hop's own limit less 10 bytes per IPv4 header it carries for the hops
@@ -64,14 +69,15 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 1751 assertions across 21 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
+- 1839 assertions across 21 groups, plus a 91-check symbol gate. TST-05 has 55 new assertions, the
   leak client tries 13 more routes, and the leak test checks the raw-socket refusal. The chain
   configuration adds 89 to unit-config and 5 to the wrapper tests, and chain setup has a new
   group, unit-chain, with 135, against chained fixture proxies. The integration tests run again
   through 2- and 3-hop fixture chains, 378 assertions each, and Valgrind and Helgrind run through
   2 hops. Name lookups are tested through 2 hops (13 more resolver checks), the leak test runs
   with each hop of a 3-hop chain dead in turn (12 more), and the fault tests add the chain's
-  faults and a full descriptor range (26 more). Clean under ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
+  faults and a full descriptor range (26 more). Reading a proxychains.conf adds 83 to unit-config
+  and 5 to the authentication test. Clean under ASan/UBSan, ThreadSanitizer, Valgrind and Helgrind.
   On the wire, as root, the capture script saw no datagram and no lookup leave with each hop of a
   3-hop chain dead in turn.
 - `make interop` adds 70 results for chains of the seven real proxies, all as expected: a 2-hop

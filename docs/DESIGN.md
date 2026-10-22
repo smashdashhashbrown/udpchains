@@ -612,6 +612,11 @@ only, as D-27 does for the one proxy; later hops are checked for form and export
 `UDPCHAINS_USERNAME_<n>` and the password's location as `UDPCHAINS_PASSWORD_FILE_<n>` or
 `UDPCHAINS_PASSWORD_CONFIG_<n>` (D-25, D-38).
 
+A proxychains.conf given to `-f` is read by the same reader (D-47). Its directives are applied,
+refused or warned about one line at a time, and each `socks5` line of its `[ProxyList]` fills the
+next hop's fields as a `[hop]` section does, so nothing after reading knows which form the chain
+was written in. A shim re-reading the file for a password repeats none of the warnings.
+
 ### 12.2 Setup
 
 `udpc_socks_associate_chain` (`src/socks5.c`) builds a `struct udpc_socks_chain`: for each hop *k*,

@@ -134,10 +134,11 @@ static int parse_long(const char *v, long min, long max, long *out)
 	return 0;
 }
 
-/* The shim's permission warnings are the wrapper's to give: launched by the
+/* The warnings about a config file -- its permissions, and proxychains
+ * directives it does not apply -- are the wrapper's to give: launched by the
  * wrapper, a shim reading the same files again would print each warning a
  * second time, once per process (D-33). */
-static bool g_quiet_permissions;
+static bool g_quiet_file_warnings;
 
 /* SEC-03: reads a password from a file, so it never appears in argv or in
  * `ps` output.  Strips one trailing newline, CR included.
@@ -158,7 +159,7 @@ static int read_password_file(const char *path, char *out, size_t outlen,
 		*err = "cannot open password file";
 		return -1;
 	}
-	if (!g_quiet_permissions && fstat(fd, &st) == 0 &&
+	if (!g_quiet_file_warnings && fstat(fd, &st) == 0 &&
 	    (st.st_mode & (S_IRWXG | S_IRWXO)) != 0)
 		udpc_warn("password file %s is group- or world-accessible", path);
 
@@ -385,15 +386,6 @@ int udpc_config_set(struct udpc_config *cfg, const char *key, const char *value,
 		return 0;
 	}
 
-	/* FR-C-04 ([ProxyList] stanzas) is deferred (D-08).  Recognise the
-	 * header specifically so a user who brings a proxychains.conf gets a
-	 * useful message instead of "unknown key". */
-	if (strcasecmp(key, "[proxylist]") == 0) {
-		*err = "proxychains-style [ProxyList] is not supported in v1 "
-		       "(FR-C-04, deferred); use 'proxy = host:port'";
-		return -1;
-	}
-
 	*err = "unknown configuration key";
 	return -1;
 }
@@ -443,6 +435,153 @@ static int set_hop_key(struct udpc_hop *h, const char *key, const char *value,
 	return -1;
 }
 
+/* --- proxychains.conf (FR-CH-14, D-47) --------------------------------------
+ *
+ * A proxychains.conf can be given to -f as it is, for the strict chain of
+ * socks5 hops that udpchains shares with it.  Written from the format as
+ * proxychains documents it, never from its source (D-01). */
+
+/* proxychains' own directives, which come before its [ProxyList], one to a
+ * line as "name" or "name value" ("chain_len = 2" has an '=').  Each is
+ * applied, refused, or named in a warning; none can make anything go direct.
+ * Returns 1 if the line is one, 0 if it is not, and -1 with *err if it is
+ * refused. */
+static int proxychains_directive(struct udpc_config *cfg, const char *line,
+                                 const char *path, int lineno, const char **err)
+{
+	static const struct {
+		const char *name, *why;
+	} ignored[] = {
+		{ "chain_len", "chains are strict, so every hop listed is used" },
+		{ "tcp_read_time_out", "there is no read timeout; connect_timeout "
+		                       "bounds each step of a handshake" },
+		{ "proxy_dns", "names are looked up at the resolver set by dns, "
+		               "through the proxies, and fail without one" },
+		{ "proxy_dns_old", "names are looked up at the resolver set by dns, "
+		                   "through the proxies, and fail without one" },
+		{ "proxy_dns_daemon", "names are looked up at the resolver set by "
+		                      "dns, through the proxies, and fail without one" },
+		{ "remote_dns_subnet", "no placeholder addresses are handed out" },
+		{ "localnet", "there is no bypass, so that traffic goes through the "
+		              "proxies or fails (D-05)" },
+		{ "dnat", "destinations are used as given" },
+	};
+	char name[32];
+	const char *value;
+	size_t len = strcspn(line, " \t=");
+	size_t i;
+
+	if (len == 0 || len >= sizeof(name))
+		return 0;
+	memcpy(name, line, len);
+	name[len] = '\0';
+	value = line + len;
+	value += strspn(value, " \t");
+	if (*value == '=')
+		value += 1 + strspn(value + 1, " \t");
+
+	if (strcmp(name, "strict_chain") == 0)
+		return 1;
+	if (strcmp(name, "dynamic_chain") == 0 || strcmp(name, "random_chain") == 0 ||
+	    strcmp(name, "round_robin_chain") == 0) {
+		*err = "chains are strict: every hop, in order, or the send fails "
+		       "(D-37); use strict_chain";
+		return -1;
+	}
+	if (strcmp(name, "quiet_mode") == 0) {
+		cfg->verbosity = UDPC_QUIET;
+		cfg->set_mask |= UDPC_SET_VERBOSITY;
+		return 1;
+	}
+	if (strcmp(name, "tcp_connect_time_out") == 0) {
+		if (udpc_config_set(cfg, "connect_timeout", value, err) != 0) {
+			*err = "tcp_connect_time_out must be 1..600000 ms";
+			return -1;
+		}
+		return 1;
+	}
+	for (i = 0; i < sizeof(ignored) / sizeof(ignored[0]); i++) {
+		if (strcmp(name, ignored[i].name) != 0)
+			continue;
+		if (!g_quiet_file_warnings)
+			udpc_warn("%s:%d: proxychains' %s is not applied: %s", path,
+			          lineno, name, ignored[i].why);
+		return 1;
+	}
+	return 0;
+}
+
+/* One [ProxyList] line, "type host port [user pass]", separated by spaces or
+ * tabs, as the next hop.  Only socks5 can carry UDP. */
+static int proxylist_entry(struct udpc_config *cfg, char *line, const char **err)
+{
+	char *field[5], *save = NULL, *tok;
+	char spec[sizeof(cfg->proxy_spec)];
+	struct creds c;
+	unsigned n = 0;
+	long port;
+
+	for (tok = strtok_r(line, " \t", &save); tok != NULL;
+	     tok = strtok_r(NULL, " \t", &save)) {
+		/* D4, as for key = value lines. */
+		if (tok[0] == '#') {
+			*err = "'#' after a proxy is not a comment; comments must be on "
+			       "their own line";
+			return -1;
+		}
+		if (n == sizeof(field) / sizeof(field[0])) {
+			*err = "too many fields; a [ProxyList] line is 'socks5 host port "
+			       "[username password]'";
+			return -1;
+		}
+		field[n++] = tok;
+	}
+
+	if (strcasecmp(field[0], "socks4") == 0 || strcasecmp(field[0], "http") == 0 ||
+	    strcasecmp(field[0], "raw") == 0) {
+		*err = "only socks5 can carry UDP; socks4, http and raw proxies "
+		       "cannot";
+		return -1;
+	}
+	if (strcasecmp(field[0], "socks5") != 0) {
+		*err = "unknown proxy type; a [ProxyList] line is 'socks5 host port "
+		       "[username password]'";
+		return -1;
+	}
+	if (n < 3) {
+		*err = "a [ProxyList] line is 'socks5 host port [username password]'";
+		return -1;
+	}
+	if (n == 4) {
+		*err = "a username needs a password after it";
+		return -1;
+	}
+	if (parse_long(field[2], 1, 65535, &port) != 0) {
+		*err = "the port must be 1..65535";
+		return -1;
+	}
+	/* A bare IPv6 address takes the brackets the rest of the configuration
+	 * writes it with. */
+	if (strchr(field[1], ':') != NULL && field[1][0] != '[')
+		snprintf(spec, sizeof(spec), "[%.200s]:%ld", field[1], port);
+	else
+		snprintf(spec, sizeof(spec), "%.240s:%ld", field[1], port);
+
+	if (!(cfg->set_mask & UDPC_SET_PROXY)) {
+		if (udpc_config_set(cfg, "proxy", spec, err) != 0)
+			return -1;
+		c = hop1_creds(cfg);
+	} else {
+		if (udpc_config_append_hop(cfg, spec, err) != 0)
+			return -1;
+		c = hop_creds(&cfg->hops[cfg->nextra - 1]);
+	}
+	if (n == 5 && (set_credential(&c, "username", field[3], err) < 0 ||
+	               set_credential(&c, "password", field[4], err) < 0))
+		return -1;
+	return 0;
+}
+
 int udpc_config_read_file(struct udpc_config *cfg, const char *path,
                           const char **err, int *errline)
 {
@@ -450,6 +589,9 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 	 * section, which is hop k + 1. */
 	unsigned section = 0;
 	int section_line = 0;
+	/* FR-CH-14: inside a proxychains [ProxyList], every line is a hop. */
+	bool proxylist = false;
+	int proxylist_line = 0;
 	FILE *f;
 	char line[1024];
 	int lineno = 0;
@@ -468,7 +610,7 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 	/* SEC-04: this file directs where traffic goes.  If anyone else can
 	 * write it, they can redirect the traffic. */
 	have_st = fstat(fileno(f), &st) == 0;
-	if (!g_quiet_permissions && have_st && (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+	if (!g_quiet_file_warnings && have_st && (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
 		udpc_warn("config file %s is group- or world-writable; "
 		          "it controls where your traffic goes",
 		          path);
@@ -502,12 +644,32 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 			end = p + strlen(p);
 			while (end > p && (end[-1] == ' ' || end[-1] == '\t'))
 				*--end = '\0';
+			if (strcasecmp(p, "[proxylist]") == 0) {
+				/* One way to write a chain to a file (D-47). */
+				*err = proxylist ? "a second [ProxyList]"
+				       : (cfg->set_mask & UDPC_SET_PROXY)
+				               ? "[ProxyList] cannot follow 'proxy =' or "
+				                 "[hop] sections; use one or the other"
+				               : NULL;
+				if (*err != NULL) {
+					*errline = lineno;
+					fclose(f);
+					return -1;
+				}
+				proxylist = true;
+				proxylist_line = lineno;
+				continue;
+			}
 			if (strcasecmp(p, "[hop]") != 0) {
-				/* FR-C-04's message for a proxychains.conf, and
-				 * a plain one for anything else. */
-				if (udpc_config_set(cfg, p, "", err) == 0 ||
-				    strcmp(*err, "unknown configuration key") == 0)
-					*err = "unknown section; the only section is [hop]";
+				*err = "unknown section; the sections are [hop] and "
+				       "[ProxyList]";
+				*errline = lineno;
+				fclose(f);
+				return -1;
+			}
+			if (proxylist) {
+				*err = "[hop] sections cannot follow [ProxyList]; use one "
+				       "or the other";
 				*errline = lineno;
 				fclose(f);
 				return -1;
@@ -534,6 +696,33 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 			section = ++cfg->nextra;
 			section_line = lineno;
 			continue;
+		}
+
+		if (proxylist) {
+			/* "key = value": an '=' after the first word.  One
+			 * inside a password further on is the password's. */
+			const char *after = p + strcspn(p, " \t=");
+
+			if (after[strspn(after, " \t")] == '=') {
+				*err = "only proxies belong after [ProxyList]; put "
+				       "settings before it";
+			} else if (proxylist_entry(cfg, p, err) == 0) {
+				continue;
+			}
+			*errline = lineno;
+			fclose(f);
+			return -1;
+		}
+		if (section == 0) {
+			int rc = proxychains_directive(cfg, p, path, lineno, err);
+
+			if (rc > 0)
+				continue;
+			if (rc < 0) {
+				*errline = lineno;
+				fclose(f);
+				return -1;
+			}
 		}
 
 		eq = strchr(p, '=');
@@ -593,6 +782,12 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 		fclose(f);
 		return -1;
 	}
+	if (proxylist && !(cfg->set_mask & UDPC_SET_PROXY)) {
+		*err = "[ProxyList] lists no proxy";
+		*errline = proxylist_line;
+		fclose(f);
+		return -1;
+	}
 
 	if (ferror(f)) {
 		*err = "read error";
@@ -623,7 +818,7 @@ int udpc_config_read_file(struct udpc_config *cfg, const char *path,
 		/* L5: SEC-04 warns about a writable config file because it
 		 * directs traffic; one holding a password also matters when
 		 * others can merely READ it. */
-		if (!g_quiet_permissions && have_st &&
+		if (!g_quiet_file_warnings && have_st &&
 		    (st.st_mode & (S_IRGRP | S_IROTH)) != 0)
 			udpc_warn("config file %s holds a password and is readable "
 			          "by other users",
@@ -699,10 +894,16 @@ static int password_from_config(const char *path, unsigned hop, char *out,
 {
 	static struct udpc_config tmp;
 	const char *ferr = NULL;
-	int fline = 0, rc = -1;
+	int fline = 0, rc = -1, read_rc;
+	bool quiet = g_quiet_file_warnings;
 
+	/* Only the password is wanted.  Whoever named this file has already
+	 * read it, and said what there was to say about it. */
 	udpc_config_init(&tmp);
-	if (udpc_config_read_file(&tmp, path, &ferr, &fline) == 0) {
+	g_quiet_file_warnings = true;
+	read_rc = udpc_config_read_file(&tmp, path, &ferr, &fline);
+	g_quiet_file_warnings = quiet;
+	if (read_rc == 0) {
 		const uint32_t mask = hop == 1 ? tmp.set_mask : tmp.hops[hop - 2].set_mask;
 		const char *pw = hop == 1 ? tmp.password : tmp.hops[hop - 2].password;
 
@@ -1159,7 +1360,7 @@ int udpc_config_load_shim(struct udpc_config *cfg, const char **err)
 	if (getenv("UDPCHAINS_RESOLVED") != NULL) {
 		/* The wrapper has already warned about any file's permissions;
 		 * each process under it saying so again is noise (D-33). */
-		g_quiet_permissions = true;
+		g_quiet_file_warnings = true;
 		/* D-27: the wrapper exported a complete, resolved configuration,
 		 * and it is the whole of it.  Consulting the default config files
 		 * as well, as this once did, let ~/.udpchains.conf supply

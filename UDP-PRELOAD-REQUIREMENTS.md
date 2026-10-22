@@ -209,7 +209,7 @@ indistinguishable from an unhooked socket.
 | FR-C-01 | M | A wrapper executable SHALL provide `udpchains [-f config] <program> [args…]`, setting `LD_PRELOAD` and exec-ing the program. | integration |
 | FR-C-02 | M | Configuration SHALL be read from, in precedence order: command line, environment (`UDPCHAINS_PROXY`, `UDPCHAINS_CONFIG`), config file, built-in default. | unit |
 | FR-C-03 | M | An unparseable or missing configuration SHALL cause a clear diagnostic and refuse to run the program, rather than running it unproxied. | unit |
-| FR-C-04 | S | The config file SHALL accept a `proxychains.conf`-like `[ProxyList]` stanza so existing muscle memory transfers. Deferred with FR-P-10, whose chains it would list (FR-CH-14, §2a). | manual |
+| FR-C-04 | S | The config file SHALL accept a `proxychains.conf`-like `[ProxyList]` stanza so existing muscle memory transfers. Deferred with FR-P-10, whose chains it lists; implemented with them as FR-CH-14 (§2a, D-47). | manual |
 | FR-C-05 | M | Diagnostics SHALL go to stderr with a recognizable prefix, at a verbosity set by `UDPCHAINS_QUIET`/`-q` and `UDPCHAINS_DEBUG`/`-v`. | manual |
 | FR-C-06 | S | At default verbosity the shim SHALL print one line per association established, naming the destination — so the operator can see that proxying is actually happening. | manual |
 

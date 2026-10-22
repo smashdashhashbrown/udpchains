@@ -205,5 +205,64 @@ else
 	notok "no warning for a readable config file holding a password: $out"
 fi
 
+# --- FR-CH-14: a proxychains.conf, as it is (D-47) ----------------------------
+# An open hop 1, then the proxy demanding a login as hop 2, with the login
+# inline on its [ProxyList] line, as proxychains writes it.  The directives
+# udpchains does not apply are warned about by the wrapper, once each.
+cat > "$TMP/proxychains.conf" <<PC
+# proxychains.conf
+strict_chain
+proxy_dns
+tcp_read_time_out 15000
+tcp_connect_time_out 8000
+localnet 127.0.0.0/255.0.0.0
+
+[ProxyList]
+socks5	127.0.0.1	$PROXY2
+socks5	127.0.0.1	$PROXY	alice	s3cret
+PC
+chmod 600 "$TMP/proxychains.conf"
+before=$(grep -c "user 'alice' accepted" "$TMP/proxy.out" || true)
+out=$(echo "proxychains-conf-ok" | env -u UDPCHAINS_PROXY -u UDPCHAINS_QUIET \
+	timeout 15 "$WRAPPER" -f "$TMP/proxychains.conf" \
+	nc -u -w 3 127.0.0.1 "$ECHO_PORT" 2>&1) || true
+if printf '%s' "$out" | grep -q proxychains-conf-ok; then
+	ok "FR-CH-14: a proxychains.conf's chain carries the datagram"
+else
+	notok "FR-CH-14: a proxychains.conf's chain failed: $out"
+fi
+after=$(grep -c "user 'alice' accepted" "$TMP/proxy.out" || true)
+if [ "$after" -gt "$before" ]; then
+	ok "hop 2 authenticated with the login from its [ProxyList] line"
+else
+	notok "hop 2 logged no authentication"
+fi
+c=$(printf '%s\n' "$out" | grep -c "proxychains' .* is not applied" || true)
+if [ "$c" = "3" ]; then
+	ok "proxy_dns, tcp_read_time_out and localnet are each warned about once"
+else
+	notok "$c warnings about proxychains directives, not 3: $out"
+fi
+envout=$(env -u UDPCHAINS_PROXY "$WRAPPER" -q -f "$TMP/proxychains.conf" env 2>&1) || true
+if printf '%s' "$envout" | grep -q s3cret; then
+	notok "D-25: a [ProxyList] password is in the target's environment"
+elif printf '%s' "$envout" | grep -q "^UDPCHAINS_PASSWORD_CONFIG_2=$TMP/proxychains.conf\$"; then
+	ok "D-25: hop 2's password is passed on by naming the file"
+else
+	notok "UDPCHAINS_PASSWORD_CONFIG_2 was not passed on: $envout"
+fi
+
+printf 'dynamic_chain\n[ProxyList]\nsocks5 127.0.0.1 %s\n' "$PROXY2" \
+	> "$TMP/dynamic.conf"
+out=$(env -u UDPCHAINS_PROXY "$WRAPPER" -f "$TMP/dynamic.conf" \
+	/bin/echo TARGET-RAN 2>&1) || true
+if printf '%s' "$out" | grep -q TARGET-RAN; then
+	notok "a dynamic_chain file ran the program"
+elif printf '%s' "$out" | grep -q "dynamic.conf:1: chains are strict"; then
+	ok "a dynamic_chain file is refused, naming the line, and nothing runs"
+else
+	notok "a dynamic_chain file was refused without the reason: $out"
+fi
+
 echo "1..$n"
 [ "$fail" -eq 0 ] || exit 1

@@ -83,14 +83,6 @@ int main(void)
 		err = NULL;
 		TAP_EQ_INT(udpc_config_set(&layer, "strict_loopback", "maybe", &err),
 		           -1, "a non-boolean strict_loopback is rejected");
-
-		/* A proxychains.conf brought over by muscle memory should say
-		 * something useful rather than "unknown key" (FR-C-04, D-08). */
-		err = NULL;
-		TAP_EQ_INT(udpc_config_set(&layer, "[ProxyList]", "", &err), -1,
-		           "a [ProxyList] stanza is rejected");
-		TAP_OK(err != NULL && strstr(err, "FR-C-04") != NULL,
-		       "with a message pointing at the deferred requirement");
 	}
 
 	TAP_GROUP("valid values are accepted");
@@ -391,7 +383,7 @@ int main(void)
 			{ "badkey.conf",
 			  "proxy = 127.0.0.1:1080\n[hop]\nproxy = 10.0.0.5:1081\nmax_datagram = 100\n",
 			  "[hop] section", 4 },
-			{ "section.conf", "proxy = 127.0.0.1:1080\n[hops]\n", "[hop]", 2 },
+			{ "section.conf", "proxy = 127.0.0.1:1080\n[hops]\n", "[hop] and [ProxyList]", 2 },
 		};
 		size_t i;
 
@@ -664,6 +656,155 @@ int main(void)
 		v = getenv("UDPCHAINS_CHAIN_TIMEOUT");
 		TAP_EQ_STR(v ? v : "", "2500", "and a value as itself");
 		unsetenv("UDPCHAINS_CHAIN_TIMEOUT");
+	}
+
+	TAP_GROUP("FR-CH-14: a proxychains.conf is read as it is (D-47)");
+	{
+		const char *path, *v;
+
+		/* The shape of the file proxychains documents: its directives,
+		 * then the list.  Fields separated by spaces or tabs. */
+		path = write_conf("proxychains.conf",
+		                  "# proxychains.conf\n"
+		                  "strict_chain\n"
+		                  "quiet_mode\n"
+		                  "proxy_dns\n"
+		                  "remote_dns_subnet 224\n"
+		                  "tcp_read_time_out 15000\n"
+		                  "tcp_connect_time_out 8000\n"
+		                  "localnet 127.0.0.0/255.0.0.0\n"
+		                  "chain_len = 2\n"
+		                  "dns = 9.9.9.9\n"
+		                  "\n"
+		                  "[ProxyList]\n"
+		                  "# type host port [user pass]\n"
+		                  "socks5\t10.0.0.1\t1080\n"
+		                  "socks5  inner.example  1081  bob  b=pw#2\n"
+		                  "SOCKS5 fd00::9 1082\n",
+		                  0600);
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &line), 0,
+		           "a proxychains.conf parses (%s)", err ? err : "ok");
+		TAP_EQ_STR(layer.proxy_spec, "10.0.0.1:1080", "its first proxy is hop 1");
+		TAP_EQ_INT(layer.nextra, 2, "and the others follow, in order");
+		TAP_EQ_STR(layer.hops[0].spec, "inner.example:1081", "a name is kept as written");
+		TAP_EQ_STR(layer.hops[0].username, "bob", "with its username");
+		TAP_EQ_STR(layer.hops[0].password, "b=pw#2",
+		           "and its password, '=' and '#' included");
+		TAP_OK(layer.hops[0].password_config[0] == '/',
+		       "which is passed on by naming the file (D-25)");
+		TAP_EQ_STR(layer.hops[1].spec, "[fd00::9]:1082",
+		           "a bare IPv6 address is bracketed");
+		TAP_OK(!layer.have_credentials && !(layer.set_mask & UDPC_SET_PASSWORD),
+		       "hop 1, listed without credentials, has none");
+		TAP_EQ_INT(layer.connect_timeout_ms, 8000,
+		           "tcp_connect_time_out becomes connect_timeout");
+		TAP_EQ_INT(layer.verbosity, UDPC_QUIET, "quiet_mode becomes quiet");
+		TAP_OK(layer.dns_set, "and udpchains' own settings sit beside them");
+
+		/* Handed to the shim as any chain is. */
+		udpc_config_defaults(&cfg);
+		udpc_config_merge(&cfg, &layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_finalize(&cfg, &err), 0, "it finalises (%s)",
+		           err ? err : "ok");
+		TAP_EQ_INT(udpc_config_export(&cfg), 0, "and exports");
+		v = getenv("UDPCHAINS_PROXY");
+		TAP_EQ_STR(v ? v : "", "10.0.0.1:1080,inner.example:1081,[fd00::9]:1082",
+		           "as the same chain");
+		TAP_OK(getenv("UDPCHAINS_PASSWORD_2") == NULL, "never with the password");
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), 0, "the shim reads it back (%s)",
+		           err ? err : "ok");
+		TAP_EQ_STR(layer.hops[0].password, "b=pw#2",
+		           "hop 2's password from the proxychains.conf");
+
+		/* Credentials on hop 1 are hop 1's. */
+		path = write_conf("pc-auth.conf",
+		                  "[ProxyList]\nsocks5 127.0.0.1 1080 alice apw\n", 0600);
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &line), 0,
+		           "a single authenticated proxy parses (%s)", err ? err : "ok");
+		TAP_OK(layer.nextra == 0 && strcmp(layer.username, "alice") == 0 &&
+		       strcmp(layer.password, "apw") == 0,
+		       "as hop 1 with its credentials");
+		TAP_OK(layer.password_config[0] == '/',
+		       "its inline password passed on by naming the file");
+	}
+
+	TAP_GROUP("FR-CH-14: what a proxychains.conf cannot carry is an error, with a line number");
+	{
+		static const struct {
+			const char *name, *text, *needle;
+			int line;
+		} bad[] = {
+			{ "pc-dynamic.conf", "dynamic_chain\n[ProxyList]\nsocks5 10.0.0.1 1080\n",
+			  "strict", 1 },
+			{ "pc-random.conf", "random_chain\n", "strict", 1 },
+			{ "pc-rr.conf", "round_robin_chain\n", "strict", 1 },
+			{ "pc-socks4.conf", "[ProxyList]\nsocks4 127.0.0.1 9050\n", "UDP", 2 },
+			{ "pc-http.conf", "[ProxyList]\nsocks5 10.0.0.1 1080\nhttp 10.0.0.2 8080\n",
+			  "UDP", 3 },
+			{ "pc-raw.conf", "[ProxyList]\nraw 10.0.0.1 1080\n", "UDP", 2 },
+			{ "pc-type.conf", "[ProxyList]\nsocks 10.0.0.1 1080\n", "unknown proxy type", 2 },
+			{ "pc-port0.conf", "[ProxyList]\nsocks5 10.0.0.1 0\n", "port", 2 },
+			{ "pc-port.conf", "[ProxyList]\nsocks5 10.0.0.1 70000\n", "port", 2 },
+			{ "pc-noport.conf", "[ProxyList]\nsocks5 10.0.0.1\n", "socks5 host port", 2 },
+			{ "pc-nopw.conf", "[ProxyList]\nsocks5 10.0.0.1 1080 alice\n", "password", 2 },
+			{ "pc-many.conf", "[ProxyList]\nsocks5 10.0.0.1 1080 a b c\n", "too many", 2 },
+			{ "pc-comment.conf", "[ProxyList]\nsocks5 10.0.0.1 1080 # office\n", "comment", 2 },
+			{ "pc-mixed.conf", "proxy = 10.0.0.1:1080\n[ProxyList]\nsocks5 10.0.0.2 1080\n",
+			  "one or the other", 2 },
+			{ "pc-hop.conf", "[ProxyList]\nsocks5 10.0.0.1 1080\n[hop]\nproxy = 10.0.0.2:1080\n",
+			  "one or the other", 3 },
+			{ "pc-twice.conf", "[ProxyList]\nsocks5 10.0.0.1 1080\n[ProxyList]\n",
+			  "second", 3 },
+			{ "pc-empty.conf", "strict_chain\n[ProxyList]\n# none yet\n", "no proxy", 2 },
+			{ "pc-after.conf", "[ProxyList]\nsocks5 10.0.0.1 1080\ndns = 9.9.9.9\n",
+			  "before it", 3 },
+			{ "pc-timeout.conf", "tcp_connect_time_out 0\n", "tcp_connect_time_out", 1 },
+			{ "pc-hopkey.conf", "proxy = 10.0.0.1:1080\n[hop]\nproxy = 10.0.0.2:1080\nstrict_chain\n",
+			  "key = value", 4 },
+		};
+		char conf[1024];
+		const char *path;
+		size_t i, off;
+		int n, at;
+
+		for (i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+			path = write_conf(bad[i].name, bad[i].text, 0600);
+			at = 0;
+			udpc_config_init(&layer);
+			err = NULL;
+			TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &at), -1,
+			           "%s is rejected", bad[i].name);
+			TAP_OK(err != NULL && strstr(err, bad[i].needle) != NULL,
+			       "saying '%s' (%s)", bad[i].needle, err ? err : "no message");
+			TAP_EQ_INT(at, bad[i].line, "on line %d", bad[i].line);
+		}
+
+		/* D-42 holds for a list as for [hop] sections. */
+		off = (size_t)snprintf(conf, sizeof(conf), "[ProxyList]\n");
+		for (n = 1; n <= 8; n++)
+			off += (size_t)snprintf(conf + off, sizeof(conf) - off,
+			                        "socks5 10.0.0.%d 1080\n", n);
+		path = write_conf("pc-eight.conf", conf, 0600);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &line), 0,
+		           "a list of 8 parses");
+		TAP_EQ_INT(layer.nextra, 7, "as a chain of 8");
+		snprintf(conf + off, sizeof(conf) - off, "socks5 10.0.0.9 1080\n");
+		path = write_conf("pc-nine.conf", conf, 0600);
+		udpc_config_init(&layer);
+		err = NULL;
+		at = 0;
+		TAP_EQ_INT(udpc_config_read_file(&layer, path, &err, &at), -1,
+		           "a ninth is rejected");
+		TAP_OK(err != NULL && strstr(err, "8") != NULL && at == 10,
+		       "naming the limit, on its line (%s, line %d)", err ? err : "no message", at);
 	}
 
 	{
