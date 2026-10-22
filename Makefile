@@ -70,13 +70,15 @@ SRCDIR  := src
 OBJDIR  := build
 TESTDIR := tests
 
-# Everything except the wrapper's own main() belongs to the shim.
-SHIM_SRCS    := $(filter-out $(SRCDIR)/wrapper.c,$(wildcard $(SRCDIR)/*.c))
+# Everything except the wrapper's own main() and the supervisor belongs to the
+# shim.
+SHIM_SRCS    := $(filter-out $(SRCDIR)/wrapper.c $(SRCDIR)/supervise.c,\
+                             $(wildcard $(SRCDIR)/*.c))
 SHIM_OBJS    := $(SHIM_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 
 # The wrapper links only the pieces it needs: no hooks, no fd table.
 WRAPPER_SRCS := $(SRCDIR)/wrapper.c $(SRCDIR)/config.c $(SRCDIR)/log.c \
-                $(SRCDIR)/addr.c
+                $(SRCDIR)/addr.c $(SRCDIR)/supervise.c
 WRAPPER_OBJS := $(WRAPPER_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 
 SHIM    := libudpchains.so
@@ -92,7 +94,8 @@ TESTS    := $(OBJDIR)/test_config $(OBJDIR)/test_socks5 $(OBJDIR)/test_addr \
             $(OBJDIR)/leakclient $(OBJDIR)/test_faults \
             $(OBJDIR)/test_fdtable_mt $(OBJDIR)/test_portswitch \
             $(OBJDIR)/bench_latency $(OBJDIR)/test_dns \
-            $(OBJDIR)/test_resolve
+            $(OBJDIR)/test_resolve $(OBJDIR)/test_supervise_unit \
+            $(OBJDIR)/test_supervise $(OBJDIR)/leakclient-static
 
 .PHONY: all clean test check install uninstall fixtures tests interop compare
 
@@ -185,6 +188,22 @@ $(OBJDIR)/test_portswitch: $(TESTDIR)/test_portswitch.c | $(OBJDIR)
 
 $(OBJDIR)/leakclient: $(TESTDIR)/leakclient.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $< $(LDFLAGS)
+
+# Supervisor mode (D-48 to D-53).  The probes are built -static: the programs
+# the mode exists for, which the shim cannot see at all.  The sanitisers cannot
+# link statically, so the probes are built without them; the supervisor they
+# run under is what an ASan run checks.
+STATIC_CFLAGS  = $(filter-out -fsanitize=%,$(CFLAGS))
+STATIC_LDFLAGS = $(filter-out -fsanitize=%,$(LDFLAGS))
+$(OBJDIR)/test_supervise_unit: $(TESTDIR)/test_supervise_unit.c $(OBJDIR)/supervise.o \
+                               $(OBJDIR)/log.o | $(OBJDIR)
+	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS)
+
+$(OBJDIR)/test_supervise: $(TESTDIR)/test_supervise.c | $(OBJDIR)
+	$(CC) $(STATIC_CFLAGS) -I$(SRCDIR) -static -o $@ $< $(STATIC_LDFLAGS)
+
+$(OBJDIR)/leakclient-static: $(TESTDIR)/leakclient.c | $(OBJDIR)
+	$(CC) $(STATIC_CFLAGS) -I$(SRCDIR) -static -o $@ $< $(STATIC_LDFLAGS)
 
 $(OBJDIR)/bench_latency: $(TESTDIR)/bench_latency.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $< $(LDFLAGS)

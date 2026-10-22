@@ -9,6 +9,29 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) and mapped in
 [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
 
+## [Unreleased]
+
+### Added
+
+- **Supervisor mode** (D-48 to D-53), in progress, for static and Go binaries, which the shim
+  cannot see. `udpchains --supervise` (or `supervise = yes`, or `UDPCHAINS_SUPERVISE=1`) runs the
+  program under a seccomp filter whose calls udpchains answers, instead of preloading the shim.
+  - **So far** (step 2 of `docs/FUTURE-STATIC-BINARIES.md`): the program runs under the filter
+    and is never given the shim; its exit status and the signals sent to `udpchains` are passed
+    on; descendants it leaves running are waited for and stay supervised. x86-64 and Linux 5.14
+    or later only.
+  - **Not yet: UDP.** A UDP socket is refused (`EPROTONOSUPPORT`) rather than made, so nothing is
+    sent directly while the mode is built. Already refused, as decided: raw, packet, ICMP and
+    UDP-Lite sockets; `io_uring_setup`; `pidfd_getfd`; sends, connects, `sendfile` and `splice`
+    on a UDP socket received from another process; and starting with an inherited UDP socket.
+  - Not yet in the README, man page or `udpchains -h`.
+
+### Verification
+
+- 1883 assertions across 23 groups. Supervisor mode adds `unit-supervise` (11), 6 to
+  unit-config, and `FR-SV-supervise` (27 checks, with a static probe making 18 assertions). The
+  supervisor also runs under ASan and UBSan.
+
 ## [0.2.0] — 2026-10-21
 
 Multi-hop chains, a proxychains.conf read as it is, and the routes around the hooks closed.

@@ -167,12 +167,20 @@ run_asan() {
 	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0:exitcode=99"
 
 	local t rc
-	for t in test_addr test_config test_socks5 test_chain test_dns; do
+	for t in test_addr test_config test_socks5 test_chain test_dns \
+		test_supervise_unit; do
 		echo "--- $t"
 		"$BUILD/$t" > "$TMP/$t.out" 2>&1
 		rc=$?
 		report "$t" "$TMP/$t.out" "$rc"
 	done
+
+	# The supervisor (D-48) lives in the wrapper, built with the sanitisers
+	# here; the programs it runs are not.
+	echo "--- supervisor"
+	NO_SHIM=1 "$ROOT/tests/test_supervise.sh" "$ROOT/udpchains" "$BUILD" > "$TMP/sv.out" 2>&1
+	rc=$?
+	report "supervisor" "$TMP/sv.out" "$rc"
 
 	unset ASAN_OPTIONS UBSAN_OPTIONS
 	rm -rf "$TMP"; TMP=""

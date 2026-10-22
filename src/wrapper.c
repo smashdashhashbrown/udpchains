@@ -3,7 +3,8 @@
  * Resolves configuration, refuses to run if it cannot, sets LD_PRELOAD, and
  * execs the target.  Configuration is resolved BEFORE exec so that a failure is
  * attributable to the wrapper rather than being emitted from inside the
- * target's address space.
+ * target's address space.  With --supervise it runs the target under the
+ * supervisor instead (supervise.c, D-49).
  */
 #include "compat.h"
 
@@ -24,6 +25,7 @@
 #include "addr.h"
 #include "config.h"
 #include "log.h"
+#include "supervise.h"
 
 #ifndef UDPCHAINS_LIBDIR
 #define UDPCHAINS_LIBDIR "/usr/local/lib"
@@ -345,6 +347,33 @@ static int set_preload(const char *shim)
 	return setenv("LD_PRELOAD", buf, 1);
 }
 
+/* D-49: a supervised program is not also given the shim.  Removes
+ * libudpchains.so from an LD_PRELOAD the program would inherit, keeping
+ * whatever else is there. */
+static int strip_preload(void)
+{
+	const char *existing = getenv("LD_PRELOAD");
+	char in[8192], out[8192];
+	char *tok, *save = NULL;
+	size_t off = 0;
+
+	if (existing == NULL)
+		return 0;
+	if (snprintf(in, sizeof(in), "%s", existing) >= (int)sizeof(in))
+		return -1;
+	out[0] = '\0';
+	/* ld.so(8): entries are separated by colons or spaces. */
+	for (tok = strtok_r(in, ": ", &save); tok != NULL; tok = strtok_r(NULL, ": ", &save)) {
+		const char *base = strrchr(tok, '/');
+
+		if (strcmp(base != NULL ? base + 1 : tok, "libudpchains.so") == 0)
+			continue;
+		off += (size_t)snprintf(out + off, sizeof(out) - off, "%s%s",
+		                        off ? ":" : "", tok);
+	}
+	return out[0] != '\0' ? setenv("LD_PRELOAD", out, 1) : unsetenv("LD_PRELOAD");
+}
+
 int main(int argc, char **argv)
 {
 	struct udpc_config cfg, cli;
@@ -383,6 +412,11 @@ int main(int argc, char **argv)
 		if (strcmp(a, "-v") == 0) {
 			cli.verbosity = UDPC_DEBUG;
 			cli.set_mask |= UDPC_SET_VERBOSITY;
+			continue;
+		}
+		if (strcmp(a, "--supervise") == 0) {
+			cli.supervise = true;
+			cli.set_mask |= UDPC_SET_SUPERVISE;
 			continue;
 		}
 		if (strcmp(a, "-f") == 0) {
@@ -457,6 +491,16 @@ int main(int argc, char **argv)
 
 	if (refuse_if_privileged(program) != 0)
 		return 1;
+
+	if (cfg.supervise) {
+		if (udpc_config_export(&cfg) != 0 || strip_preload() != 0) {
+			fprintf(stderr, "udpchains: cannot set up the environment: %s\n",
+			        strerror(errno));
+			return 1;
+		}
+		explicit_bzero(cli.password, sizeof(cli.password));
+		return udpc_supervise(program, &argv[i]);
+	}
 
 	if (find_shim(shim, sizeof(shim)) != 0)
 		return 1;

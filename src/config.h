@@ -52,6 +52,7 @@
 #define UDPC_SET_DNS_SEARCH (1u << 10)
 #define UDPC_SET_HOSTS_FILE (1u << 11)
 #define UDPC_SET_CHAIN_TIMEOUT (1u << 12)
+#define UDPC_SET_SUPERVISE (1u << 13)
 
 /* Hop 2 onwards of a chain (D-38).  Hop 1 is the top-level proxy and credential
  * fields of struct udpc_config, which a chain of one uses exactly as 0.1.0 did
@@ -85,6 +86,10 @@ struct udpc_config {
 	 * limit for a chain of one, as in 0.1.0. */
 	bool chain_timeout_set;
 	int chain_timeout_ms;               /* when chain_timeout_set */
+
+	/* D-49: run the program under the supervisor instead of the shim.  The
+	 * wrapper's alone; never exported to the program. */
+	bool supervise;
 
 	/* D-22: the resolver the shim queries through the proxy.  Numeric
 	 * only, since a named resolver would need resolving first.  There is

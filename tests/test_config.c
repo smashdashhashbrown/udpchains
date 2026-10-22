@@ -807,6 +807,28 @@ int main(void)
 		       "naming the limit, on its line (%s, line %d)", err ? err : "no message", at);
 	}
 
+	TAP_GROUP("D-49: supervise");
+	{
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_set(&layer, "supervise", "yes", &err), 0,
+		           "supervise = yes is accepted");
+		TAP_OK(layer.supervise && (layer.set_mask & UDPC_SET_SUPERVISE), "and set");
+		err = NULL;
+		TAP_EQ_INT(udpc_config_set(&layer, "supervise", "sometimes", &err), -1,
+		           "a non-boolean is rejected");
+		setenv("UDPCHAINS_SUPERVISE", "1", 1);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), 0, "UDPCHAINS_SUPERVISE is read");
+		TAP_OK(layer.supervise, "and chooses it");
+		udpc_config_defaults(&cfg);
+		udpc_config_set(&cfg, "proxy", "127.0.0.1:1080", &err);
+		udpc_config_finalize(&cfg, &err);
+		udpc_config_export(&cfg);
+		TAP_OK(getenv("UDPCHAINS_SUPERVISE") == NULL,
+		       "the export does not pass it on to the program");
+	}
+
 	{
 		char cmd[600];
 		snprintf(cmd, sizeof(cmd), "rm -rf %s", g_tmpdir);

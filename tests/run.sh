@@ -92,6 +92,7 @@ run_test unit-socks5  "$BUILD/test_socks5"
 run_test unit-chain   "$BUILD/test_chain"
 run_test unit-fdtable "$BUILD/test_fdtable_mt"
 run_test unit-dns     "$BUILD/test_dns"
+run_test unit-supervise "$BUILD/test_supervise_unit"
 
 # --- integration tests, under the shim ---------------------------------------
 
@@ -178,6 +179,10 @@ run_test wrapper-loadable "$ROOT/tests/test_wrapper.sh" "$WRAPPER" \
 	"$ROOT/libudpchains.so"
 
 run_test TST-03-leak "$ROOT/tests/test_leak.sh" "$ECHO1"
+
+# --- supervisor mode (D-48 to D-53): static programs, under the filter -------
+
+run_test FR-SV-supervise "$ROOT/tests/test_supervise.sh" "$WRAPPER" "$BUILD"
 
 # --- fault injection: FR-P-08, FR-P-04, D-12 ---------------------------------
 

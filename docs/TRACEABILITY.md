@@ -25,18 +25,19 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 1839 assertions across 21 groups (`tests/run.sh`), all passing, plus the 91-check
+**Test totals:** 1883 assertions across 23 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
 | Group | Assertions |
 |---|---|
 | unit-addr | 51 |
-| unit-config | 226 |
+| unit-config | 232 |
 | unit-socks5 | 88 |
 | unit-chain | 135 |
 | unit-fdtable | 22 |
 | unit-dns | 52 |
+| unit-supervise | 11 |
 | TST-01 hook matrix | 108 |
 | TST-05 fidelity | 171 |
 | port switch (TFTP pattern) | 12 |
@@ -50,6 +51,7 @@ from a run rather than editing it by hand.
 | wrapper loadability | 17 |
 | TST-03 leak | 23 checks |
 | fault injection | 43 |
+| FR-SV supervisor mode, step 2 | 27 checks, one running a static probe making 18 assertions of its own |
 | TST-04 real tools | 2 run, 3 skipped (automated, against the fixture) |
 | NFR-04 latency benchmark | reported, not a gate (D-08) |
 | TST-02 symbol check | 71 (build gate, `make check`) |
@@ -203,35 +205,36 @@ means no code yet.
 | FR-CH-T3 | M | faults | **Verified** — expiry at the middle hop, `FRAG` at the middle and innermost layers, a forged inner source behind a genuine outer one, and a hop refusing `CONNECT` |
 | FR-CH-T4 | S | interop | **Verified** on this host — `make interop` runs a ring of 2-hop chains of the seven proxies, so each is once a middle hop and once the exit hop, and one chain of all seven. Every proxy serves as a middle hop. Each 2-hop chain passes the matrix, the resolver over UDP and chained `CONNECT`, an IPv6 destination, and a hop 2 given by name; fidelity and the port-switch test follow the exit hop alone; the largest datagram is as predicted from each hop's own; and with each hop killed in turn, nothing reaches the destination and the same socket recovers. The 7-hop chain passes the matrix, lifecycle, resolver, IPv6 and size checks, and the same with its middle hop killed. Results in [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) §13. Not across hosts |
 
-## Supervisor mode (§2b), planned
+## Supervisor mode (§2b), in progress
 
 Not part of v1 scope, and not counted in the summary above. Design: D-48 to D-53, decided
-2026-10-22; no code yet. The accepted limitations are listed in
+2026-10-22. Step 2 of the plan is built: the supervisor runs a program under its filter and
+answers it, but refuses UDP until step 3 carries it. The accepted limitations are listed in
 [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §9.
 
 | ID | Pri | Test | Status |
 |---|---|---|---|
-| FR-SV-01 | M | — | **Not started** |
-| FR-SV-02 | M | — | **Not started** |
-| FR-SV-03 | M | — | **Not started** |
+| FR-SV-01 | M | FR-SV-supervise | **Partial** — `--supervise`, `supervise = yes` and `UDPCHAINS_SUPERVISE` choose it, and the variable is not passed to the program; without them, every shim-mode group passes as before and the program has no filter. The shim is not given to a supervised program: `libudpchains.so` is removed from an inherited `LD_PRELOAD`. Same configuration and diagnostics once UDP is carried (step 3) |
+| FR-SV-02 | M | unit-supervise, FR-SV-supervise | **Partial** — refuses before the `exec`, never running the program unsupervised: a kernel older than 5.14 (the release check unit-tested), no seccomp, a filter refused, a listener the parent cannot copy, an inherited UDP, raw or packet socket (tested). Only the last can be tested on this host |
+| FR-SV-03 | M | FR-SV-supervise | **Verified** — from a static probe, an x32 call and a 32-bit `int $0x80` call both fail with `ENOSYS`; only x86-64 is supported so far, and any other build refuses supervisor mode |
 | FR-SV-04 | M | — | **Not started** |
 | FR-SV-05 | M | — | **Not started** |
 | FR-SV-06 | M | — | **Not started** |
 | FR-SV-07 | M | — | **Not started** |
 | FR-SV-08 | M | — | **Not started** |
-| FR-SV-09 | M | — | **Not started** |
+| FR-SV-09 | M | FR-SV-supervise | **Partial** — `io_uring_setup` `ENOSYS`, `pidfd_getfd` `EPERM`, raw and packet sockets `EPERM`, ICMP datagram sockets `EPROTONOSUPPORT`, and `sendfile`/`splice` onto a received UDP socket `EINVAL`, each with a diagnostic not hidden by another's, from a static probe. `sendfile`/`splice` onto a reserved socket waits for the range (step 3) |
 | FR-SV-10 | M | — | **Not started** |
-| FR-SV-11 | M | — | **Not started** |
+| FR-SV-11 | M | FR-SV-supervise | **Partial** — the supervisor exits with the program's status, or dies of the signal that killed it; signals sent to it reach the program, and one the program handles is handled; it stays for a descendant the program leaves running, which is supervised. Per-descriptor state across `fork`, threads and `exec` comes with the range (steps 3 and 5) |
 | FR-SV-12 | M | — | **Not started** |
 | FR-SV-13 | M | — | **Not started** |
-| FR-SV-14 | M | — | **Not started** |
+| FR-SV-14 | M | inspection, FR-SV-supervise | **Partial** — the supervisor opens no socket of its own, and logs no payload (it reads none yet); setuid, setgid and capability targets are refused before supervision, as in shim mode |
 | FR-SV-15 | S | — | **Not started** |
 | FR-SV-16 | S | — | **Not started** |
 | FR-SV-17 | C | — | **Not started** |
-| FR-SV-18 | M | — | **Not started** |
+| FR-SV-18 | M | FR-SV-supervise | **Verified** — a UDP socket received over `SCM_RIGHTS` from an unsupervised process: `sendto`, `send`, `sendmsg`, `sendmmsg` and `connect` fail with `EPERM`, `sendfile` and `splice` onto it with `EINVAL`; D-50's documented `write()` gap is shown to deliver its one byte and nothing else. An inherited UDP socket refuses the run, naming the descriptor. With the `socket()` trap removed (a mutation), the dynamic and static leak clients still sent nothing |
 | FR-SV-19 | M | — | **Not started** |
 | FR-SV-T1 | M | — | **Not started** |
-| FR-SV-T2 | M | — | **Not started** |
+| FR-SV-T2 | M | FR-SV-supervise | **Partial** — the leak client, static and dynamic, sends nothing and the destination receives nothing. The wire capture and the supervisor killed mid-run: step 5 |
 | FR-SV-T3 | M | — | **Not started** |
 | FR-SV-T4 | M | — | **Not started** |
 | FR-SV-T5 | S | — | **Not started** |

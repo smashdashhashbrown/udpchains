@@ -1,0 +1,188 @@
+#!/bin/bash
+# test_supervise.sh -- supervisor mode, step 2 (D-48 to D-53, FR-SV-*).
+#
+# The supervisor so far installs the filter, answers it, and passes on the
+# program's exit status and signals.  It does not carry UDP yet, so a UDP
+# socket is refused rather than made: these check that it fails closed, that
+# everything else still works, and the start-up refusals.  The probes are
+# static binaries, which the shim cannot see at all.
+#
+# usage: test_supervise.sh <wrapper> <build dir>
+#
+# NO_SHIM=1 skips the checks that load the shim, for a sanitiser build, whose
+# shim cannot be preloaded into programs that were not built with it.
+set -u
+
+W="$1"
+B="$2"
+P="$B/test_supervise"
+
+TMP=$(mktemp -d)
+PIDS=()
+cleanup() {
+	local p
+	for p in "${PIDS[@]:-}"; do
+		[ -n "$p" ] && kill "$p" 2> /dev/null
+	done
+	rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+n=0
+fail=0
+ok() { n=$((n + 1)); echo "ok $n - $1"; }
+notok() { n=$((n + 1)); echo "not ok $n - $1"; fail=1; }
+check() { if [ "$2" = "$3" ]; then ok "$1"; else notok "$1 (got '$2', want '$3')"; fi; }
+skip() { n=$((n + 1)); echo "ok $n - # SKIP $1"; }
+NO_SHIM=${NO_SHIM:-0}
+
+# Starts a fixture and stores the port it reports in the variable named $1.
+# Not in a subshell, so its PID reaches PIDS.
+start() {
+	local var=$1 name=$2 i port=""
+	shift 2
+	"$@" > "$TMP/$name.out" 2> "$TMP/$name.err" &
+	PIDS+=($!)
+	for ((i = 0; i < 100; i++)); do
+		port=$(awk '/^PORT/{print $2; exit}' "$TMP/$name.out" 2> /dev/null)
+		[ -n "$port" ] && break
+		sleep 0.05
+	done
+	[ -n "$port" ] || { echo "FATAL: $name did not start" >&2; exit 1; }
+	printf -v "$var" '%s' "$port"
+}
+
+start PROXY proxy "$B/socks5d" --port 0 --quiet
+start ECHO echo "$B/udpecho" --port 0
+# A proxy is required, as in shim mode (FR-C-03); supervisor mode does not
+# use it yet.
+SV=("$W" --supervise -p "127.0.0.1:$PROXY")
+echoed() { grep -c bytes "$TMP/echo.err"; }
+
+echo "# exit status is the program's (FR-SV-11)"
+timeout 20 "${SV[@]}" true; check "true exits 0" "$?" 0
+timeout 20 "${SV[@]}" false; check "false exits 1" "$?" 1
+timeout 20 "${SV[@]}" sh -c 'exit 42'; check "exit 42 is 42" "$?" 42
+timeout 20 "${SV[@]}" sh -c 'kill -TERM $$'
+check "a program killed by SIGTERM: udpchains dies of it too" "$?" 143
+env -u UDPCHAINS_PROXY -u UDPCHAINS_CONFIG HOME="$TMP" timeout 20 "$W" --supervise \
+	sh -c 'exit 0' 2> "$TMP/noproxy.err"
+check "no proxy configured: refused, as in shim mode" "$?" 1
+
+echo "# the program is supervised, and given no shim (D-49)"
+out=$(timeout 20 "${SV[@]}" sh -c 'grep "^Seccomp:" /proc/self/status')
+check "the program runs under a seccomp filter" "$out" "$(printf 'Seccomp:\t2')"
+if [ "$NO_SHIM" = 1 ]; then
+	skip "LD_PRELOAD stripping (NO_SHIM)"
+	skip "LD_PRELOAD unset (NO_SHIM)"
+else
+	# The shim also loads into the wrapper itself here, and says it is
+	# not configured; that is not what is checked.
+	out=$(LD_PRELOAD="$PWD/libudpchains.so:/nonexistent-other.so" timeout 20 "${SV[@]}" \
+		sh -c 'echo "[$LD_PRELOAD]"' 2> /dev/null)
+	check "libudpchains.so is removed from an inherited LD_PRELOAD, the rest kept" \
+		"$out" "[/nonexistent-other.so]"
+	out=$(LD_PRELOAD="$PWD/libudpchains.so" timeout 20 "${SV[@]}" \
+		sh -c 'echo "[${LD_PRELOAD-unset}]"' 2> /dev/null)
+	check "and an LD_PRELOAD of only the shim is unset" "$out" "[unset]"
+fi
+out=$(UDPCHAINS_SUPERVISE=1 timeout 20 "$W" -p "127.0.0.1:$PROXY" \
+	sh -c 'grep "^Seccomp:" /proc/self/status; echo "[${UDPCHAINS_SUPERVISE-unset}]"')
+check "UDPCHAINS_SUPERVISE=1 chooses it, and is not passed to the program" \
+	"$out" "$(printf 'Seccomp:\t2\n[unset]')"
+printf 'proxy = 127.0.0.1:%s\nsupervise = yes\n' "$PROXY" > "$TMP/sv.conf"
+chmod 600 "$TMP/sv.conf"
+out=$(env -u UDPCHAINS_PROXY timeout 20 "$W" -f "$TMP/sv.conf" \
+	sh -c 'grep "^Seccomp:" /proc/self/status')
+check "supervise = yes in a config file chooses it" "$out" "$(printf 'Seccomp:\t2')"
+if [ "$NO_SHIM" = 1 ]; then
+	skip "shim mode has no filter (NO_SHIM)"
+else
+	out=$(timeout 20 "$W" -p "127.0.0.1:$PROXY" sh -c 'grep "^Seccomp:" /proc/self/status')
+	check "without it, shim mode as before: no filter" "$out" "$(printf 'Seccomp:\t0')"
+fi
+
+echo "# signals sent to udpchains reach the program"
+# Not under timeout(1), whose PID $! would then be: the signal must go to
+# udpchains itself.  A watchdog ends a run that hangs instead.
+signalled() {	# <signal> <program...>
+	local sig=$1 pid dog rc
+	shift
+	"${SV[@]}" "$@" &
+	pid=$!
+	(sleep 20; kill -KILL "$pid") 2> /dev/null &
+	dog=$!
+	sleep 0.5
+	kill "-$sig" "$pid"
+	wait "$pid"
+	rc=$?
+	kill "$dog" 2> /dev/null
+	return $rc
+}
+signalled TERM sleep 30
+check "SIGTERM to udpchains ends the program, and udpchains with it" "$?" 143
+signalled USR1 sh -c 'trap "exit 7" USR1; while :; do sleep 0.1; done'
+check "a signal the program handles is delivered to it (exit 7 from its handler)" "$?" 7
+
+echo "# the supervisor stays for descendants the program leaves running (FR-SV-11)"
+start=$(date +%s%N)
+timeout 30 "${SV[@]}" sh -c \
+	'(sleep 1; grep "^Seccomp:" /proc/self/status > "$0") &' "$TMP/late"
+elapsed=$((($(date +%s%N) - start) / 1000000))
+[ "$elapsed" -ge 900 ] && ok "udpchains waited for the orphaned descendant (${elapsed} ms)" ||
+	notok "udpchains returned after ${elapsed} ms, before its descendant"
+check "and the descendant was supervised" "$(cat "$TMP/late" 2> /dev/null)" \
+	"$(printf 'Seccomp:\t2')"
+
+echo "# a static program: refusals, and what still runs (D-48, D-50, D-53)"
+timeout 30 "${SV[@]}" "$P" refusals "$PROXY" > "$TMP/refusals.tap" 2> "$TMP/refusals.err"
+rc=$?
+sed 's/^/#   /' "$TMP/refusals.tap"
+check "test_supervise refusals passes, -static" "$rc" 0
+grep -q "socket refused: supervisor mode does not carry UDP yet" "$TMP/refusals.err" &&
+	ok "the refusal says why" || notok "no diagnostic for the refused UDP socket"
+for what in "raw and packet" "io_uring" "pidfd_getfd"; do
+	grep -q "$what" "$TMP/refusals.err" && ok "a diagnostic for $what, not hidden by another" ||
+		notok "no diagnostic mentioning $what"
+done
+
+echo "# fail-closed: nothing is sent (SEC-01)"
+before=$(echoed)
+for client in "$B/leakclient-static" "$B/leakclient"; do
+	out=$(timeout 60 "${SV[@]}" "$client" 127.0.0.1 "$ECHO" 2> /dev/null)
+	check "$(basename "$client"): every send fails" \
+		"$(echo "$out" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')" 0
+done
+sleep 0.3
+check "and nothing reached the destination" "$(echoed)" "$before"
+
+echo "# a UDP socket received from an unsupervised process (D-50)"
+"$P" pass "$TMP/u.sock" "$ECHO" > "$TMP/pass.out" 2>&1 &
+PIDS+=($!)
+for ((i = 0; i < 100; i++)); do
+	grep -q READY "$TMP/pass.out" 2> /dev/null && break
+	sleep 0.05
+done
+before=$(echoed)
+timeout 30 "${SV[@]}" "$P" received "$TMP/u.sock" > "$TMP/received.tap" 2> /dev/null
+rc=$?
+sed 's/^/#   /' "$TMP/received.tap"
+check "test_supervise received passes" "$rc" 0
+sleep 0.3
+check "only the documented write() gap reached the destination, 1 byte" \
+	"$(($(echoed) - before))" 1
+
+echo "# an inherited UDP socket stops the program from starting (D-50)"
+exec 5<> "/dev/udp/127.0.0.1/$ECHO"
+out=$(timeout 20 "${SV[@]}" /bin/echo PROGRAM-RAN 2>&1)
+rc=$?
+exec 5>&-
+check "refused" "$rc" 1
+case $out in
+*PROGRAM-RAN*) notok "THE PROGRAM RAN with an inherited UDP socket" ;;
+*"descriptor 5"*) ok "naming the descriptor, and the program never ran" ;;
+*) notok "refused without naming the descriptor: $out" ;;
+esac
+
+echo "1..$n"
+exit $fail

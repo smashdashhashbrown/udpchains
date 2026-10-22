@@ -176,6 +176,9 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
 1. The decision records. Move §4 into the requirements document.
 2. A supervisor that installs the filter and lets everything through, with the program's exit
    status and signals passed on. The whole suite still green in shim mode. A safe point to stop.
+   *Done 2026-10-22, with one change:* "everything" would have included UDP, sent directly, so
+   instead a UDP socket is refused until step 3 can carry it, and D-50's and D-53's refusals are
+   in place already. Every commit of the mode fails closed.
 3. `socket()`, the reserved range and the `dup` family. Then sends, then non-blocking receives:
    enough for the matrix with a static probe, and for Go, which never blocks in a receive.
 4. Blocking receives and signals. The hardest part, so it gets its own step.
@@ -201,6 +204,14 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
   is expected, against about 1 µs for the shim, but that is unmeasured.
 - **Two front ends.** Every behaviour has to be tested twice and documented per mode. The
   requirements should say which differences between the modes are allowed.
+- **The shim loaded into the supervisor.** An inherited `LD_PRELOAD` naming `libudpchains.so`
+  loads the shim into the wrapper itself. Harmless while the supervisor sends nothing, but from
+  step 3 it would wrap the supervisor's own datagrams. Step 3 must re-run the wrapper without it,
+  or refuse.
+- **A thread with its own descriptor table.** A notification names a thread; the supervisor reads
+  the descriptor through its process (`pidfd_open` takes a process before Linux 6.9). A thread
+  that has unshared its descriptor table (`unshare(CLONE_FILES)`) would be checked against the
+  wrong table. Rare; step 5 (threads) settles it.
 - **Clean room (D-01).** graftcp is GPL-3.0 and must not be read. The design comes from the man
   pages: `seccomp(2)`, `seccomp_unotify(2)`, `pidfd_getfd(2)`, `process_vm_readv(2)`, `ptrace(2)`
   (for the access rules).

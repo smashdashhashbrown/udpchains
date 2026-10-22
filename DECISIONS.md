@@ -2037,9 +2037,9 @@ supervisor would cost two context switches on each.
     destination is a UDP socket, as the shim refuses them (D-36). (`vmsplice` only fills a pipe;
     sending from it needs `splice`.)
   - **At start-up,** the descriptors the program would inherit are checked. A UDP socket among them
-    (one handed over by a service manager, say) makes the supervisor refuse to start, naming the
-    descriptor: it cannot be moved into the range without changing the number the program
-    expects.
+    (one handed over by a service manager, say), or a raw or packet socket (D-36), makes the
+    supervisor refuse to start, naming the descriptor: it cannot be moved into the range without
+    changing the number the program expects.
 
 **Rejected.**
 
@@ -2068,6 +2068,12 @@ supervisor would cost two context switches on each.
 **Open for step 3** of the plan: placing a socket at a number in the range must not replace a
 descriptor the program already has there; how the supervisor finds a free number, and what it
 does when the range is full (D-46 is the shim's answer), is settled when it is built.
+
+**Built in step 2** (2026-10-22): the checks outside the range, the three additions, and the
+start-up check, all as above. Until step 3 carries UDP, every UDP socket is outside the range, so
+`socket()` refuses one with `EPROTONOSUPPORT` instead of making it: the mode fails closed at every
+step of its construction. A mutation that stopped trapping `socket()` was still caught by the
+checks outside the range: nothing was sent.
 
 **Revisit if:** the gap above is met by a real program, which would justify trapping `recvmsg` on
 Unix sockets.

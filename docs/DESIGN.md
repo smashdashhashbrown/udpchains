@@ -701,3 +701,83 @@ once a second, with no vaguer line after it (D-43). A dropped datagram names its
   forged inner source, a hop refusing `CONNECT`, and a full descriptor range (FR-CH-T3, FR-CH-10).
 - `make interop` builds chains of the seven real proxies (FR-CH-T4,
   [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) §13).
+
+---
+
+## 13. Supervisor mode (FR-SV-*), in progress
+
+**Status:** step 2 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
+D-48 to D-53, the requirements §2b. The supervisor runs programs and answers its filter, but does
+not carry UDP yet: a UDP socket is refused.
+
+### 13.1 Where it lives
+
+`src/supervise.c`, linked into the wrapper only, never into the shim. `udpchains --supervise`
+(or `supervise = yes`, or `UDPCHAINS_SUPERVISE=1`, D-49) resolves and exports the configuration as
+usual, removes `libudpchains.so` from `LD_PRELOAD`, and calls `udpc_supervise()` instead of
+`exec`.
+
+### 13.2 Start-up
+
+```
+wrapper: kernel ≥ 5.14? inherited UDP/raw/packet socket?        → refuse (D-53, D-50)
+         block forwarded signals + SIGCHLD; signalfd; subreaper
+         fork
+  child: restore the signal mask; no_new_privs
+         seccomp(SET_MODE_FILTER, NEW_LISTENER) → listener
+         tell the parent the listener's number; wait for its ack
+         close the listener; exec the program
+ parent: pidfd_open(child); pidfd_getfd(listener) → its own copy
+         ack; read until the exec closes the pipe (or its errno)
+         serve until no supervised process is left
+```
+
+Every failure before the `exec` refuses to run the program (FR-SV-02): no seccomp, a filter the
+kernel or a container refuses, a listener the parent cannot copy (Yama `ptrace_scope` above 1).
+The program never holds the listener: it is closed before the `exec`, and close-on-exec besides.
+
+### 13.3 The filter
+
+Built at run time, x86-64 only so far. A call from another ABI, or with `__X32_SYSCALL_BIT`, fails
+with `ENOSYS` in the kernel. `socket()` is sent to the supervisor for `AF_INET`, `AF_INET6` and
+`AF_PACKET`; `connect`, `sendto`, `sendmsg`, `sendmmsg`, `sendfile`, `splice`, `io_uring_setup`
+and `pidfd_getfd` always. Everything else runs in the kernel.
+
+### 13.4 Answering
+
+One notification at a time, in one thread. Each is answered with an `errno`, or let continue
+(`SECCOMP_USER_NOTIF_FLAG_CONTINUE`):
+
+- `socket()`: raw and packet sockets `EPERM`, ICMP and UDP-Lite `EPROTONOSUPPORT`, and for now UDP
+  `EPROTONOSUPPORT`; anything else continues. Its arguments are values, so continuing cannot be
+  raced.
+- On a descriptor: the supervisor finds the calling thread's process, opens a pidfd, checks the
+  notification is still valid (so the pid is not a reused one), and copies the descriptor
+  (`pidfd_getfd`). A UDP, raw or packet socket is refused, `EPERM`, or `EINVAL` for `sendfile` and
+  `splice`; anything else continues. A descriptor that cannot be classified is refused.
+- `io_uring_setup` `ENOSYS`, `pidfd_getfd` `EPERM`.
+
+Each refusal is reported once a second for each reason (D-33).
+
+### 13.5 Exit and signals
+
+- **Signals** sent to `udpchains` by another process — `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGTERM`,
+  `SIGUSR1`, `SIGUSR2`, `SIGALRM`, `SIGWINCH` — are forwarded to the program. One from the
+  terminal (`si_code` `SI_KERNEL`) is not: the terminal has sent it to the program already.
+- **Descendants.** The supervisor is a child subreaper, so a descendant the program leaves running
+  becomes its child, and stays supervised. It serves until the listener reports end of file, or
+  no child is left.
+- **Status.** It exits with the program's status; if the program was killed by a signal, the
+  supervisor dies of the same one, with core dumps off, so a shell sees what it would have seen.
+
+### 13.6 Tests
+
+- `unit-supervise`: the kernel-floor check against release strings of several distributions.
+- `FR-SV-supervise` (`tests/test_supervise.sh`): exit statuses and death by signal; the filter
+  present and the shim absent; the flag, the setting and the variable; signals forwarded and
+  handled; a descendant waited for and supervised; a static probe (`test_supervise refusals`)
+  checking every refusal, the x32 and 32-bit ABIs, and that TCP, Unix sockets and files work; the
+  leak client, static and dynamic, sending nothing; a UDP socket received from an unsupervised
+  process refused on every send route but D-50's `write()` gap, which delivers its one byte; and
+  an inherited UDP socket refusing the run.
+- The same script under ASan and UBSan, in `run_sanitizers.sh`.
