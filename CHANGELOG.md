@@ -9,11 +9,13 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) and mapped in
 [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
 
-## [Unreleased]
+## [0.2.0] — 2026-10-21
+
+Multi-hop chains, a proxychains.conf read as it is, and the routes around the hooks closed.
 
 ### Added
 
-- **Multi-hop chains** (D-37 to D-46): up to 8 SOCKS5 proxies in a strict chain. A single proxy
+- **Multi-hop chains** (D-37 to D-47): up to 8 SOCKS5 proxies in a strict chain. A single proxy
   behaves exactly as before.
   - **Configuration:** `[hop]` sections in a config file, repeated `-p`, a comma-separated
     `UDPCHAINS_PROXY`, and credentials per hop, passed on by location like hop 1's (D-38).
@@ -274,4 +276,5 @@ Documented in full in the README's *Security considerations* and *What does not 
   the delta between the same binary run with and without the shim. Inside the 100 µs budget, and
   an upper bound since the proxy hop is not separable.
 
+[0.2.0]: https://github.com/smashdashhashbrown/udpchains/releases/tag/v0.2.0
 [0.1.0]: https://github.com/smashdashhashbrown/udpchains/releases/tag/v0.1.0
