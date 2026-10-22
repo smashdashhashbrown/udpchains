@@ -2,7 +2,7 @@
 
 **Status:** implemented after 0.1.0. The requirements in §4 have moved to §2a of
 [`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the reference for them,
-and the design questions in §5 are decided in D-37 to D-46. All six steps of §7 are done; the
+and the design questions in §5 are decided in D-37 to D-47. All six steps of §7 are done; the
 design as built is [`DESIGN.md`](DESIGN.md) §12, the user's guide the README's *Chains* section,
 and the interop results [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) §13. §8 records how each
 risk turned out. This document stays as the background and estimate.

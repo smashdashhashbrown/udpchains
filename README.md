@@ -297,7 +297,7 @@ To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 | Program | Reason |
 |---|---|
-| Statically linked binaries | No libc to interpose on. Planned after 0.1.0 as a supervisor mode ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)). |
+| Statically linked binaries | No libc to interpose on. Planned as a supervisor mode, designed in D-48 to D-53 ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)). |
 | Go binaries | Go makes system calls directly, not through libc. Planned with static binaries. |
 | Programs making system calls without libc (inline assembly) | Same reason. Planned with static binaries. Calls through libc's `syscall()` are proxied. |
 | setuid, setgid and file-capability binaries | The loader ignores `LD_PRELOAD` for them. `udpchains` refuses to run them. |
@@ -411,7 +411,7 @@ host's loopback.
   including GSSAPI (`0x01`). A proxy selecting one is refused with a diagnostic.
 - Chains that skip a dead hop or pick hops at random (proxychains' `dynamic_chain` and
   `random_chain`). Chains are strict ([`DECISIONS.md`](DECISIONS.md) D-37).
-- Static and Go binaries, and system calls made without libc. Planned after 0.1.0
+- Static and Go binaries, and system calls made without libc. Planned as a supervisor mode
   ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)).
 - Loopback and multicast bypass. Deferred ([`DECISIONS.md`](DECISIONS.md) D-05).
 

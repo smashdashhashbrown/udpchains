@@ -600,7 +600,7 @@ is never used: the whole query is repeated over TCP.
 ## 12. Multi-hop chains (FR-P-10)
 
 **Status:** implemented after 0.1.0. The requirements are §2a of the requirements document
-(FR-CH-*); the choices are D-37 to D-46. A chain of one is 0.1.0 exactly: the same wire bytes,
+(FR-CH-*); the choices are D-37 to D-47. A chain of one is 0.1.0 exactly: the same wire bytes,
 errors, diagnostics and environment (FR-CH-01).
 
 ### 12.1 Configuration and handoff

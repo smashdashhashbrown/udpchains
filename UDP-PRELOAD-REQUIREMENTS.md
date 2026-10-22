@@ -142,13 +142,13 @@ out below (FR-P-05, FR-P-06).
 | FR-P-07 | M | When the application supplies a hostname the shim SHALL forward it as `ATYP=0x03` for proxy-side resolution rather than resolving locally. Where only an address is available (the normal UDP case) `ATYP=0x01`/`0x04` SHALL be used. | unit |
 | FR-P-08 | S | If the proxy has expired an idle association, the next send SHALL transparently re-associate rather than failing. | integration |
 | FR-P-09 | S | SOCKS5 username/password authentication (RFC 1929) SHALL be supported when configured. | unit |
-| FR-P-10 | C | Multiple proxies in a chain, as proxychains offers. Not required for v1; UDP chaining is only meaningful hop-by-hop and the complexity is disproportionate. **In progress after 0.1.0:** the requirements are §2a, the design is D-37 to D-42. | — |
+| FR-P-10 | C | Multiple proxies in a chain, as proxychains offers. Not required for v1; UDP chaining is only meaningful hop-by-hop and the complexity is disproportionate. **Implemented in 0.2.0:** the requirements are §2a, the design is D-37 to D-47. | — |
 
 
 ## 2a. Functional requirements — Multi-hop chains (FR-P-10)
 
 Added after 0.1.0. Priorities are within this feature: **M** means chains are not done without
-it. Design: D-37 to D-42 in [`DECISIONS.md`](DECISIONS.md); background and estimate in
+it. Design: D-37 to D-47 in [`DECISIONS.md`](DECISIONS.md); background and estimate in
 [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md).
 
 | ID | Pri | Requirement | Verify |
@@ -171,6 +171,41 @@ it. Design: D-37 to D-42 in [`DECISIONS.md`](DECISIONS.md); background and estim
 | FR-CH-T2 | M | The hook matrix and the fidelity, lifecycle and thread tests SHALL pass through 2- and 3-hop fixture chains. | integration |
 | FR-CH-T3 | M | Fault tests SHALL cover: expiry at a middle hop, `FRAG` set at an inner layer, a forged inner source behind a genuine outer one, and a hop refusing `CONNECT`. | integration |
 | FR-CH-T4 | S | `make interop` SHALL run chains of real proxies, and record which can serve as an intermediate hop. | manual |
+
+## 2b. Functional requirements — Supervisor mode (static and Go binaries)
+
+Planned after 0.2.0; nothing here is built yet. A second front end over the same SOCKS5 client,
+which sees system calls instead of libc functions, for programs the shim cannot reach (§8).
+Priorities are within this feature: **M** means it is not done without it. Design: D-48 to D-53
+in [`DECISIONS.md`](DECISIONS.md); background, estimate and order in
+[`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md).
+
+| ID | Pri | Requirement | Verify |
+|---|---|---|---|
+| FR-SV-01 | M | Supervisor mode SHALL be chosen explicitly: `--supervise`, `supervise = yes`, or `UDPCHAINS_SUPERVISE` (D-49). Without it, behaviour SHALL be exactly 0.2.0's. The same configuration, credentials (SEC-03), chains and diagnostics SHALL apply in both modes. A supervised program SHALL NOT also be given the shim. | integration |
+| FR-SV-02 | M | If supervisor mode cannot be set up — kernel older than 5.14, the filter cannot be installed, the program's memory cannot be reached, or an inherited UDP socket — `udpchains` SHALL refuse to run the program, and SHALL NOT run it unsupervised (D-53). | integration |
+| FR-SV-03 | M | The filter SHALL check the architecture, and refuse system calls from any other ABI the kernel accepts, such as x32 (`__X32_SYSCALL_BIT`) and 32-bit calls on x86-64. An unrecognised architecture SHALL be refused, never allowed (D-48). | unit |
+| FR-SV-04 | M | Every `AF_INET`/`AF_INET6` `SOCK_DGRAM` socket a supervised process creates SHALL live in the reserved range. `dup`, `dup2`, `dup3` and `fcntl(F_DUPFD*)` that would place one outside it SHALL be performed by the supervisor inside the range, or refused (D-50). | integration |
+| FR-SV-05 | M | The program's own socket SHALL remain the only data socket (FR-I-07). The supervisor works on a copy of the same open file. | integration |
+| FR-SV-06 | M | Every send on a reserved descriptor — `sendto`, `sendmsg`, `sendmmsg`, `write`, `writev`, `pwritev2` — SHALL be performed by the supervisor, with the return values and `errno`s of shim mode. | integration |
+| FR-SV-07 | M | Every receive on a reserved descriptor — `recvfrom`, `recvmsg`, `recvmmsg`, `read`, `readv`, `preadv2` — SHALL be performed by the supervisor: headers checked and stripped, the real sender reported, truncation and `MSG_TRUNC` as in shim mode. `recvmmsg` MAY return one datagram per call (D-51). | integration |
+| FR-SV-08 | M | Blocking and non-blocking receives (`O_NONBLOCK`, `MSG_DONTWAIT`), `SO_RCVTIMEO`, and interruption by a signal, with and without `SA_RESTART`, SHALL behave as on a native socket. A datagram SHALL NOT be lost because a signal interrupted the call receiving it: it is consumed only once the program has it (D-51). | integration |
+| FR-SV-09 | M | Routes that cannot be proxied SHALL be refused with an `errno` and a diagnostic: `io_uring_setup` (`ENOSYS`), `sendfile` and `splice` onto a UDP socket (`EINVAL`), `pidfd_getfd` (`EPERM`), raw and packet sockets (`EPERM`, D-36), and ICMP and UDP-Lite sockets (`EPROTONOSUPPORT`, D-29) (D-53). | integration |
+| FR-SV-10 | M | `getpeername` and `getsockname` SHALL report what the program believes (FR-I-05). | integration |
+| FR-SV-11 | M | `fork`, `vfork`, threads, `clone` with and without `CLONE_FILES`, and `exec` SHALL be followed: children are supervised, state follows each descriptor table, and descriptors closed on `exec` are noticed. The supervisor SHALL stay until the last supervised process exits, and SHALL exit with the program's status. | integration |
+| FR-SV-12 | M | **DNS.** A UDP query to the system resolver (a loopback address, or a nameserver in `/etc/resolv.conf`, re-read when it changes) SHALL go through the proxy to `dns`, its reply reported from the address asked; with `dns` unset it SHALL fail. Port 53 elsewhere SHALL be proxied as addressed. TCP to the system resolver SHALL be carried by SOCKS5 `CONNECT` or refused, never made directly (D-52). | integration |
+| FR-SV-13 | M | If the supervisor exits or is killed, every supervised call SHALL fail, and nothing SHALL be sent directly (D-48). | integration |
+| FR-SV-14 | M | The supervisor SHALL open no listening socket (SEC-05), and SHALL NOT log payload (NFR-05). setuid and setgid targets SHALL still be refused (SEC-06). | inspection |
+| FR-SV-15 | S | The added latency per call SHALL be measured and documented, against NFR-04's 100 µs. | manual (benchmark) |
+| FR-SV-16 | S | aarch64 SHALL be supported as well as x86-64. | integration |
+| FR-SV-17 | C | Supervisor mode MAY be chosen automatically for static and Go binaries, once it has had the same interop as the shim (D-49). | unit |
+| FR-SV-18 | M | Outside the reserved range, `sendto`, `sendmsg`, `sendmmsg` and `connect` on a UDP socket SHALL be refused with `EPERM` and a diagnostic, and other descriptors let through. A UDP socket among the descriptors a program would inherit SHALL make the supervisor refuse to start (D-50). | integration |
+| FR-SV-19 | M | The README and man page SHALL state, per mode, what each mode cannot see, including D-50's write-family gap, and that supervisor mode is not a sandbox (D-48). | inspection |
+| FR-SV-T1 | M | The hook matrix (TST-01, 108 cells) SHALL pass under supervisor mode with the probe built `-static`. | integration |
+| FR-SV-T2 | M | The leak test (SEC-02) and the wire capture (`test_failclosed_capture.sh`) SHALL pass with a static client, and with the supervisor killed mid-run. | integration |
+| FR-SV-T3 | M | Lifecycle tests SHALL cover `fork`, `exec`, threads, the `dup` family, `close_range`, `SCM_RIGHTS` (a UDP socket received outside the range is refused, FR-SV-18), and each refused route of FR-SV-09. | integration |
+| FR-SV-T4 | M | Signal tests SHALL interrupt blocking receives, with and without `SA_RESTART`, and check that no datagram is lost. | integration |
+| FR-SV-T5 | S | A Go client SHALL be tested when a Go toolchain is present; `make` itself SHALL still need only a C compiler (acceptance criterion 5). `make compare` SHALL gain a supervisor-mode column. | integration |
 
 ## 3. Functional requirements — Syscall fidelity
 
@@ -242,10 +277,10 @@ Documenting these prevents scope creep and sets user expectations honestly.
 
 | Non-goal | Rationale |
 |---|---|
-| Statically-linked binaries | No libc to interpose on. Unfixable by this approach. Not a permanent non-goal: a supervisor mode that does not use `LD_PRELOAD` is planned after 0.1.0, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
-| Go binaries | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. Planned with static binaries, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
+| Statically-linked binaries | No libc to interpose on. Unfixable by this approach. Not a permanent non-goal: a supervisor mode that does not use `LD_PRELOAD` is planned, see §2b. |
+| Go binaries | Go issues raw syscalls, bypassing libc entirely. Unfixable by this approach. Planned with static binaries, see §2b. |
 | setuid/setgid binaries | The loader drops `LD_PRELOAD`. See SEC-06. |
-| System calls made without libc | Same reason. Calls through libc's `syscall()` are routed to the hooks (D-36); a program issuing its own system calls (inline assembly) is beyond any preload. Planned with static binaries, see [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md). |
+| System calls made without libc | Same reason. Calls through libc's `syscall()` are routed to the hooks (D-36); a program issuing its own system calls (inline assembly) is beyond any preload. Planned with static binaries, see §2b. |
 | Faithful ancillary data (`IP_PKTINFO`, `IP_RECVERR`, ECN) | Describes a socket the application does not actually own; no honest emulation exists. Returned empty (FR-F-11). |
 | GSO/GRO (`UDP_SEGMENT`, `UDP_GRO`) | Tier 3. Modern QUIC stacks use these; they will fall back or fail. |
 | QUIC performance | Even when functional, a UDP flow through a TCP-based tunnel inherits retransmit-and-wait behaviour that fights QUIC's own loss recovery. |

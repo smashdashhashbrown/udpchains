@@ -61,6 +61,12 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-45](#d-45) | Setup has an overall deadline, `chain_timeout`: by default `connect_timeout` per hop of a chain | FR-CH-02; settles a FUTURE-UDP-CHAINS §8 question |
 | [D-46](#d-46) | When the shim's descriptor range is full, its connection stays where it is, protected, and that is reported | FR-CH-10; extends D-26 |
 | [D-47](#d-47) | A proxychains.conf is read as it is, for the strict chain of `socks5` hops it shares | FR-CH-14, FR-C-04 |
+| [D-48](#d-48) | Supervisor mode intercepts system calls with seccomp user notification | FR-SV-02, FR-SV-03, FR-SV-13; revisits FR-I-01 |
+| [D-49](#d-49) | Supervisor mode is chosen explicitly, and never combined with the shim | FR-SV-01, FR-SV-17 |
+| [D-50](#d-50) | UDP sockets live in a reserved range; outside it, UDP sends and connects are refused | FR-SV-04, FR-SV-18 |
+| [D-51](#d-51) | A supervised receive peeks, delivers, and consumes only once the program has the datagram | FR-SV-07, FR-SV-08 |
+| [D-52](#d-52) | Queries to the system resolver are redirected to `dns`, through the proxy | FR-SV-12; revisits D-22 |
+| [D-53](#d-53) | What supervisor mode refuses, and Linux 5.14 as its floor | FR-SV-02, FR-SV-09; revisits D-29, D-36, NFR-01a |
 
 ---
 
@@ -1901,3 +1907,322 @@ pass]`, separated by spaces or tabs. Never from its source (D-01).
 refusal with its line) and `test_auth.sh` (a proxychains.conf whose hop 2 requires the login on its
 line: the datagram round-trips, the proxy logs the login, the password is passed on by naming the
 file, three directives are warned about once each, and a `dynamic_chain` file runs nothing).
+
+---
+
+## D-48
+### Supervisor mode intercepts system calls with seccomp user notification
+
+**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-02, FR-SV-03, FR-SV-13.
+Revisits FR-I-01 (`LD_PRELOAD` as the only mechanism). Background:
+[`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md).
+
+**Context.** Static binaries, Go binaries and programs making their own system calls never call
+libc, so the shim cannot see their UDP, and they send directly. They can be seen only at the
+system-call boundary, from outside the process.
+
+**Decision.** `udpchains` stays running as the program's parent, the **supervisor**. Before the
+program runs, the child sets `no_new_privs` and installs a seccomp filter with
+`SECCOMP_FILTER_FLAG_NEW_LISTENER`, and hands the listener to the parent. The filter returns
+`SECCOMP_RET_USER_NOTIF` for the calls D-50 and D-53 select, and lets everything else through in
+the kernel. The supervisor performs each trapped call itself, or answers it with an error.
+
+- **Fail-closed by construction** (FR-SV-13). Once the supervisor has gone, every trapped call in
+  the program fails with `ENOSYS` (`seccomp(2)`, `seccomp_unotify(2)`). A filter cannot be
+  removed, and is inherited across `fork` and `exec`.
+- **One ABI** (FR-SV-03). The filter checks `arch` first, and fails any call from another ABI. On
+  x86-64 it also fails any call number with `__X32_SYSCALL_BIT` set, since x32 shares x86-64's
+  `arch` value (`seccomp(2)`). An architecture the filter does not know is refused, never
+  allowed.
+- **Reading and writing the program's memory** uses `process_vm_readv` and `process_vm_writev`.
+  Every read is followed by `SECCOMP_IOCTL_NOTIF_ID_VALID` before the bytes are used, as
+  `seccomp_unotify(2)` requires, so a call the program abandoned is never acted on.
+- **The shim's code is reused:** the SOCKS5 client, chains, the header codec, configuration and
+  address checks. The supervisor is a second front end, not a second implementation.
+
+**Rejected.**
+
+- **`ptrace`.** If the tracer dies, the program continues untraced and sends directly (SEC-01).
+  It conflicts with `gdb` and `strace`, and the `ptrace` tool in the comparison lab ran reliably
+  only with Docker's seccomp filter disabled.
+- **A network namespace with a TUN device.** The strongest guarantee, but it needs unprivileged
+  user namespaces, which Ubuntu 24.04 restricts by default, and the program's TCP would have
+  nowhere to go unless udpchains carried TCP too (a §8 non-goal).
+
+**Known limitations.**
+
+- **Not a sandbox.** A call the supervisor lets continue in the kernel
+  (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`) is checked first and then performed, and a hostile program
+  can change what it refers to in between, from another thread (`seccomp_unotify(2)` warns of
+  exactly this). Like the shim, supervisor mode keeps a cooperative program from leaking by
+  accident; it does not contain one trying to escape.
+- **Access to the program's memory** needs the same permission as `ptrace`. Yama's default
+  (`ptrace_scope` 1) lets a parent reach its children; a stricter setting does not, and the mode
+  then refuses to start (D-53).
+- **Inside containers,** a runtime's own seccomp profile may forbid installing the filter. The
+  mode then refuses to start; it never runs the program unsupervised (FR-SV-02).
+
+**Revisit if:** a kernel interface appears that lets a supervisor see a descriptor's type in the
+filter, which would remove the reserved range (D-50).
+
+---
+
+## D-49
+### Supervisor mode is chosen explicitly, and never combined with the shim
+
+**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-01, FR-SV-17. Chosen by the
+maintainer over choosing it automatically for static and Go binaries, and over supervising every
+program.
+
+**Decision.**
+
+- **Explicit.** `udpchains --supervise <program>`, or `supervise = yes` in a config file, or
+  `UDPCHAINS_SUPERVISE=1`, with the usual precedence (FR-C-02). Without it, behaviour is exactly
+  0.2.0's. Configuration, credentials (SEC-03, D-25), chains and diagnostics are the same in both
+  modes.
+- **One front end per program.** A supervised program is not given the shim: the wrapper does not
+  set `LD_PRELOAD`, and removes `libudpchains.so` from an inherited one. Everything the program
+  starts stays supervised, since the filter is inherited and cannot be removed, so no descendant
+  falls back to the shim or to nothing.
+- **No automatic choice yet.** FR-SV-17 (supervising static and Go binaries without being asked)
+  waits until supervisor mode has had the interop the shim has had.
+
+**Rejected.**
+
+- **Automatic for static and Go binaries.** Convenient, since such a program sends directly
+  today, but it would put a new, less tested mode, with a higher kernel floor, under users who
+  did not ask for it.
+- **Supervising every program.** One mode to test, but every program would pay the supervisor's
+  cost per call and its kernel floor, and 0.2.0's behaviour would change for everyone.
+- **Both front ends on one program.** Every UDP call would be seen twice, by the shim inside and
+  the supervisor outside, with two sets of headers and two views of each descriptor.
+
+**Known limitation.** A user must know to ask: a static or Go program run without `--supervise`
+still sends directly, as in 0.2.0, which the README already says.
+
+**Revisit if:** supervisor mode has had remote and real-proxy interop; then FR-SV-17.
+
+---
+
+## D-50
+### UDP sockets live in a reserved range; outside it, UDP sends and connects are refused
+
+**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-04, FR-SV-18. Chosen by the
+maintainer: trap sends on every descriptor and check its type, with three additions, over
+trapping `recvmsg` everywhere and over documenting the gap.
+
+**Context.** A seccomp filter sees a call's number and its raw arguments, never what a descriptor
+refers to. `write` and `writev` carry nearly all of a program's I/O; sending every one to the
+supervisor would cost two context switches on each.
+
+**Decision.**
+
+- **The reserved range.** Every `AF_INET`/`AF_INET6` `SOCK_DGRAM` socket the program creates is
+  made by the supervisor and installed in the program at a number in the range
+  (`SECCOMP_IOCTL_NOTIF_ADDFD`), and the supervisor keeps a copy of the same open file. The range
+  starts as D-26's does: at 768, or at half the soft `RLIMIT_NOFILE` when that is below 1024. The
+  filter traps `read`, `write` and the other data calls only for numbers in the range, so file
+  and TCP I/O below it never leaves the kernel. A program descriptor that reaches the range is
+  checked by the supervisor and let through (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`).
+- **The `dup` family** on a descriptor in the range is performed by the supervisor, inside the
+  range; one that would put a UDP socket outside it is refused.
+- **Outside the range, the type is checked.** `sendto`, `sendmsg` and `sendmmsg` on any descriptor
+  are trapped. Outside the range the supervisor takes a copy of the descriptor (`pidfd_getfd`)
+  and asks its domain and type: a UDP socket fails with `EPERM` and a diagnostic; anything else is
+  let through. `send` is covered: on x86-64 and aarch64 libc implements it with `sendto`.
+- **And three additions**, each cheap because the call is rare:
+  - `connect` on any descriptor is trapped; outside the range, a UDP socket is refused with
+    `EPERM`. A received socket the program connects itself cannot then be written to.
+  - `sendfile` and `splice` are trapped on any descriptor, and refused with `EINVAL` when the
+    destination is a UDP socket, as the shim refuses them (D-36). (`vmsplice` only fills a pipe;
+    sending from it needs `splice`.)
+  - **At start-up,** the descriptors the program would inherit are checked. A UDP socket among them
+    (one handed over by a service manager, say) makes the supervisor refuse to start, naming the
+    descriptor: it cannot be moved into the range without changing the number the program
+    expects.
+
+**Rejected.**
+
+- **Trapping `recvmsg` everywhere,** to catch a UDP socket arriving over `SCM_RIGHTS` and move it
+  into the range. It closes the gap below, but every `recvmsg` on every Unix socket — all of a
+  D-Bus or Wayland program's traffic — would go through the supervisor.
+- **Documenting the gap only,** as D-21 once did for the shim. A real leak path for programs that
+  pass sockets between processes.
+
+**Known limitations.**
+
+- **A UDP socket received already connected, then written with `write`, `writev` or `pwritev2`,
+  sends directly.** All four must hold: the socket arrives from another, unsupervised process
+  over `SCM_RIGHTS`; it was connected before it was sent; the program never connects it again;
+  and it sends with the write family rather than a send call. This is rare for the client
+  programs supervisor mode is for, and most likely in privilege-separated daemons.
+- **Cost outside UDP.** Every `sendto`, `sendmsg` and `sendmmsg` on a non-UDP descriptor makes a
+  round trip to the supervisor for the type check: notably D-Bus, which sends with `sendmsg`, and
+  TCP programs that use `sendmsg`. So does every `connect`.
+- **A supervised UDP socket passed to an unsupervised process** is still connected to the relay.
+  What that process writes reaches the relay without a SOCKS header, and goes no further; it is not
+  a leak, but it does not work.
+- **The range is decided before the program runs.** A program that raises its own descriptor
+  limit later (Go does, at start-up) keeps the range where it was.
+
+**Open for step 3** of the plan: placing a socket at a number in the range must not replace a
+descriptor the program already has there; how the supervisor finds a free number, and what it
+does when the range is full (D-46 is the shim's answer), is settled when it is built.
+
+**Revisit if:** the gap above is met by a real program, which would justify trapping `recvmsg` on
+Unix sockets.
+
+---
+
+## D-51
+### A supervised receive peeks, delivers, and consumes only once the program has the datagram
+
+**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-07, FR-SV-08. Chosen by the
+maintainer over letting signals wait, and over accepting an occasional lost datagram.
+
+**Context.** While the supervisor performs a receive, the program's call can be interrupted by a
+signal. The supervisor is not told: its reply then fails with `ENOENT`, and with `SA_RESTART` the
+call comes back as a new notification (`seccomp_unotify(2)`). A datagram already taken off the
+socket at that point would be lost.
+
+**Decision.**
+
+- **Peek, deliver, commit.** The supervisor reads the next datagram with `MSG_PEEK`, checks and
+  strips its headers (D-41), writes the payload and the real sender into the program, checks the
+  notification is still valid, and replies. Only if the reply is accepted does it consume the
+  datagram from its copy of the socket. If the call was interrupted, the datagram stays queued for
+  the next receive. A datagram whose headers fail the checks is consumed and dropped at once, as
+  in shim mode, since it could never be delivered.
+- **Blocking receives** are run by a worker, which waits on the socket and on the notification
+  staying valid, so an interrupted call is abandoned rather than left holding the socket.
+- **Native behaviour otherwise.** `O_NONBLOCK` and `SO_RCVTIMEO` belong to the shared open file, so
+  the supervisor's copy sees the program's settings; `MSG_DONTWAIT` is taken from the call. With
+  nothing queued, a non-blocking receive fails with `EAGAIN` at once. An interrupted call returns
+  `EINTR`, or restarts under `SA_RESTART`, as on a native socket.
+- **Receives on one socket are serialised** in the supervisor, so the datagram peeked is the one
+  consumed.
+
+**Rejected.**
+
+- **Letting signals wait** while the supervisor holds a receive. Simplest, but a program that
+  relies on `alarm()` or another signal to break a blocking `recvfrom` would hang.
+- **Consuming first and accepting the loss.** UDP may drop anything, but a loss caused by a signal
+  is a difference from a native socket that programs cannot reason about.
+
+**Known limitations.**
+
+- **`recvmmsg` returns at most one datagram per call** in this mode: only the first queued
+  datagram can be peeked. `recvmmsg` may always return fewer than asked.
+- **An interrupted receive may still have written to the program's buffer** before the
+  interruption was seen. The call reports `EINTR` or restarts, as it should; only the buffer's
+  contents differ from a native socket's, which callers should not read after a failed call.
+- **A socket also read by an unsupervised process** can lose a datagram: that process could take
+  the peeked datagram before the supervisor consumes it, and the supervisor would then consume the
+  next one.
+- **Each receive costs** two context switches and a copy in each direction, against about 1 µs
+  for the shim; it will be measured (FR-SV-15).
+
+---
+
+## D-52
+### Queries to the system resolver are redirected to `dns`, through the proxy
+
+**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-12. Revisits D-22, whose
+libc-level resolver does not apply in this mode. Chosen by the maintainer over proxying port 53 as
+addressed.
+
+**Context.** A supervised program runs its own resolver, glibc's, musl's or Go's, reading
+`/etc/resolv.conf`. On systemd-resolved hosts its nameserver is `127.0.0.53`, which, proxied as
+addressed, would be resolved at the proxy host and usually fail. Resolvers also check that a reply
+comes from the address they asked.
+
+**Decision.**
+
+- **A UDP datagram to port 53 of the system resolver** — a loopback address, or a nameserver listed
+  in `/etc/resolv.conf` — is sent through the proxy (or chain) to the configured `dns` server
+  instead. Its reply is reported as coming from the address the program asked, so the resolver
+  accepts it.
+- **`/etc/resolv.conf` is read again whenever it changes,** so a nameserver that a VPN or DHCP
+  puts there while the program runs is recognised as the system resolver too.
+- **With `dns` unset,** such a datagram fails with `ENETUNREACH`, so lookups fail, as they do in
+  shim mode (D-22); none goes anywhere directly.
+- **Port 53 elsewhere** (`dig @9.9.9.9`) is proxied as addressed, exactly as the shim does, so a
+  user's explicit choice of server is kept.
+- **TCP to the system resolver's port 53** is never made directly. It is carried by SOCKS5
+  `CONNECT` to `dns`, as the shim's fallback is; until that is built, the connect is refused with
+  `ECONNREFUSED`, so a truncated answer fails rather than leaks.
+
+**Rejected.**
+
+- **Proxying port 53 as addressed.** Simplest, and what the shim does for `dig`, but on most
+  desktop hosts lookups would fail.
+- **Redirecting every port-53 datagram,** whatever its destination. It would silently replace a
+  server the user named.
+
+**None of this is a leak.** Under any rule, every datagram goes through the proxy; the rule only
+decides which server the proxy forwards a query to. A server named explicitly sees the proxy's
+address, not this host's.
+
+**Known limitations.**
+
+- **A resolver configured somewhere other than `/etc/resolv.conf`,** on an address that is not
+  loopback (a program's own setting, say), is proxied as addressed. A private address such as
+  `192.168.1.1` is then reached on the proxy's network, so lookups fail; nothing leaks.
+- **A local DNS server's own entries are not used.** A query to dnsmasq or similar on loopback goes
+  to `dns` instead, as in shim mode (D-22): answering it locally would let that server forward the
+  rest upstream directly. Entries in `/etc/hosts` still work, since the program's resolver reads
+  that file itself.
+- **Split DNS,** names that only a VPN's or a company's resolver knows, works only if `dns` is a
+  resolver that knows them and that the proxy can reach.
+- **DNS over TCP to other servers, DNS over TLS and DNS over HTTPS** are TCP, which udpchains does
+  not proxy (§8), in either mode.
+
+---
+
+## D-53
+### What supervisor mode refuses, and Linux 5.14 as its floor
+
+**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-02, FR-SV-09. Revisits D-29 and
+D-36 (their refusals made at the system call instead of at libc), and NFR-01a (a higher floor for
+this mode only).
+
+**Decision.**
+
+- **Refused, each with a diagnostic:**
+  - `io_uring_setup`, with `ENOSYS`: the "not available" answer most programs fall back from. It
+    is refused for files too, since the filter cannot tell what a ring will be used for. This
+    closes the route the shim cannot (D-36).
+  - `sendfile` and `splice` onto a UDP socket, with `EINVAL` (D-36, D-50).
+  - `pidfd_getfd`, with `EPERM`: a copy of another process's descriptor would arrive outside the
+    range.
+  - Raw and packet sockets with `EPERM` (D-36), and ICMP and UDP-Lite sockets with
+    `EPROTONOSUPPORT` (D-29), at `socket()`.
+  - UDP sends and connects outside the range, with `EPERM` (D-50).
+- **The floor is Linux 5.14,** for `SECCOMP_ADDFD_FLAG_SEND`, which installs a socket and answers
+  the call in one step so none is leaked into the program (5.9 for `ADDFD`, 5.6 for
+  `pidfd_getfd`, 5.0 for user notification). That matches the distributions with glibc 2.34
+  (Ubuntu 22.04, RHEL 9). The shim's floor is unchanged.
+- **Refusing to start** (FR-SV-02): on an older kernel, when the filter cannot be installed (a
+  container's seccomp profile, say), when the program's memory cannot be reached (Yama
+  `ptrace_scope` above 1), or with an inherited UDP socket (D-50). The program is never run
+  unsupervised.
+
+**Why refusing `io_uring` is acceptable.** A filter sees only `io_uring_setup`, never what a ring
+is later asked to do, and one ring does file and network work alike; allowing rings would reopen
+the route the shim cannot close (D-36). Refusing it costs little for the programs this mode is
+for: Go's standard library does not use `io_uring`, and static C tools rarely do. Many
+environments already refuse it, for its record of kernel security bugs (Docker's default seccomp
+profile in recent releases, ChromeOS, Android, and Linux's own `io_uring_disabled` setting), so
+software that uses it generally handles `ENOSYS` and falls back to ordinary calls.
+
+**Known limitations.**
+
+- **Programs that use `io_uring` lose it,** for files too: some databases, QEMU's optional
+  backend, `fio`. Most fall back to ordinary calls. A framework that requires it, with no
+  fallback, fails to start under supervision. A dynamically linked one can still run under the
+  shim, which cannot refuse `io_uring` (D-36).
+- **Debian 11 and other pre-5.14 kernels** cannot use the mode.
+
+**Revisit if:** a program is found that needs `io_uring` and cannot fall back; refusing only rings
+that touch sockets would need inspecting each submission, which a seccomp filter cannot do.
+

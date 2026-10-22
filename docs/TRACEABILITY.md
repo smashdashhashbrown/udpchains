@@ -179,7 +179,7 @@ from a run rather than editing it by hand.
 
 ## Multi-hop chains (§2a)
 
-Not part of v1 scope, and not counted in the summary above. Design: D-37 to D-46. `Not started`
+Not part of v1 scope, and not counted in the summary above. Design: D-37 to D-47. `Not started`
 means no code yet.
 
 | ID | Pri | Test | Status |
@@ -202,6 +202,39 @@ means no code yet.
 | FR-CH-T2 | M | FR-CH-T2-2hop, FR-CH-T2-3hop | **Verified** — the matrix, fidelity, port-switch, lifecycle and threading tests through 2 and 3 hops |
 | FR-CH-T3 | M | faults | **Verified** — expiry at the middle hop, `FRAG` at the middle and innermost layers, a forged inner source behind a genuine outer one, and a hop refusing `CONNECT` |
 | FR-CH-T4 | S | interop | **Verified** on this host — `make interop` runs a ring of 2-hop chains of the seven proxies, so each is once a middle hop and once the exit hop, and one chain of all seven. Every proxy serves as a middle hop. Each 2-hop chain passes the matrix, the resolver over UDP and chained `CONNECT`, an IPv6 destination, and a hop 2 given by name; fidelity and the port-switch test follow the exit hop alone; the largest datagram is as predicted from each hop's own; and with each hop killed in turn, nothing reaches the destination and the same socket recovers. The 7-hop chain passes the matrix, lifecycle, resolver, IPv6 and size checks, and the same with its middle hop killed. Results in [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) §13. Not across hosts |
+
+## Supervisor mode (§2b), planned
+
+Not part of v1 scope, and not counted in the summary above. Design: D-48 to D-53, decided
+2026-10-22; no code yet. The accepted limitations are listed in
+[`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §9.
+
+| ID | Pri | Test | Status |
+|---|---|---|---|
+| FR-SV-01 | M | — | **Not started** |
+| FR-SV-02 | M | — | **Not started** |
+| FR-SV-03 | M | — | **Not started** |
+| FR-SV-04 | M | — | **Not started** |
+| FR-SV-05 | M | — | **Not started** |
+| FR-SV-06 | M | — | **Not started** |
+| FR-SV-07 | M | — | **Not started** |
+| FR-SV-08 | M | — | **Not started** |
+| FR-SV-09 | M | — | **Not started** |
+| FR-SV-10 | M | — | **Not started** |
+| FR-SV-11 | M | — | **Not started** |
+| FR-SV-12 | M | — | **Not started** |
+| FR-SV-13 | M | — | **Not started** |
+| FR-SV-14 | M | — | **Not started** |
+| FR-SV-15 | S | — | **Not started** |
+| FR-SV-16 | S | — | **Not started** |
+| FR-SV-17 | C | — | **Not started** |
+| FR-SV-18 | M | — | **Not started** |
+| FR-SV-19 | M | — | **Not started** |
+| FR-SV-T1 | M | — | **Not started** |
+| FR-SV-T2 | M | — | **Not started** |
+| FR-SV-T3 | M | — | **Not started** |
+| FR-SV-T4 | M | — | **Not started** |
+| FR-SV-T5 | S | — | **Not started** |
 
 ---
 

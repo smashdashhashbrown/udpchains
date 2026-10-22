@@ -115,12 +115,17 @@ None open.
   still failed closed. `connect_with_timeout` in `src/socks5.c` now returns `SO_ERROR`, and
   `unit-socks5` has a test that fails without the fix. (b31b583)
 
-## Residuals recorded in D-21 (no fix planned yet)
+## Residuals recorded in D-21
 
-Not fixed, but documented for users as ways around the proxy: the README (*Traffic it
-deliberately refuses*), the man page's LIMITATIONS, `SECURITY.md` and the CHANGELOG. Awaiting
-commit.
+Documented for users as ways around the proxy: the README (*Traffic that bypasses the shim*), the
+man page's LIMITATIONS, `SECURITY.md` and the CHANGELOG. D-36 (released in 0.2.0) closed all but
+`io_uring`.
 
-- [ ] stdio over a UDP socket (`fdopen`) uses glibc-internal read and write, and bypasses the hooks.
-- [ ] `io_uring`, `sendfile` and `splice` bypass libc entirely.
-- [ ] `pidfd_getfd` can obtain a UDP socket without passing through a hook.
+- [x] stdio over a UDP socket (`fdopen`) uses glibc-internal read and write, and bypasses the hooks.
+  Now refused with `EINVAL` (D-36, 5084498).
+- [x] `sendfile` and `splice` bypass libc entirely. Now refused with `EINVAL` on a UDP socket
+  (D-36, 5084498).
+- [x] `pidfd_getfd` can obtain a UDP socket without passing through a hook. The copy is now
+  adopted and tracked (D-36, 5084498).
+- [ ] `io_uring` bypasses libc entirely. No fix is possible in the shim; supervisor mode could
+  refuse `io_uring_setup` (FR-SV-09, [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md)).

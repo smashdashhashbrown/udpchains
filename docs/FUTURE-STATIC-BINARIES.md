@@ -1,9 +1,12 @@
 # Future requirement — static and Go binaries (supervisor mode)
 
-**Status:** a §8 non-goal for v1. Planned for a release after 0.1.0. Nothing here is implemented.
+**Status:** planned after 0.2.0, on branch `supervisor_mode`. Step 1 of §7 is done: the decisions
+are D-48 to D-53, and the requirements are §2b of
+[`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the reference for
+them. No code yet. §9 lists the known limitations the decisions accept.
 **Written:** 2026-10-20, against `9acf337`. Line counts and file references are as of that
-commit; recheck them before starting. Kernel versions below are from memory of the man pages;
-confirm them there before relying on them.
+commit; recheck them before starting. The kernel versions in §8 were confirmed in the man pages
+on 2026-10-22.
 
 This works out far enough to start from how udpchains could proxy programs that `LD_PRELOAD`
 cannot reach: what the feature is, who it is for, the mechanism, draft requirements, what it
@@ -63,7 +66,7 @@ Three ways of intercepting from outside were considered.
 |---|---|
 | **`ptrace`** | **Rejected.** If the tracer dies, the program continues untraced and sends directly, which breaks SEC-01. It conflicts with `gdb` and `strace`. In the comparison lab, the `ptrace`-based tool ran reliably only with Docker's seccomp filter disabled. |
 | **Network namespace and TUN device** | **Rejected.** The strongest guarantee, but it needs unprivileged user namespaces, which Ubuntu 24.04 restricts by default through AppArmor. The program's TCP would have nowhere to go unless udpchains carried TCP too, which is a §8 non-goal. |
-| **seccomp user notification** (`seccomp_unotify(2)`) | **Proposed.** The kernel stops the program at the system calls the filter selects and sends a notification to the supervisor, which performs the call itself or answers with an error. If the supervisor exits, those calls fail with `ENOSYS`, so the program stays fail-closed. No conflict with debuggers. |
+| **seccomp user notification** (`seccomp_unotify(2)`) | **Chosen (D-48).** The kernel stops the program at the system calls the filter selects and sends a notification to the supervisor, which performs the call itself or answers with an error. If the supervisor exits, those calls fail with `ENOSYS`, so the program stays fail-closed. No conflict with debuggers. |
 
 In outline:
 
@@ -89,8 +92,9 @@ not the program, so D-26's protected band is not needed in this mode.
 
 ## 4. Draft requirements
 
-Priorities as in the requirements document, but within this feature: **M** means the feature is
-not done without it.
+**Moved** to §2b of [`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md) on 2026-10-22,
+updated to the decisions and with FR-SV-18 and FR-SV-19 added. The draft below is kept as it was
+written, for the record; §2b is the reference.
 
 | ID | Pri | Requirement | Verify |
 |---|---|---|---|
@@ -140,7 +144,7 @@ resolver runs), D-23 (cookie checks, now across processes), D-26 (protected desc
 needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mode), and NFR-03
 (signal safety, moot outside the process).
 
-**Decision records to write before coding:**
+**Decision records to write before coding** — written 2026-10-22 as D-48 to D-53, in this order:
 
 1. Seccomp user notification, rather than `ptrace` or namespaces (§3).
 2. How the mode is chosen (FR-SV-01, FR-SV-17), and whether the shim and the supervisor are ever
@@ -181,10 +185,10 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
 ## 8. Risks and open questions
 
 - **Kernel features.** User notification needs Linux 5.0, `pidfd_getfd` 5.6,
-  `SECCOMP_IOCTL_NOTIF_ADDFD` 5.9 and `SECCOMP_ADDFD_FLAG_SEND` 5.14, so the floor would be about
-  5.14. That matches distributions with glibc 2.34 (Ubuntu 22.04, RHEL 9), but excludes Debian 11.
-  Whether the listener reports when the last supervised process has gone, and from which version,
-  needs checking.
+  `SECCOMP_IOCTL_NOTIF_ADDFD` 5.9 and `SECCOMP_ADDFD_FLAG_SEND` 5.14, so the floor is 5.14 (D-53).
+  That matches distributions with glibc 2.34 (Ubuntu 22.04, RHEL 9), but excludes Debian 11.
+  The listener reports end of file (`POLLHUP`) once the last thread using the filter has
+  terminated and been reaped (`seccomp_unotify(2)`), which is how the supervisor knows to exit.
 - **Containers.** Whether Docker's default seccomp profile lets the supervisor install its filter,
   and whether user notification works inside other sandboxes such as gVisor, needs testing.
 - **Access to the program's memory.** `process_vm_readv` and `pidfd_getfd` need the same
@@ -200,3 +204,40 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
 - **Clean room (D-01).** graftcp is GPL-3.0 and must not be read. The design comes from the man
   pages: `seccomp(2)`, `seccomp_unotify(2)`, `pidfd_getfd(2)`, `process_vm_readv(2)`, `ptrace(2)`
   (for the access rules).
+
+## 9. Known limitations, as decided
+
+What the decisions accept, collected here so the README and man page can state them per mode when
+the mode is built (FR-SV-19). Each is explained in its record.
+
+- **Not a sandbox** (D-48). A call let through after a check can be changed in between by a hostile
+  program. Like the shim, the mode prevents accidental leaks, not deliberate ones.
+- **A UDP socket received already connected, then written with `write`, `writev` or `pwritev2`,
+  sends directly** (D-50). It needs a socket passed over `SCM_RIGHTS` by an unsupervised process,
+  connected before it was passed, and never connected again by the program.
+- **Every `sendto`, `sendmsg`, `sendmmsg` and `connect` makes a round trip to the supervisor,**
+  UDP or not (D-50): D-Bus traffic, TCP programs using `sendmsg`, and every connection.
+- **A supervised UDP socket passed to an unsupervised process** does not work there: what it writes
+  reaches the relay without a header (D-50). Not a leak.
+- **The reserved range is fixed before the program runs** (D-50); a program raising its own
+  descriptor limit does not move it.
+- **An inherited UDP socket stops the program from starting** (D-50), so a service handed a UDP
+  socket by its service manager cannot be supervised.
+- **`recvmmsg` returns at most one datagram per call** (D-51).
+- **An interrupted receive may still have written to the program's buffer** (D-51); the call
+  itself fails or restarts as it should.
+- **A socket also read by an unsupervised process** can lose a datagram (D-51).
+- **DNS** (D-52), none of it a leak:
+  - only queries to the system resolver (loopback, or `/etc/resolv.conf`, re-read when it changes)
+    are redirected to `dns`; other port-53 traffic is proxied as addressed, so a private resolver
+    configured elsewhere is reached on the proxy's network, and fails;
+  - a local DNS server's own entries are not used; `/etc/hosts` is;
+  - split DNS works only if `dns` knows the internal names and the proxy can reach it;
+  - DNS over TCP to other servers, over TLS and over HTTPS is TCP, which is not proxied; and until
+    TCP to the system resolver is carried by `CONNECT`, a truncated answer fails.
+- **`io_uring` is refused for everything,** files included (D-53). Go does not use it; software
+  that does mostly falls back, but a framework that requires it fails to start under supervision.
+- **Linux 5.14 or later,** a reachable program memory (Yama `ptrace_scope` 1 or less), and a
+  container runtime that allows the filter are required; otherwise the program is not run (D-53).
+- **Each supervised call costs two context switches and a copy,** against about 1 µs for the
+  shim; to be measured (FR-SV-15).
