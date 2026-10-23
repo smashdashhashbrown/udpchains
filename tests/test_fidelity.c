@@ -5,6 +5,11 @@
  *
  * Run under the shim:
  *   udpchains ./test_fidelity <echo1_v4> <echo2_v4> <echo_v6>
+ *
+ * Built -static and run under the supervisor, with a fourth argument
+ * "supervised", it checks the two places the modes are documented to differ:
+ * recvmmsg returns one datagram per call (D-51), and stdio on a UDP socket is
+ * carried, since the supervisor sees the write() it makes (D-36 is the shim's).
  */
 #include "tap.h"
 
@@ -36,6 +41,7 @@
 
 static struct sockaddr_in g_echo1, g_echo2;
 static struct sockaddr_in6 g_echo6;
+static int g_supervised;
 
 static int udp4(void)
 {
@@ -354,8 +360,17 @@ static void t_mmsg(void)
 		rmsgs[i].msg_hdr.msg_iov = &riov[i];
 		rmsgs[i].msg_hdr.msg_iovlen = 1;
 	}
-	rc = recvmmsg(fd, rmsgs, 3, 0, NULL);
-	TAP_EQ_INT(rc, 3, "recvmmsg reports all three messages received");
+	if (g_supervised) {
+		/* D-51: one datagram per call, so the rest take two more. */
+		rc = recvmmsg(fd, rmsgs, 3, 0, NULL);
+		TAP_EQ_INT(rc, 1, "recvmmsg returns one datagram per call (D-51)");
+		for (i = 1; i < 3 && rc == 1; i++)
+			rc = recvmmsg(fd, &rmsgs[i], 3 - (unsigned)i, 0, NULL);
+		TAP_EQ_INT(rc, 1, "and the next call returns the next one");
+	} else {
+		rc = recvmmsg(fd, rmsgs, 3, 0, NULL);
+		TAP_EQ_INT(rc, 3, "recvmmsg reports all three messages received");
+	}
 	for (i = 0; i < 3; i++)
 		TAP_OK(rmsgs[i].msg_len == strlen(sbuf[i]) &&
 		               memcmp(rbuf[i], sbuf[i], rmsgs[i].msg_len) == 0,
@@ -1030,7 +1045,21 @@ static void t_unhookable_refused(void)
 
 	errno = 0;
 	f = fdopen(fd, "w");
-	TAP_OK(f == NULL && errno == EINVAL, "fdopen on a UDP socket fails with EINVAL");
+	if (g_supervised) {
+		/* The supervisor sees the write() stdio makes, so carries it. */
+		char back[16] = { 0 };
+
+		TAP_OK(f != NULL && fputs("stdio", f) >= 0 && fflush(f) == 0,
+		       "fdopen on a UDP socket is carried in supervisor mode");
+		TAP_OK(recv(fd, back, sizeof(back), 0) == 5 && memcmp(back, "stdio", 5) == 0,
+		       "and what it wrote comes back, through the proxy");
+		fd = dup(fd); /* fclose below closes the original */
+		if (f != NULL)
+			fclose(f);
+	} else {
+		TAP_OK(f == NULL && errno == EINVAL,
+		       "fdopen on a UDP socket fails with EINVAL");
+	}
 	errno = 0;
 	TAP_OK(sendfile(fd, fileno(tf), &off, 4) == -1 && errno == EINVAL,
 	       "sendfile onto a UDP socket fails with EINVAL");
@@ -1107,9 +1136,11 @@ int main(int argc, char **argv)
 {
 	if (argc < 4) {
 		fprintf(stderr,
-		        "usage: test_fidelity <echo1_v4> <echo2_v4> <echo_v6>\n");
+		        "usage: test_fidelity <echo1_v4> <echo2_v4> <echo_v6> "
+		        "[supervised]\n");
 		return 2;
 	}
+	g_supervised = argc > 4 && strcmp(argv[4], "supervised") == 0;
 
 	memset(&g_echo1, 0, sizeof(g_echo1));
 	g_echo1.sin_family = AF_INET;

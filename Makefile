@@ -72,13 +72,16 @@ TESTDIR := tests
 
 # Everything except the wrapper's own main() and the supervisor belongs to the
 # shim.
-SHIM_SRCS    := $(filter-out $(SRCDIR)/wrapper.c $(SRCDIR)/supervise.c,\
+SV_SRCS      := $(SRCDIR)/supervise.c $(SRCDIR)/svcall.c $(SRCDIR)/svsock.c
+SHIM_SRCS    := $(filter-out $(SRCDIR)/wrapper.c $(SV_SRCS),\
                              $(wildcard $(SRCDIR)/*.c))
 SHIM_OBJS    := $(SHIM_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 
-# The wrapper links only the pieces it needs: no hooks, no fd table.
+# The wrapper links only the pieces it needs: no hooks, no fd table.  The
+# supervisor carries datagrams itself, so it takes the SOCKS5 client and the
+# datagram rules the shim uses (D-48).
 WRAPPER_SRCS := $(SRCDIR)/wrapper.c $(SRCDIR)/config.c $(SRCDIR)/log.c \
-                $(SRCDIR)/addr.c $(SRCDIR)/supervise.c
+                $(SRCDIR)/addr.c $(SRCDIR)/socks5.c $(SRCDIR)/dgram.c $(SV_SRCS)
 WRAPPER_OBJS := $(WRAPPER_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 
 SHIM    := libudpchains.so
@@ -95,7 +98,8 @@ TESTS    := $(OBJDIR)/test_config $(OBJDIR)/test_socks5 $(OBJDIR)/test_addr \
             $(OBJDIR)/test_fdtable_mt $(OBJDIR)/test_portswitch \
             $(OBJDIR)/bench_latency $(OBJDIR)/test_dns \
             $(OBJDIR)/test_resolve $(OBJDIR)/test_supervise_unit \
-            $(OBJDIR)/test_supervise $(OBJDIR)/leakclient-static
+            $(OBJDIR)/test_supervise $(OBJDIR)/leakclient-static \
+            $(OBJDIR)/test_matrix-static $(OBJDIR)/test_fidelity-static
 
 .PHONY: all clean test check install uninstall fixtures tests interop compare
 
@@ -173,7 +177,7 @@ $(OBJDIR)/test_thread: $(TESTDIR)/test_thread.c | $(OBJDIR)
 # Links the fd table directly rather than preloading the shim, so TSan can
 # analyse it: TSan understands C11 atomics but intercepts read/recv/recvfrom,
 # which conflicts with LD_PRELOAD interposition (see tests/run_sanitizers.sh).
-MT_OBJS := $(OBJDIR)/fdtable.o $(OBJDIR)/assoc.o $(OBJDIR)/socks5.o \
+MT_OBJS := $(OBJDIR)/fdtable.o $(OBJDIR)/assoc.o $(OBJDIR)/dgram.o $(OBJDIR)/socks5.o \
            $(OBJDIR)/addr.o $(OBJDIR)/config.o $(OBJDIR)/log.o \
            $(OBJDIR)/real.o $(OBJDIR)/scratch.o $(OBJDIR)/shim.o
 
@@ -195,14 +199,21 @@ $(OBJDIR)/leakclient: $(TESTDIR)/leakclient.c | $(OBJDIR)
 # run under is what an ASan run checks.
 STATIC_CFLAGS  = $(filter-out -fsanitize=%,$(CFLAGS))
 STATIC_LDFLAGS = $(filter-out -fsanitize=%,$(LDFLAGS))
-$(OBJDIR)/test_supervise_unit: $(TESTDIR)/test_supervise_unit.c $(OBJDIR)/supervise.o \
-                               $(OBJDIR)/log.o | $(OBJDIR)
+$(OBJDIR)/test_supervise_unit: $(TESTDIR)/test_supervise_unit.c \
+                               $(filter-out $(OBJDIR)/wrapper.o,$(WRAPPER_OBJS)) | $(OBJDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS)
 
 $(OBJDIR)/test_supervise: $(TESTDIR)/test_supervise.c | $(OBJDIR)
 	$(CC) $(STATIC_CFLAGS) -I$(SRCDIR) -static -o $@ $< $(STATIC_LDFLAGS)
 
 $(OBJDIR)/leakclient-static: $(TESTDIR)/leakclient.c | $(OBJDIR)
+	$(CC) $(STATIC_CFLAGS) -I$(SRCDIR) -static -o $@ $< $(STATIC_LDFLAGS)
+
+# FR-SV-T1: the shim's own matrix and fidelity tests, as static programs.
+$(OBJDIR)/test_matrix-static: $(TESTDIR)/test_matrix.c | $(OBJDIR)
+	$(CC) $(STATIC_CFLAGS) -I$(SRCDIR) -static -o $@ $< $(STATIC_LDFLAGS)
+
+$(OBJDIR)/test_fidelity-static: $(TESTDIR)/test_fidelity.c | $(OBJDIR)
 	$(CC) $(STATIC_CFLAGS) -I$(SRCDIR) -static -o $@ $< $(STATIC_LDFLAGS)
 
 $(OBJDIR)/bench_latency: $(TESTDIR)/bench_latency.c | $(OBJDIR)

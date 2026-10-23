@@ -25,7 +25,7 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 1883 assertions across 23 groups (`tests/run.sh`), all passing, plus the 91-check
+**Test totals:** 2282 assertions across 26 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
@@ -51,7 +51,10 @@ from a run rather than editing it by hand.
 | wrapper loadability | 17 |
 | TST-03 leak | 23 checks |
 | fault injection | 43 |
-| FR-SV supervisor mode, step 2 | 27 checks, one running a static probe making 18 assertions of its own |
+| FR-SV supervisor mode | 37 checks, three of them running static probes making 18, 6 and 37 assertions of their own |
+| FR-SV-T1 hook matrix, `-static`, under the supervisor | 108 |
+| FR-SV-T1 the same through 2 hops | 108 |
+| FR-SV fidelity, `-static`, under the supervisor | 173 |
 | TST-04 real tools | 2 run, 3 skipped (automated, against the fixture) |
 | NFR-04 latency benchmark | reported, not a gate (D-08) |
 | TST-02 symbol check | 71 (build gate, `make check`) |
@@ -208,34 +211,35 @@ means no code yet.
 ## Supervisor mode (§2b), in progress
 
 Not part of v1 scope, and not counted in the summary above. Design: D-48 to D-53, decided
-2026-10-22. Step 2 of the plan is built: the supervisor runs a program under its filter and
-answers it, but refuses UDP until step 3 carries it. The accepted limitations are listed in
+2026-10-22. Steps 2 and 3 of the plan are built: the supervisor runs a program under its filter
+and carries its UDP, for x86-64. Signals (step 4), threads and the supervisor-killed test (step 5),
+DNS and aarch64 (step 6) remain. The accepted limitations are listed in
 [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §9.
 
 | ID | Pri | Test | Status |
 |---|---|---|---|
-| FR-SV-01 | M | FR-SV-supervise | **Partial** — `--supervise`, `supervise = yes` and `UDPCHAINS_SUPERVISE` choose it, and the variable is not passed to the program; without them, every shim-mode group passes as before and the program has no filter. The shim is not given to a supervised program: `libudpchains.so` is removed from an inherited `LD_PRELOAD`. Same configuration and diagnostics once UDP is carried (step 3) |
+| FR-SV-01 | M | FR-SV-supervise, FR-SV-T1 | **Verified** — `--supervise`, `supervise = yes` and `UDPCHAINS_SUPERVISE` choose it, and the variable is not passed to the program; without them, every shim-mode group passes as before and the program has no filter. The shim is not given to a supervised program: `libudpchains.so` is removed from an inherited `LD_PRELOAD`, and if it was loaded into `udpchains` itself, `udpchains` runs again without it (tested: UDP is carried once). The same configuration, chains included, and the same diagnostics: the association line names the process and descriptor |
 | FR-SV-02 | M | unit-supervise, FR-SV-supervise | **Partial** — refuses before the `exec`, never running the program unsupervised: a kernel older than 5.14 (the release check unit-tested), no seccomp, a filter refused, a listener the parent cannot copy, an inherited UDP, raw or packet socket (tested). Only the last can be tested on this host |
 | FR-SV-03 | M | FR-SV-supervise | **Verified** — from a static probe, an x32 call and a 32-bit `int $0x80` call both fail with `ENOSYS`; only x86-64 is supported so far, and any other build refuses supervisor mode |
-| FR-SV-04 | M | — | **Not started** |
-| FR-SV-05 | M | — | **Not started** |
-| FR-SV-06 | M | — | **Not started** |
-| FR-SV-07 | M | — | **Not started** |
-| FR-SV-08 | M | — | **Not started** |
-| FR-SV-09 | M | FR-SV-supervise | **Partial** — `io_uring_setup` `ENOSYS`, `pidfd_getfd` `EPERM`, raw and packet sockets `EPERM`, ICMP datagram sockets `EPROTONOSUPPORT`, and `sendfile`/`splice` onto a received UDP socket `EINVAL`, each with a diagnostic not hidden by another's, from a static probe. `sendfile`/`splice` onto a reserved socket waits for the range (step 3) |
-| FR-SV-10 | M | — | **Not started** |
-| FR-SV-11 | M | FR-SV-supervise | **Partial** — the supervisor exits with the program's status, or dies of the signal that killed it; signals sent to it reach the program, and one the program handles is handled; it stays for a descendant the program leaves running, which is supervised. Per-descriptor state across `fork`, threads and `exec` comes with the range (steps 3 and 5) |
+| FR-SV-04 | M | FR-SV-supervise | **Verified** — every UDP socket is made at the lowest free number from 768; `dup` and `F_DUPFD`/`F_DUPFD_CLOEXEC` are placed in the range and carry; `dup2`/`dup3` below it fail with `EPERM` and put nothing there; `dup2` within it carries; a closed number is given out again |
+| FR-SV-05 | M | FR-SV-supervise, FR-SV-T1 | **Verified** — the program's socket is the only data socket: replies arrive on it (`poll` sees them), a socket shared across `fork` is one socket, and the supervisor keeps no descriptor of its own for it, so 40 sockets used and closed leave it holding no control connection |
+| FR-SV-06 | M | FR-SV-T1, FR-SV-fidelity | **Verified** — every sender of the matrix from a static probe, and the fidelity test's send semantics (returned length, `EMSGSIZE`, `EDESTADDRREQ`, `sendmmsg` partial success, `pwritev2`); `MSG_MORE`, multicast and a short address refused as in shim mode |
+| FR-SV-07 | M | FR-SV-T1, FR-SV-fidelity | **Verified** — every receiver of the matrix from a static probe; the true sender, truncation and `MSG_TRUNC`, `MSG_PEEK`, zero-length datagrams, `preadv2`; `recvmmsg` returns one datagram per call (D-51), checked as such |
+| FR-SV-08 | M | FR-SV-supervise | **Partial** — `O_NONBLOCK` and `MSG_DONTWAIT` give `EAGAIN` at once; a blocking receive waits, honours `SO_RCVTIMEO`, and returns `EINTR` when a signal interrupts it. `SA_RESTART` and no datagram lost under signals: step 4 |
+| FR-SV-09 | M | FR-SV-supervise | **Partial** — `io_uring_setup` `ENOSYS`, `pidfd_getfd` `EPERM`, raw and packet sockets `EPERM`, ICMP datagram sockets `EPROTONOSUPPORT`, and `sendfile`/`splice` onto a received UDP socket `EINVAL`, each with a diagnostic not hidden by another's, from a static probe. `sendfile`/`splice` onto a carried socket `EINVAL` (FR-SV-fidelity) |
+| FR-SV-10 | M | FR-SV-supervise, FR-SV-fidelity | **Verified** — `getsockname` reports the bound address with the port the kernel chose; `getpeername` the connected destination, never the relay, and `ENOTCONN` unconnected or after `connect(AF_UNSPEC)` |
+| FR-SV-11 | M | FR-SV-supervise | **Partial** — the supervisor exits with the program's status, or dies of the signal that killed it; signals sent to it reach the program, and one the program handles is handled; it stays for a descendant the program leaves running, which is supervised. State is kept per socket, so a socket inherited across `fork` is carried in the child, including after the parent has closed its descriptor. Threads, `exec` and their tests: step 5 |
 | FR-SV-12 | M | — | **Not started** |
 | FR-SV-13 | M | — | **Not started** |
-| FR-SV-14 | M | inspection, FR-SV-supervise | **Partial** — the supervisor opens no socket of its own, and logs no payload (it reads none yet); setuid, setgid and capability targets are refused before supervision, as in shim mode |
+| FR-SV-14 | M | inspection, FR-SV-supervise | **Verified** by inspection — the supervisor's only sockets are the program's (made for it, then closed) and its control connections to the proxy; nothing listens. Its debug lines carry addresses, lengths and the ATYP byte, never payload (NFR-05). setuid, setgid and capability targets are refused before supervision, as in shim mode |
 | FR-SV-15 | S | — | **Not started** |
 | FR-SV-16 | S | — | **Not started** |
 | FR-SV-17 | C | — | **Not started** |
 | FR-SV-18 | M | FR-SV-supervise | **Verified** — a UDP socket received over `SCM_RIGHTS` from an unsupervised process: `sendto`, `send`, `sendmsg`, `sendmmsg` and `connect` fail with `EPERM`, `sendfile` and `splice` onto it with `EINVAL`; D-50's documented `write()` gap is shown to deliver its one byte and nothing else. An inherited UDP socket refuses the run, naming the descriptor. With the `socket()` trap removed (a mutation), the dynamic and static leak clients still sent nothing |
 | FR-SV-19 | M | — | **Not started** |
-| FR-SV-T1 | M | — | **Not started** |
-| FR-SV-T2 | M | FR-SV-supervise | **Partial** — the leak client, static and dynamic, sends nothing and the destination receives nothing. The wire capture and the supervisor killed mid-run: step 5 |
-| FR-SV-T3 | M | — | **Not started** |
+| FR-SV-T1 | M | FR-SV-T1-matrix, FR-SV-T1-matrix-2hop | **Verified** — the 108-cell matrix with the probe built `-static`, directly and through two hops; also under ASan and UBSan. With `read` removed from the filter's range calls (a mutation), the 9 `read` cells failed |
+| FR-SV-T2 | M | FR-SV-supervise | **Partial** — against a dead proxy, the leak client, static and dynamic, sends nothing and the destination receives nothing; with the proxy up, the same sends are carried. The wire capture and the supervisor killed mid-run: step 5 |
+| FR-SV-T3 | M | FR-SV-supervise | **Partial** — the `dup` family, `fork` (a child sending on, and outliving the parent's descriptor for, an inherited socket), `SCM_RIGHTS` from an unsupervised process, and each refused route. `exec`, threads and `close_range`: step 5. With the sweep's marking removed (a mutation), the socket a child still held was forgotten and 7 checks failed |
 | FR-SV-T4 | M | — | **Not started** |
 | FR-SV-T5 | S | — | **Not started** |
 

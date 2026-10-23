@@ -706,21 +706,37 @@ once a second, with no vaguer line after it (D-43). A dropped datagram names its
 
 ## 13. Supervisor mode (FR-SV-*), in progress
 
-**Status:** step 2 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
-D-48 to D-53, the requirements §2b. The supervisor runs programs and answers its filter, but does
-not carry UDP yet: a UDP socket is refused.
+**Status:** step 3 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
+D-48 to D-53, the requirements §2b. The supervisor carries a static program's UDP through the
+proxy or chain, from sockets it makes in a reserved range. Not yet: the signal tests (step 4),
+threads and the supervisor-killed test (step 5), DNS redirection and aarch64 (step 6).
 
 ### 13.1 Where it lives
 
-`src/supervise.c`, linked into the wrapper only, never into the shim. `udpchains --supervise`
-(or `supervise = yes`, or `UDPCHAINS_SUPERVISE=1`, D-49) resolves and exports the configuration as
-usual, removes `libudpchains.so` from `LD_PRELOAD`, and calls `udpc_supervise()` instead of
-`exec`.
+Linked into the wrapper only, never into the shim:
+
+| File | Holds |
+|---|---|
+| `supervise.c` | the filter, start-up, the loop, exit status and signals |
+| `svcall.c` | answering each call: `socket()`, sends, receives, names, the `dup` family, refusals |
+| `svsock.c` | the sockets the supervisor carries, their associations, and the sweep for closed ones |
+| `svint.h` | what the three share |
+
+The supervisor reuses the SOCKS5 client and chain codec (`socks5.c`), and the datagram rules both
+front ends apply (`dgram.c`): the multicast and broadcast refusal, `MSG_MORE` and GSO, the loopback
+guard, and the checks and stripping of a received datagram's headers (D-41).
+
+`udpchains --supervise` (or `supervise = yes`, or `UDPCHAINS_SUPERVISE=1`, D-49) resolves the
+configuration as usual and removes `libudpchains.so` from `LD_PRELOAD`. If the shim was there, it
+is already loaded into `udpchains` itself, so `udpchains` runs itself again without it first. It
+then calls `udpc_supervise()` with the configuration, password included, instead of `exec`: the
+supervisor, not the program, speaks to the proxy.
 
 ### 13.2 Start-up
 
 ```
 wrapper: kernel ≥ 5.14? inherited UDP/raw/packet socket?        → refuse (D-53, D-50)
+         the range's start: 768, or half the soft RLIMIT_NOFILE below 1024
          block forwarded signals + SIGCHLD; signalfd; subreaper
          fork
   child: restore the signal mask; no_new_privs
@@ -729,6 +745,7 @@ wrapper: kernel ≥ 5.14? inherited UDP/raw/packet socket?        → refuse (D-
          close the listener; exec the program
  parent: pidfd_open(child); pidfd_getfd(listener) → its own copy
          ack; read until the exec closes the pipe (or its errno)
+         raise its own RLIMIT_NOFILE to the hard limit, for control connections
          serve until no supervised process is left
 ```
 
@@ -738,28 +755,81 @@ The program never holds the listener: it is closed before the `exec`, and close-
 
 ### 13.3 The filter
 
-Built at run time, x86-64 only so far. A call from another ABI, or with `__X32_SYSCALL_BIT`, fails
-with `ENOSYS` in the kernel. `socket()` is sent to the supervisor for `AF_INET`, `AF_INET6` and
-`AF_PACKET`; `connect`, `sendto`, `sendmsg`, `sendmmsg`, `sendfile`, `splice`, `io_uring_setup`
-and `pidfd_getfd` always. Everything else runs in the kernel.
+Built at run time, x86-64 only so far, by a small assembler that resolves forward jumps to labels.
+A call from another ABI, or with `__X32_SYSCALL_BIT`, fails with `ENOSYS` in the kernel. Sent to
+the supervisor:
 
-### 13.4 Answering
+- `socket()` for `AF_INET`, `AF_INET6` and `AF_PACKET`;
+- always: `connect`, `sendto`, `sendmsg`, `sendmmsg`, `sendfile`, `splice`, `io_uring_setup`,
+  `pidfd_getfd`;
+- when the descriptor is in the range: `read`, `write`, `readv`, `writev`, `preadv2`, `pwritev2`,
+  `recvfrom`, `recvmsg`, `recvmmsg`, `bind`, `getsockname`, `getpeername`, `close`, `dup`;
+- `dup2` and `dup3` from or to the range; `close_range` reaching it; `fcntl` on it, and any
+  `F_DUPFD` or `F_DUPFD_CLOEXEC`.
 
-One notification at a time, in one thread. Each is answered with an `errno`, or let continue
-(`SECCOMP_USER_NOTIF_FLAG_CONTINUE`):
+Everything else runs in the kernel, so file and TCP I/O below the range never reaches the
+supervisor. `pread64`, `pwrite64`, `preadv` and `pwritev` are not sent: the kernel refuses them on
+a socket itself. A descriptor is compared unsigned, so a negative one counts as in the range and
+gets the kernel's own `EBADF`.
 
-- `socket()`: raw and packet sockets `EPERM`, ICMP and UDP-Lite `EPROTONOSUPPORT`, and for now UDP
-  `EPROTONOSUPPORT`; anything else continues. Its arguments are values, so continuing cannot be
-  raced.
-- On a descriptor: the supervisor finds the calling thread's process, opens a pidfd, checks the
-  notification is still valid (so the pid is not a reused one), and copies the descriptor
-  (`pidfd_getfd`). A UDP, raw or packet socket is refused, `EPERM`, or `EINVAL` for `sendfile` and
-  `splice`; anything else continues. A descriptor that cannot be classified is refused.
+### 13.4 The sockets it carries
+
+A UDP `socket()` is made by the supervisor, in its own process, keeping `SOCK_NONBLOCK`. The
+supervisor finds the lowest free number at or above the range's start in the caller's process,
+asking for each in turn with `pidfd_getfd`, and installs the socket there while answering the call
+(`SECCOMP_ADDFD_FLAG_SETFD | SECCOMP_ADDFD_FLAG_SEND`). Its own descriptor is then closed: the
+program's is the only one kept open (FR-SV-05), so closing it frees the port as natively.
+
+Each socket's entry (`struct sv_sock`) is keyed by the kernel's socket cookie. It holds the family,
+the destination the program connected to, the address it bound, and the association: the chain,
+each hop's control connection in the supervisor, and the time of last use (FR-P-08). Every call on
+a descriptor in the range starts with a fresh copy of it (`pidfd_getfd`) and its cookie, so a
+`dup`, a `fork`, an `exec` or a passed socket all find the same entry, and a closed and reused
+number is never mistaken for the socket that was there.
+
+The program's own socket is pointed at hop 1's relay when the association is set up, through the
+supervisor's copy (the same open file), so replies arrive on it and `poll`, `select` and `epoll`
+work unaided (FR-I-07).
+
+**The sweep.** The kernel does not say when the last descriptor for a socket closes. 200 ms after
+a `close`, `close_range`, `dup2` or `dup3` in the range, or a child's exit, and every 5 s while any
+socket is carried, the supervisor lists `/proc`, picks its descendants by their parent links, and
+reads the socket inodes in their descriptors at or above the range's start. An entry no descendant
+holds has its association closed. If a descendant's descriptors cannot be read, nothing is
+forgotten that time.
+
+### 13.5 Answering
+
+One notification at a time, in one thread. Before using anything read from the program's memory
+or descriptors, the supervisor checks the notification is still pending, so a call the program
+abandoned, or a thread number reused, is never acted on.
+
+- **`socket()`:** raw and packet sockets `EPERM`, ICMP and UDP-Lite `EPROTONOSUPPORT`; UDP as
+  above; anything else continues. Its arguments are values, so continuing cannot be raced.
+- **Sends** on a carried socket: the message header, iovecs, address and control data are read
+  with `process_vm_readv`, checked as in shim mode (`EMSGSIZE`, `EDESTADDRREQ`, multicast,
+  `MSG_MORE`, GSO), wrapped, and sent on the supervisor's copy to the relay, never blocking the
+  supervisor for long. `sendmmsg` reports partial success as the kernel does.
+- **Receives** on a carried socket (D-51): peek, check and strip every layer, write the payload,
+  sender and message fields into the program, answer, and consume only if the answer was
+  accepted. `recvmmsg` returns one datagram. With nothing queued, a non-blocking receive gets
+  `EAGAIN`; a blocking one is **parked**, and its socket joins the loop's `poll` set until a
+  datagram arrives, its `SO_RCVTIMEO` passes, or the call is gone.
+- **`connect`, `bind`, `getsockname`, `getpeername`** on a carried socket: as the shim answers
+  them (FR-F-08, FR-P-05, FR-I-05). `bind` is performed on the supervisor's copy, so the address
+  checked is the one bound.
+- **The `dup` family:** `dup` and `F_DUPFD` of a carried socket are installed in the range;
+  `dup2` and `dup3` of one below the range are refused with `EPERM`.
+- **Any other descriptor:** a UDP, raw or packet socket the supervisor did not make is refused for
+  anything that would send, connect or move data, with `EPERM` (`EINVAL` for `sendfile` and
+  `splice`). Anything else continues. A descriptor that cannot be classified is refused; when the
+  kernel denies the access, as for a non-dumpable process, the diagnostic says so (D-48).
 - `io_uring_setup` `ENOSYS`, `pidfd_getfd` `EPERM`.
 
-Each refusal is reported once a second for each reason (D-33).
+Each refusal is reported once a second for each reason (D-33). Each association is reported as in
+shim mode, naming the process and descriptor (FR-C-06).
 
-### 13.5 Exit and signals
+### 13.6 Exit and signals
 
 - **Signals** sent to `udpchains` by another process — `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGTERM`,
   `SIGUSR1`, `SIGUSR2`, `SIGALRM`, `SIGWINCH` — are forwarded to the program. One from the
@@ -770,14 +840,24 @@ Each refusal is reported once a second for each reason (D-33).
 - **Status.** It exits with the program's status; if the program was killed by a signal, the
   supervisor dies of the same one, with core dumps off, so a shell sees what it would have seen.
 
-### 13.6 Tests
+### 13.7 Tests
 
 - `unit-supervise`: the kernel-floor check against release strings of several distributions.
 - `FR-SV-supervise` (`tests/test_supervise.sh`): exit statuses and death by signal; the filter
-  present and the shim absent; the flag, the setting and the variable; signals forwarded and
-  handled; a descendant waited for and supervised; a static probe (`test_supervise refusals`)
-  checking every refusal, the x32 and 32-bit ABIs, and that TCP, Unix sockets and files work; the
-  leak client, static and dynamic, sending nothing; a UDP socket received from an unsupervised
-  process refused on every send route but D-50's `write()` gap, which delivers its one byte; and
-  an inherited UDP socket refusing the run.
-- The same script under ASan and UBSan, in `run_sanitizers.sh`.
+  present and the shim absent; the flag, the setting and the variable; the shim in an inherited
+  `LD_PRELOAD` not wrapping twice; signals forwarded and handled; a descendant waited for and
+  supervised; a static probe checking every refusal, the x32 and 32-bit ABIs, and that TCP, Unix
+  sockets and files work; a non-dumpable process refused its connect and UDP socket, with the
+  cause named, while files and pipes work; a static probe (`test_supervise range`) for the range,
+  the `dup` family, names, refused sends, receives that wait, time out and are interrupted,
+  `poll`, and a socket inherited across `fork`, including by a child that outlives the parent's
+  descriptor; 40 sockets used and closed, after which the supervisor holds no control
+  connection; the leak client, static and dynamic, against a dead proxy sending nothing; a UDP
+  socket received from an unsupervised process refused on every send route but D-50's `write()`
+  gap, which delivers its one byte; and an inherited UDP socket refusing the run.
+- `FR-SV-T1-matrix`: the hook matrix, built `-static`, under the supervisor, directly and through
+  two hops.
+- `FR-SV-fidelity`: TST-05 built `-static`, checking the two documented differences as such:
+  `recvmmsg` returns one datagram per call, and stdio on a UDP socket is carried.
+- Under ASan and UBSan in `run_sanitizers.sh`: the script, and the static matrix and fidelity
+  tests, with the supervisor instrumented.

@@ -1,9 +1,10 @@
 # Future requirement — static and Go binaries (supervisor mode)
 
-**Status:** planned after 0.2.0, on branch `supervisor_mode`. Step 1 of §7 is done: the decisions
-are D-48 to D-53, and the requirements are §2b of
+**Status:** in progress after 0.2.0, on branch `supervisor_mode`. Steps 1 to 3 of §7 are done: the
+decisions are D-48 to D-53, the requirements are §2b of
 [`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the reference for
-them. No code yet. §9 lists the known limitations the decisions accept.
+them, and the supervisor carries a static program's UDP (DESIGN.md §13). §9 lists the known
+limitations the decisions accept.
 **Written:** 2026-10-20, against `9acf337`. Line counts and file references are as of that
 commit; recheck them before starting. The kernel versions in §8 were confirmed in the man pages
 on 2026-10-22.
@@ -181,7 +182,14 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
    in place already. Every commit of the mode fails closed.
 3. `socket()`, the reserved range and the `dup` family. Then sends, then non-blocking receives:
    enough for the matrix with a static probe, and for Go, which never blocks in a receive.
-4. Blocking receives and signals. The hardest part, so it gets its own step.
+   *Done 2026-10-22,* with blocking receives brought forward from step 4, since the matrix makes
+   them. A receive with nothing queued is parked in the supervisor's own loop rather than given
+   to a worker, honouring `SO_RCVTIMEO` and ending in `EINTR` when a signal interrupts it (D-51).
+   The static matrix passes directly and through two hops, and the fidelity test passes with the
+   two documented differences. Sockets are tracked by the kernel's socket cookie, so `fork` and
+   `exec` need nothing more for state; step 5 is left their tests and threads.
+4. Blocking receives and signals. The hardest part, so it gets its own step. What is left after
+   step 3: the signal tests of FR-SV-T4, `SA_RESTART`, and that no datagram is lost.
 5. `fork`, threads and `exec`; the refused routes; the supervisor-killed test; the wire capture.
 6. DNS. Then aarch64, interop, `make compare`, and documentation.
 
@@ -205,9 +213,16 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
 - **Two front ends.** Every behaviour has to be tested twice and documented per mode. The
   requirements should say which differences between the modes are allowed.
 - **The shim loaded into the supervisor.** An inherited `LD_PRELOAD` naming `libudpchains.so`
-  loads the shim into the wrapper itself. Harmless while the supervisor sends nothing, but from
-  step 3 it would wrap the supervisor's own datagrams. Step 3 must re-run the wrapper without it,
-  or refuse.
+  loads the shim into the wrapper itself, where it would wrap the supervisor's own datagrams.
+  *Settled in step 3:* the wrapper runs itself again without it (D-49).
+- **Setting up an association holds up the loop.** The supervisor is one thread, so while it
+  waits for the proxy, every other trapped call waits too. Moving setup to a worker is a candidate
+  for step 4 or 5, if a program is found that suffers from it.
+- **Processes that cannot be inspected.** A process that makes itself non-dumpable
+  (`ssh-agent`, `gpg-agent`) denies the supervisor the access it needs, so its connects and sends
+  fail closed, TCP included, with a diagnostic naming the cause (D-48). Found in step 3. *Decided:*
+  it stays fail-closed. Letting such a process's connects and sends through below the range would
+  widen D-50's received-socket gap for it; revisit if a program needs it.
 - **A thread with its own descriptor table.** A notification names a thread; the supervisor reads
   the descriptor through its process (`pidfd_open` takes a process before Linux 6.9). A thread
   that has unshared its descriptor table (`unshare(CLONE_FILES)`) would be checked against the
@@ -252,3 +267,15 @@ the mode is built (FR-SV-19). Each is explained in its record.
   container runtime that allows the filter are required; otherwise the program is not run (D-53).
 - **Each supervised call costs two context switches and a copy,** against about 1 µs for the
   shim; to be measured (FR-SV-15).
+- **Found in step 3** (D-48, D-50):
+  - while an association is set up, the program's other trapped calls wait for it;
+  - a process that makes itself non-dumpable (`ssh-agent`, `gpg-agent`) fails closed, with a
+    diagnostic naming the cause: its connects and sends, TCP included,
+    are refused, and it cannot make a UDP socket;
+  - a send interrupted after its datagram has left is sent again if the call restarts;
+  - a socket is placed at a free number, but a program with the range's start of descriptors open
+    could, from another thread, open one at that number in the instant before the install;
+  - a carried socket passed to another supervised process below the range is carried by its
+    sends, but not by `write` and `read` there;
+  - stdio on a UDP socket is carried, where the shim refuses it (D-36): a difference between the
+    modes, not a limitation.

@@ -1913,7 +1913,7 @@ file, three directives are warned about once each, and a `dynamic_chain` file ru
 ## D-48
 ### Supervisor mode intercepts system calls with seccomp user notification
 
-**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-02, FR-SV-03, FR-SV-13.
+**Date:** 2026-10-22 · **Status:** Accepted; built for x86-64 (steps 2 and 3) · FR-SV-02, FR-SV-03, FR-SV-13.
 Revisits FR-I-01 (`LD_PRELOAD` as the only mechanism). Background:
 [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md).
 
@@ -1962,6 +1962,25 @@ the kernel. The supervisor performs each trapped call itself, or answers it with
 - **Inside containers,** a runtime's own seccomp profile may forbid installing the filter. The
   mode then refuses to start; it never runs the program unsupervised (FR-SV-02).
 
+**Built in step 3** (2026-10-22): the supervisor is one thread, which answers every call in turn,
+carrying the program's UDP through the same SOCKS5 client, chain codec and datagram checks as the
+shim (`dgram.c` holds the checks both front ends apply). It adds three limitations:
+
+- **Setting up an association holds up the program's other trapped calls.** While the supervisor
+  waits for the proxy (up to `connect_timeout` per hop), every other trapped call in every
+  supervised process waits too. Other system calls do not.
+- **A process that makes itself non-dumpable cannot be inspected.** Linux then denies the
+  supervisor `ptrace`-level access to it, as Yama's stricter settings do. Its connects and sends,
+  TCP and Unix sockets included, fail with `EPERM`, and it cannot make a UDP socket; files, pipes
+  and `read`/`write` below the range still work. It fails closed, with a diagnostic that names
+  the cause. `ssh-agent` and `gpg-agent` are such programs (`prctl(PR_SET_DUMPABLE, 0)`; checked
+  on this host, where the `ssh` client is not), and so is a process running a binary it cannot
+  read. It matters most when such an agent is started under a supervised program, which it then
+  inherits. Chosen by the maintainer over letting such a process's connects and sends below the
+  range through unchecked, which would widen the received-socket gap (D-50) for it.
+- **A send interrupted after its datagram has left is sent again** if the call restarts
+  (`SA_RESTART`). UDP permits duplicates, but a native send is never repeated.
+
 **Revisit if:** a kernel interface appears that lets a supervisor see a descriptor's type in the
 filter, which would remove the reserved range (D-50).
 
@@ -1970,7 +1989,7 @@ filter, which would remove the reserved range (D-50).
 ## D-49
 ### Supervisor mode is chosen explicitly, and never combined with the shim
 
-**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-01, FR-SV-17. Chosen by the
+**Date:** 2026-10-22 · **Status:** Accepted; built (steps 2 and 3) · FR-SV-01, FR-SV-17. Chosen by the
 maintainer over choosing it automatically for static and Go binaries, and over supervising every
 program.
 
@@ -2000,6 +2019,12 @@ program.
 **Known limitation.** A user must know to ask: a static or Go program run without `--supervise`
 still sends directly, as in 0.2.0, which the README already says.
 
+**Built in step 3** (2026-10-22): an inherited `LD_PRELOAD` naming `libudpchains.so` has already
+loaded the shim into `udpchains` itself by the time it reads its configuration. There the shim
+would wrap the supervisor's own datagrams a second time. So `udpchains` removes the shim from
+`LD_PRELOAD` and runs itself again (`/proc/self/exe`), before changing anything else. If it
+cannot, it refuses to supervise.
+
 **Revisit if:** supervisor mode has had remote and real-proxy interop; then FR-SV-17.
 
 ---
@@ -2007,7 +2032,7 @@ still sends directly, as in 0.2.0, which the README already says.
 ## D-50
 ### UDP sockets live in a reserved range; outside it, UDP sends and connects are refused
 
-**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-04, FR-SV-18. Chosen by the
+**Date:** 2026-10-22 · **Status:** Accepted; built (steps 2 and 3) · FR-SV-04, FR-SV-18. Chosen by the
 maintainer: trap sends on every descriptor and check its type, with three additions, over
 trapping `recvmsg` everywhere and over documenting the gap.
 
@@ -2065,15 +2090,46 @@ supervisor would cost two context switches on each.
 - **The range is decided before the program runs.** A program that raises its own descriptor
   limit later (Go does, at start-up) keeps the range where it was.
 
-**Open for step 3** of the plan: placing a socket at a number in the range must not replace a
-descriptor the program already has there; how the supervisor finds a free number, and what it
-does when the range is full (D-46 is the shim's answer), is settled when it is built.
+**Open for step 3** of the plan, and settled there (below): placing a socket at a number in the
+range must not replace a descriptor the program already has there; how the supervisor finds a
+free number, and what it does when the range is full (D-46 is the shim's answer).
 
 **Built in step 2** (2026-10-22): the checks outside the range, the three additions, and the
 start-up check, all as above. Until step 3 carries UDP, every UDP socket is outside the range, so
 `socket()` refuses one with `EPROTONOSUPPORT` instead of making it: the mode fails closed at every
 step of its construction. A mutation that stopped trapping `socket()` was still caught by the
 checks outside the range: nothing was sent.
+
+**Built in step 3** (2026-10-22): UDP is carried, and the refusal at `socket()` is gone.
+
+- **Where a socket goes.** At the lowest free number at or above the range's start in the calling
+  process, below its `RLIMIT_NOFILE`. The supervisor finds it by asking for each number in turn
+  (`pidfd_getfd`), and installs the socket and answers the call in one step
+  (`SECCOMP_ADDFD_FLAG_SEND`). With no free number, `socket()` fails with `EMFILE`, as a full
+  descriptor table does. D-46's answer does not apply: there is nowhere else to put the socket.
+- **What the supervisor knows is kept per socket, not per descriptor.** Entries are keyed by the
+  kernel's socket cookie, which is never reused. A `dup`, a `fork`, an `exec`, or a socket passed
+  between supervised processes all find the same entry, as they share one socket in the kernel.
+  Nothing per process or per number can go stale.
+- **Noticing a socket closed.** The kernel does not tell the supervisor when a program's last
+  descriptor for a socket closes, so the supervisor looks. 200 ms after a close in the range or a
+  child's exit, and every 5 s while it carries any socket, it reads `/proc/<pid>/fd` of each
+  descendant. A socket none of them holds in the range has its association closed. A descendant
+  whose descriptors cannot be read holds that sweep back entirely, so nothing in use is forgotten.
+- **The `dup` family.** `dup` and `fcntl(F_DUPFD, F_DUPFD_CLOEXEC)` of a carried socket are placed
+  in the range. `dup2` and `dup3` to a number in the range are let through; below it, they are
+  refused with `EPERM` and a diagnostic.
+
+It adds two limitations:
+
+- **A narrow race in placing a socket.** The program allocates lowest-free, so it reaches the
+  range only once it has the range's start of descriptors open. Even then, another of its threads
+  would have to open a descriptor at the same number, between the supervisor's check and the
+  install, for that descriptor to be replaced.
+- **A carried socket that reaches another supervised process below the range** (over
+  `SCM_RIGHTS`) still has its sends and `connect` carried, since those are trapped on every
+  descriptor. `write` and `read` there are not trapped: what is written reaches the relay without
+  a header and goes no further, and what is read still has its header. Neither is a leak.
 
 **Revisit if:** the gap above is met by a real program, which would justify trapping `recvmsg` on
 Unix sockets.
@@ -2083,7 +2139,7 @@ Unix sockets.
 ## D-51
 ### A supervised receive peeks, delivers, and consumes only once the program has the datagram
 
-**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-07, FR-SV-08. Chosen by the
+**Date:** 2026-10-22 · **Status:** Accepted; built in part (step 3) · FR-SV-07, FR-SV-08. Chosen by the
 maintainer over letting signals wait, and over accepting an occasional lost datagram.
 
 **Context.** While the supervisor performs a receive, the program's call can be interrupted by a
@@ -2127,6 +2183,15 @@ socket at that point would be lost.
   next one.
 - **Each receive costs** two context switches and a copy in each direction, against about 1 µs
   for the shim; it will be measured (FR-SV-15).
+
+**Built in step 3** (2026-10-22): peek, deliver and commit, as decided. A blocking receive with
+nothing queued is **parked** rather than given to a worker. Its call waits in the program while
+the supervisor, one thread, watches the socket in its own loop, and answers the call when a
+datagram arrives. At the socket's `SO_RCVTIMEO` it answers `EAGAIN`, as a native socket would. A
+call that has gone is forgotten: the same thread's next call shows it was interrupted, and parked
+calls are asked once a second whether they are still pending. A signal interrupting a waiting
+receive gives `EINTR` (tested). Left for step 4: the signal tests of FR-SV-T4, including
+`SA_RESTART` and that no datagram is lost.
 
 ---
 
@@ -2188,7 +2253,7 @@ address, not this host's.
 ## D-53
 ### What supervisor mode refuses, and Linux 5.14 as its floor
 
-**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-02, FR-SV-09. Revisits D-29 and
+**Date:** 2026-10-22 · **Status:** Accepted; built (step 2) · FR-SV-02, FR-SV-09. Revisits D-29 and
 D-36 (their refusals made at the system call instead of at libc), and NFR-01a (a higher floor for
 this mode only).
 

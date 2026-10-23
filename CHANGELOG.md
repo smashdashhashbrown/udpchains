@@ -16,21 +16,39 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 - **Supervisor mode** (D-48 to D-53), in progress, for static and Go binaries, which the shim
   cannot see. `udpchains --supervise` (or `supervise = yes`, or `UDPCHAINS_SUPERVISE=1`) runs the
   program under a seccomp filter whose calls udpchains answers, instead of preloading the shim.
-  - **So far** (step 2 of `docs/FUTURE-STATIC-BINARIES.md`): the program runs under the filter
-    and is never given the shim; its exit status and the signals sent to `udpchains` are passed
-    on; descendants it leaves running are waited for and stay supervised. x86-64 and Linux 5.14
-    or later only.
-  - **Not yet: UDP.** A UDP socket is refused (`EPROTONOSUPPORT`) rather than made, so nothing is
-    sent directly while the mode is built. Already refused, as decided: raw, packet, ICMP and
-    UDP-Lite sockets; `io_uring_setup`; `pidfd_getfd`; sends, connects, `sendfile` and `splice`
-    on a UDP socket received from another process; and starting with an inherited UDP socket.
-  - Not yet in the README, man page or `udpchains -h`.
+  - **So far** (steps 2 and 3 of `docs/FUTURE-STATIC-BINARIES.md`): a static program's UDP is
+    carried through the proxy or chain. The supervisor makes each UDP socket in a reserved range
+    of descriptors (768 and up) and performs its sends and receives there: headers added and
+    checked, the true sender reported, blocking and non-blocking receives, `SO_RCVTIMEO`,
+    interruption by a signal, the `dup` family, `connect`, `bind` and the name calls. The program
+    is never given the shim; its exit status and the signals sent to `udpchains` are passed on;
+    descendants it leaves running are waited for and stay supervised. x86-64 and Linux 5.14 or
+    later only.
+  - **Refused, as decided:** raw, packet, ICMP and UDP-Lite sockets; `io_uring_setup`;
+    `pidfd_getfd`; sends, connects, `sendfile` and `splice` on a UDP socket received from another
+    process; `dup2` of a carried socket below the range; and starting with an inherited UDP
+    socket.
+  - **Known limitations found while building it:** a program that makes itself non-dumpable
+    (`ssh-agent`, `gpg-agent`) is refused its connects and sends, TCP included, with a diagnostic
+    naming the cause; setting up an
+    association holds up the program's other trapped calls; `recvmmsg` returns one datagram per
+    call.
+  - **Not yet:** the signal tests (`SA_RESTART`, no datagram lost), threads, DNS redirection,
+    aarch64. Not yet in the README, man page or `udpchains -h`.
+
+### Changed
+
+- The checks both front ends apply to a datagram (multicast and broadcast, `MSG_MORE`, GSO, the
+  loopback guard, and a received datagram's headers) moved from the shim's `core.c`, `assoc.c`
+  and `hooks.c` into `dgram.c`, unchanged, so the supervisor applies the same ones.
 
 ### Verification
 
-- 1883 assertions across 23 groups. Supervisor mode adds `unit-supervise` (11), 6 to
-  unit-config, and `FR-SV-supervise` (27 checks, with a static probe making 18 assertions). The
-  supervisor also runs under ASan and UBSan.
+- 2282 assertions across 26 groups. Supervisor mode adds `unit-supervise` (11), 6 to
+  unit-config, `FR-SV-supervise` (37 checks, with static probes making 18, 6 and 37 assertions), the
+  hook matrix built `-static` under the supervisor (108, and 108 more through two hops), and the
+  fidelity test built `-static` under it (173). The supervisor also runs under ASan and UBSan,
+  with the static matrix and fidelity tests.
 
 ## [0.2.0] — 2026-10-21
 

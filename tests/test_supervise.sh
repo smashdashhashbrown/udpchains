@@ -1,11 +1,10 @@
 #!/bin/bash
-# test_supervise.sh -- supervisor mode, step 2 (D-48 to D-53, FR-SV-*).
+# test_supervise.sh -- supervisor mode (D-48 to D-53, FR-SV-*).
 #
-# The supervisor so far installs the filter, answers it, and passes on the
-# program's exit status and signals.  It does not carry UDP yet, so a UDP
-# socket is refused rather than made: these check that it fails closed, that
-# everything else still works, and the start-up refusals.  The probes are
-# static binaries, which the shim cannot see at all.
+# The supervisor installs the filter, carries UDP through the proxy for the
+# sockets it makes in the reserved range, refuses what it cannot carry, and
+# passes on the program's exit status and signals.  The probes are static
+# binaries, which the shim cannot see at all.
 #
 # usage: test_supervise.sh <wrapper> <build dir>
 #
@@ -54,8 +53,17 @@ start() {
 
 start PROXY proxy "$B/socks5d" --port 0 --quiet
 start ECHO echo "$B/udpecho" --port 0
-# A proxy is required, as in shim mode (FR-C-03); supervisor mode does not
-# use it yet.
+# A proxy that is not there: a fixture started and stopped, so its port is
+# free.
+"$B/socks5d" --port 0 --quiet > "$TMP/dead.out" 2>&1 &
+dead=$!
+for ((i = 0; i < 100; i++)); do
+	DEAD=$(awk '/^PORT/{print $2; exit}' "$TMP/dead.out" 2> /dev/null)
+	[ -n "$DEAD" ] && break
+	sleep 0.05
+done
+kill "$dead"
+wait "$dead" 2> /dev/null
 SV=("$W" --supervise -p "127.0.0.1:$PROXY")
 echoed() { grep -c bytes "$TMP/echo.err"; }
 
@@ -75,6 +83,7 @@ check "the program runs under a seccomp filter" "$out" "$(printf 'Seccomp:\t2')"
 if [ "$NO_SHIM" = 1 ]; then
 	skip "LD_PRELOAD stripping (NO_SHIM)"
 	skip "LD_PRELOAD unset (NO_SHIM)"
+	skip "the shim preloaded into udpchains itself (NO_SHIM)"
 else
 	# The shim also loads into the wrapper itself here, and says it is
 	# not configured; that is not what is checked.
@@ -85,6 +94,11 @@ else
 	out=$(LD_PRELOAD="$PWD/libudpchains.so" timeout 20 "${SV[@]}" \
 		sh -c 'echo "[${LD_PRELOAD-unset}]"' 2> /dev/null)
 	check "and an LD_PRELOAD of only the shim is unset" "$out" "[unset]"
+	# Loaded into the supervisor, the shim would wrap its datagrams to the
+	# relay a second time; udpchains runs itself again without it.
+	out=$(LD_PRELOAD="$PWD/libudpchains.so" timeout 30 "${SV[@]}" "$P" range "$ECHO" \
+		2> /dev/null | grep -c '^not ok')
+	check "with the shim in an inherited LD_PRELOAD, UDP is still carried once" "$out" 0
 fi
 out=$(UDPCHAINS_SUPERVISE=1 timeout 20 "$W" -p "127.0.0.1:$PROXY" \
 	sh -c 'grep "^Seccomp:" /proc/self/status; echo "[${UDPCHAINS_SUPERVISE-unset}]"')
@@ -139,22 +153,65 @@ timeout 30 "${SV[@]}" "$P" refusals "$PROXY" > "$TMP/refusals.tap" 2> "$TMP/refu
 rc=$?
 sed 's/^/#   /' "$TMP/refusals.tap"
 check "test_supervise refusals passes, -static" "$rc" 0
-grep -q "socket refused: supervisor mode does not carry UDP yet" "$TMP/refusals.err" &&
-	ok "the refusal says why" || notok "no diagnostic for the refused UDP socket"
-for what in "raw and packet" "io_uring" "pidfd_getfd"; do
+for what in "ICMP" "raw and packet" "io_uring" "pidfd_getfd"; do
 	grep -q "$what" "$TMP/refusals.err" && ok "a diagnostic for $what, not hidden by another" ||
 		notok "no diagnostic mentioning $what"
 done
 
-echo "# fail-closed: nothing is sent (SEC-01)"
+echo "# a process the supervisor cannot inspect fails closed (D-48)"
+timeout 30 "${SV[@]}" "$P" nodump "$PROXY" > "$TMP/nodump.tap" 2> "$TMP/nodump.err"
+rc=$?
+sed 's/^/#   /' "$TMP/nodump.tap"
+check "test_supervise nodump passes, -static" "$rc" 0
+grep -q "cannot be inspected: it has made itself non-dumpable" "$TMP/nodump.err" &&
+	ok "the refusal names the cause" || notok "no diagnostic naming non-dumpable"
+
+echo "# a static program's UDP, carried (D-50, D-51, FR-SV-04)"
+# -v: the association line is information, which run.sh's UDPCHAINS_QUIET hides.
+timeout 60 "${SV[@]}" -v "$P" range "$ECHO" > "$TMP/range.tap" 2> "$TMP/range.err"
+rc=$?
+sed 's/^/#   /' "$TMP/range.tap"
+check "test_supervise range passes, -static" "$rc" 0
+grep -q "association up: process [0-9]* fd 768 " "$TMP/range.err" &&
+	ok "the association is reported, naming the process and descriptor (FR-C-06)" ||
+	notok "no association line for fd 768"
+grep -q "dup2 refused" "$TMP/range.err" && ok "the refused dup2 says why" ||
+	notok "no diagnostic for the refused dup2"
+
+echo "# the supervisor lets go of sockets the program has closed"
+timeout 60 "${SV[@]}" "$P" churn "$ECHO" 40 6 > "$TMP/churn.out" 2> "$TMP/churn.err" &
+churn=$!
+PIDS+=($churn)
+for ((i = 0; i < 200; i++)); do
+	grep -q CHURNED "$TMP/churn.out" 2> /dev/null && break
+	sleep 0.05
+done
+check "40 sockets made, used and closed" "$(cat "$TMP/churn.out")" "CHURNED 40 of 40"
+sleep 1
+# timeout(1) runs udpchains as its child; the supervisor's own descriptors are
+# the listener, the signals, a process descriptor and stdio.
+svpid=$(pgrep -P "$churn" -x udpchains)
+nfd=$(ls "/proc/$svpid/fd" 2> /dev/null | wc -l)
+[ -n "$svpid" ] && [ "$nfd" -le 8 ] &&
+	ok "within a second, no control connection is left open ($nfd descriptors)" ||
+	notok "the supervisor still holds $nfd descriptors"
+wait "$churn"
+check "and the program exits 0" "$?" 0
+
+echo "# fail-closed: with the proxy down, nothing is sent (SEC-01)"
 before=$(echoed)
 for client in "$B/leakclient-static" "$B/leakclient"; do
-	out=$(timeout 60 "${SV[@]}" "$client" 127.0.0.1 "$ECHO" 2> /dev/null)
+	out=$(timeout 60 "$W" --supervise -p "127.0.0.1:$DEAD" "$client" 127.0.0.1 "$ECHO" \
+		2> /dev/null)
 	check "$(basename "$client"): every send fails" \
 		"$(echo "$out" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')" 0
 done
 sleep 0.3
 check "and nothing reached the destination" "$(echoed)" "$before"
+out=$(timeout 60 "${SV[@]}" "$B/leakclient-static" 127.0.0.1 "$ECHO" 2> /dev/null)
+sent=$(echo "$out" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')
+[ "${sent:-0}" -gt 20 ] && ok "with the proxy up, the same sends are carried ($sent)" ||
+	notok "with the proxy up, only ${sent:-0} sends were carried"
 
 echo "# a UDP socket received from an unsupervised process (D-50)"
 "$P" pass "$TMP/u.sock" "$ECHO" > "$TMP/pass.out" 2>&1 &

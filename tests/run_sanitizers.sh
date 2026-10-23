@@ -181,6 +181,23 @@ run_asan() {
 	NO_SHIM=1 "$ROOT/tests/test_supervise.sh" "$ROOT/udpchains" "$BUILD" > "$TMP/sv.out" 2>&1
 	rc=$?
 	report "supervisor" "$TMP/sv.out" "$rc"
+	rm -rf "$TMP"; TMP=""
+
+	# And carrying the static matrix and fidelity probes, which exercise
+	# most of what it does with a datagram (FR-SV-T1).
+	start_fixtures || { OVERALL=1; return; }
+	echo "--- supervisor: matrix"
+	UDPCHAINS_PROXY="127.0.0.1:$PROXY" timeout 300 "$ROOT/udpchains" --supervise \
+		"$BUILD/test_matrix-static" "$ECHO1" "$ECHO6" > "$TMP/svm.out" 2>&1
+	rc=$?
+	report "supervisor: matrix" "$TMP/svm.out" "$rc"
+	echo "--- supervisor: fidelity"
+	UDPCHAINS_PROXY="127.0.0.1:$PROXY" timeout 300 "$ROOT/udpchains" --supervise \
+		"$BUILD/test_fidelity-static" "$ECHO1" "$ECHO2" "$ECHO6" supervised \
+		> "$TMP/svf.out" 2>&1
+	rc=$?
+	report "supervisor: fidelity" "$TMP/svf.out" "$rc"
+	stop_fixtures
 
 	unset ASAN_OPTIONS UBSAN_OPTIONS
 	rm -rf "$TMP"; TMP=""

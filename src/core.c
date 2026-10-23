@@ -7,6 +7,7 @@
 
 #include "addr.h"
 #include "assoc.h"
+#include "dgram.h"
 #include "guard.h"
 #include "log.h"
 #include "real.h"
@@ -62,98 +63,6 @@ static size_t copy_to_iov(const uint8_t *src, size_t len, const struct iovec *io
 	return off;
 }
 
-/* D-05 R1: SOCKS5 cannot express multicast or broadcast, so these fail --
- * with a specific reason rather than a generic error the user has to guess at.
- * There is no bypass in v1 (D-05), so failing is the only honest outcome. */
-/* D-33: these fire per datagram, so a program retrying a multicast send in a
- * loop -- or a remote peer sending oversized replies -- would otherwise fill
- * stderr.  One report per second, with a count of the rest. */
-static struct udpc_ratelimit g_rl_multicast, g_rl_broadcast, g_rl_oversize,
-	g_rl_cork;
-
-static int reject_unrepresentable(const struct sockaddr *dst)
-{
-	char abuf[UDPC_ADDRSTRLEN], note[80];
-	unsigned n;
-
-	if (udpc_addr_is_multicast(dst)) {
-		if ((n = udpc_ratelimit(&g_rl_multicast)) != 0)
-			udpc_warn("cannot send to multicast %s: SOCKS5 has no way "
-			          "to express a multicast destination, and "
-			          "udpchains does not send anything directly%s",
-			          udpc_addr_str(dst, abuf, sizeof(abuf)),
-			          udpc_ratelimit_note(n, note, sizeof(note)));
-		errno = ENETUNREACH;
-		return -1;
-	}
-	if (udpc_addr_is_broadcast(dst)) {
-		if ((n = udpc_ratelimit(&g_rl_broadcast)) != 0)
-			udpc_warn("cannot send to broadcast %s: SOCKS5 has no way "
-			          "to express a broadcast destination, and "
-			          "udpchains does not send anything directly%s",
-			          udpc_addr_str(dst, abuf, sizeof(abuf)),
-			          udpc_ratelimit_note(n, note, sizeof(note)));
-		errno = ENETUNREACH;
-		return -1;
-	}
-	return 0;
-}
-
-/* A connected UDP socket only receives from its connected peer -- the kernel
- * drops everything else before the application ever sees it.  Under the shim
- * every datagram arrives from the relay, so that filter can never fire on its
- * own and has to be reimplemented against the true origin in the SOCKS header.
- *
- * Without this the shim is MORE permissive than an unhooked socket, which is
- * the wrong direction for §3's "indistinguishable" mandate: a program that uses
- * connect() as a source filter would silently lose it.
- *
- * Both addresses are normalised to the socket's family before comparing.  An
- * AF_INET6 socket connected to ::ffff:a.b.c.d whose proxy reports the origin as
- * plain IPv4 is the same peer, and comparing the raw forms would reject every
- * datagram -- the same v4-mapped trap as D-14, in the other direction. */
-static bool from_unconnected_peer(const struct udpc_fdent *e,
-                                  const struct udpc_socks_hdr *hdr)
-{
-	struct sockaddr_storage got, want;
-	int fam;
-
-	if (!atomic_load_explicit(&e->connected, memory_order_acquire))
-		return false;
-
-	/* A domain-form reply carries no address to compare.  Delivering it is
-	 * the lesser evil: the alternative is resolving a name on the receive
-	 * path, which would both leak a lookup and be a lie. */
-	if (!hdr->addr_valid)
-		return false;
-
-	fam = atomic_load_explicit(&e->family, memory_order_relaxed);
-
-	if (udpc_addr_for_family((const struct sockaddr *)&hdr->addr, fam, &got) != 0)
-		got = hdr->addr;
-	if (udpc_addr_for_family((const struct sockaddr *)&e->app_dst, fam, &want) != 0)
-		want = e->app_dst;
-
-	return !udpc_addr_equal((const struct sockaddr *)&got,
-	                        (const struct sockaddr *)&want);
-}
-
-/* Receive scratch for cfg: the largest payload, plus a worst-case header for
- * every hop (D-42). */
-static size_t scratch_need(const struct udpc_config *cfg)
-{
-	return cfg->max_datagram + (size_t)(cfg->nextra + 1) * UDPC_SOCKS_HDR_MAX;
-}
-
-/* True for the errors that mean "this association is gone", which is what an
- * expired idle association looks like from here: the relay port stops
- * existing, so a connected UDP socket reports the resulting ICMP error. */
-static bool association_looks_dead(int e)
-{
-	return e == ECONNREFUSED || e == ENOTCONN || e == EPIPE ||
-	       e == ECONNRESET || e == EHOSTUNREACH;
-}
-
 /* One datagram through a held association. */
 static ssize_t send_via(int fd, struct udpc_fdent *e, struct udpc_assoc *a,
                         const struct udpc_config *cfg, const struct iovec *iov,
@@ -174,7 +83,7 @@ static ssize_t send_via(int fd, struct udpc_fdent *e, struct udpc_assoc *a,
 		return -1;
 	}
 
-	tls = udpc_tls_get(scratch_need(cfg));
+	tls = udpc_tls_get(udpc_dgram_scratch_need(cfg));
 	if (tls == NULL) {
 		*out_errno = ENOMEM;
 		return -1;
@@ -281,7 +190,7 @@ static ssize_t send_once(int fd, struct udpc_fdent *e,
 	rc = send_via(fd, e, a, cfg, iov, iovcnt, dst, flags, paylen, out_errno);
 	if (rc >= 0)
 		udpc_assoc_mark_used(a);
-	else if (association_looks_dead(*out_errno))
+	else if (udpc_dgram_assoc_dead(*out_errno))
 		/* Detach THIS association, so the retry re-associates -- not
 		 * one another thread may already have put in its place. */
 		udpc_assoc_drop(e, a);
@@ -321,15 +230,7 @@ ssize_t udpc_core_send(int fd, struct udpc_fdent *e, const struct iovec *iov,
 	 * datagram.  Each call carries its own SOCKS header, so the joined
 	 * datagram would arrive with a header in its middle. */
 	if (flags & MSG_MORE) {
-		char note[80];
-		unsigned n = udpc_ratelimit(&g_rl_cork);
-
-		if (n != 0)
-			udpc_warn("refusing MSG_MORE: each send carries its own SOCKS "
-			          "header, so sends cannot be joined into one "
-			          "datagram%s",
-			          udpc_ratelimit_note(n, note, sizeof(note)));
-		errno = EOPNOTSUPP;
+		errno = udpc_dgram_refuse_cork();
 		return -1;
 	}
 
@@ -354,8 +255,11 @@ ssize_t udpc_core_send(int fd, struct udpc_fdent *e, const struct iovec *iov,
 		return -1;
 	}
 
-	if (reject_unrepresentable(target) != 0)
+	err = udpc_dgram_unrepresentable(target);
+	if (err != 0) {
+		errno = err;
 		return -1;
+	}
 
 	paylen = iov_total(iov, iovcnt);
 
@@ -379,7 +283,7 @@ ssize_t udpc_core_send(int fd, struct udpc_fdent *e, const struct iovec *iov,
 	 * transparently, and retry -- the application should see a successful
 	 * send, not an error it has to handle.  send_once has already detached
 	 * the dead association. */
-	if (association_looks_dead(err)) {
+	if (udpc_dgram_assoc_dead(err)) {
 		udpc_debug("fd %d: association appears expired (%s); "
 		           "re-associating",
 		           fd, strerror(err));
@@ -430,7 +334,7 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 		return -1;
 	}
 
-	tls = udpc_tls_get(scratch_need(cfg));
+	tls = udpc_tls_get(udpc_dgram_scratch_need(cfg));
 	if (tls == NULL) {
 		udpc_assoc_unref(a);
 		errno = ENOMEM;
@@ -440,11 +344,11 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 	capacity = iov_total(iov, iovcnt);
 
 	for (;;) {
-		ssize_t n, hlen = -1;
+		const struct sockaddr_storage *peer;
+		struct sockaddr_storage shown;
+		socklen_t shownlen;
+		ssize_t n, hlen;
 		size_t paylen, copied;
-		bool discard = false;
-		enum udpc_socks_drop why;
-		unsigned layer;
 
 		sciov.iov_base = tls->buf;
 		sciov.iov_len = tls->buflen;
@@ -460,7 +364,7 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 		if (n < 0) {
 			/* FR-P-08: an expired association shows up here as a
 			 * pending ICMP error on the connected socket. */
-			if (association_looks_dead(errno) && attempts == 0) {
+			if (udpc_dgram_assoc_dead(errno) && attempts == 0) {
 				attempts++;
 				udpc_debug("fd %d: association appears expired on "
 				           "receive; re-associating",
@@ -480,63 +384,14 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 			return -1;
 		}
 
-		if ((size_t)n > tls->buflen) {
-			char note[80];
-			unsigned k = udpc_ratelimit(&g_rl_oversize);
-
-			if (k != 0)
-				udpc_warn("dropping a %zd-byte relayed datagram: "
-				          "larger than max_datagram %zu plus header%s",
-				          n, cfg->max_datagram,
-				          udpc_ratelimit_note(k, note, sizeof(note)));
-			discard = true;
-		} else {
-			/* D-41: every layer of a chain is checked before any of
-			 * the datagram is delivered, and failing any one drops
-			 * the whole of it.  A chain of one has one layer, which
-			 * is checked just as before. */
-			hlen = udpc_socks_decode_chain(tls->buf, (size_t)n,
-			                               &a->chain, &hdr, &layer, &why);
-			if (hlen < 0 && layer < a->chain.n) {
-				if (why == UDPC_DROP_SOURCE)
-					udpc_debug("dropping a relayed datagram: its "
-					           "layer %u of %u is not from hop "
-					           "%u's relay",
-					           layer, a->chain.n, layer + 1);
-				else
-					udpc_debug("dropping a relayed datagram: its "
-					           "layer %u of %u %s",
-					           layer, a->chain.n,
-					           why == UDPC_DROP_FRAG
-					                   ? "has FRAG set"
-					                   : "is malformed");
-				discard = true;
-			} else if (hlen < 0) {
-				udpc_debug("dropping a malformed relayed datagram "
-				           "(%zd bytes)",
-				           n);
-				discard = true;
-			} else if (hdr.frag != 0) {
-				/* FR-P-04: a fragmented datagram is discarded.
-				 * The application never sees it. */
-				udpc_debug("dropping a relayed datagram with "
-				           "FRAG=%u",
-				           hdr.frag);
-				discard = true;
-			} else if (from_unconnected_peer(e, &hdr)) {
-				char sbuf[UDPC_ADDRSTRLEN];
-
-				udpc_debug("dropping a relayed datagram from %s: "
-				           "the socket is connected to a different "
-				           "peer, and the kernel would drop it too",
-				           udpc_addr_str((const struct sockaddr *)
-				                                 &hdr.addr,
-				                         sbuf, sizeof(sbuf)));
-				discard = true;
-			}
-		}
-
-		if (discard) {
+		peer = atomic_load_explicit(&e->connected, memory_order_acquire)
+		               ? &e->app_dst
+		               : NULL;
+		hlen = udpc_dgram_unwrap(tls->buf, n, tls->buflen, cfg, &a->chain,
+		                         atomic_load_explicit(&e->family,
+		                                              memory_order_relaxed),
+		                         peer, &hdr);
+		if (hlen < 0) {
 			/* The application must never observe this datagram.  If
 			 * we were only peeking, it is still queued, so consume
 			 * it for real before looping -- otherwise the next
@@ -563,40 +418,12 @@ ssize_t udpc_core_recv(int fd, struct udpc_fdent *e, const struct iovec *iov,
 		/* FR-F-02: the source is the true origin from the reply header,
 		 * never the relay. */
 		if (src != NULL && srclen != NULL && *srclen > 0) {
-			if (hdr.addr_valid) {
-				/* Report it in the SOCKET's family, as the kernel
-				 * would.  An AF_INET6 dual-stack socket that
-				 * received from an IPv4 peer must be told
-				 * ::ffff:a.b.c.d, not an AF_INET sockaddr the
-				 * application has nowhere to put. */
-				struct sockaddr_storage shown;
-				socklen_t want, give;
-
-				if (udpc_addr_for_family(
-					    (const struct sockaddr *)&hdr.addr,
-					    atomic_load_explicit(&e->family,
-					                         memory_order_relaxed),
-					    &shown) != 0)
-					shown = hdr.addr;
-
-				want = udpc_sa_len((const struct sockaddr *)&shown);
-				give = (*srclen < want) ? *srclen : want;
-				memcpy(src, &shown, give);
-				*srclen = want;
-			} else if (atomic_load_explicit(&e->connected,
-			                                memory_order_acquire)) {
-				/* A domain-form reply cannot become a sockaddr
-				 * without a lookup that would both leak and
-				 * lie.  The peer the application addressed is
-				 * the honest answer. */
-				socklen_t want = udpc_sa_len(
-					(const struct sockaddr *)&e->app_dst);
-				socklen_t give = (*srclen < want) ? *srclen : want;
-				memcpy(src, &e->app_dst, give);
-				*srclen = want;
-			} else {
-				*srclen = 0;
-			}
+			shownlen = udpc_dgram_source(
+				&hdr,
+				atomic_load_explicit(&e->family, memory_order_relaxed),
+				peer, &shown);
+			memcpy(src, &shown, *srclen < shownlen ? *srclen : shownlen);
+			*srclen = shownlen;
 		}
 
 		/* FR-F-04: when the application's buffers are shorter than the

@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "addr.h"
+#include "dgram.h"
 #include "guard.h"
 #include "log.h"
 #include "real.h"
@@ -242,55 +243,6 @@ static long now_coarse(void)
 	return (long)ts.tv_sec;
 }
 
-/* D-05 R2: a loopback destination is resolved at the PROXY, so with a remote
- * proxy the datagram reaches the proxy host's loopback rather than this host's.
- * Silent misrouting is the same class of defect the project exists to remove,
- * so it is called out -- and can be promoted to a hard error.
- *
- * D-40: it is the EXIT hop that resolves it.  Only a chain of one can have its
- * exit on this host; a longer chain's exit is reached through other hops, so a
- * loopback destination there is always the far end's. */
-static int loopback_guard(const struct udpc_config *cfg, const struct udpc_fdent *e,
-                          int *out_errno)
-{
-	char abuf[UDPC_ADDRSTRLEN];
-	const struct sockaddr *dst;
-
-	if (cfg->nextra == 0 && cfg->proxy_is_local)
-		return 0;
-	if (!atomic_load_explicit(&e->connected, memory_order_acquire))
-		return 0;
-
-	dst = (const struct sockaddr *)&e->app_dst;
-	if (!udpc_addr_is_loopback(dst))
-		return 0;
-
-	if (cfg->strict_loopback) {
-		if (cfg->nextra > 0)
-			udpc_err("refusing loopback destination %s: it would be "
-			         "resolved at the chain's last hop, not here "
-			         "(strict_loopback is on)",
-			         udpc_addr_str(dst, abuf, sizeof(abuf)));
-		else
-			udpc_err("refusing loopback destination %s: the proxy is not on "
-			         "this host, so it would be resolved at the proxy "
-			         "(strict_loopback is on)",
-			         udpc_addr_str(dst, abuf, sizeof(abuf)));
-		*out_errno = ENETUNREACH;
-		return -1;
-	}
-
-	if (cfg->nextra > 0)
-		udpc_warn("destination %s is loopback; it will be resolved at the "
-		          "chain's last hop, not here",
-		          udpc_addr_str(dst, abuf, sizeof(abuf)));
-	else
-		udpc_warn("destination %s is loopback but the proxy is not on this "
-		          "host; it will be resolved at the proxy, not here",
-		          udpc_addr_str(dst, abuf, sizeof(abuf)));
-	return 0;
-}
-
 /* Points the application's own fd at the relay (FR-I-07).  There is no shadow
  * socket: this is the application's descriptor, so poll/select/epoll and every
  * socket option keep working untouched. */
@@ -413,7 +365,13 @@ static int establish(int fd, struct udpc_fdent *e, const struct udpc_config *cfg
 	const struct sockaddr *bind_addr = NULL;
 	char abuf[UDPC_ADDRSTRLEN], rbuf[UDPC_SOCKS_CHAIN_PATH_MAX];
 
-	if (loopback_guard(cfg, e, out_errno) != 0)
+	/* D-05 R2: only a connected socket has a destination to check yet. */
+	if (udpc_dgram_loopback_guard(
+		    cfg,
+		    atomic_load_explicit(&e->connected, memory_order_acquire)
+		            ? (const struct sockaddr *)&e->app_dst
+		            : NULL,
+		    out_errno) != 0)
 		return -1;
 
 	a = udpc_assoc_alloc();

@@ -17,14 +17,9 @@
 #include <stdbool.h>
 
 #include "config.h"
+#include "dgram.h"
 #include "fdtable.h"
 #include "socks5.h"
-
-/* How long an association must have been idle before a send bothers to check
- * whether the proxy has expired it.  Busy sockets pay nothing; only sockets
- * that have actually been quiet -- the ones FR-P-08 is about -- take the extra
- * poll().  Well under the reference proxy's 60 s expiry (baseline §0.5). */
-#define UDPC_IDLE_PROBE_SECS 1
 
 /* Associations are TYPE-STABLE (D-24): once allocated, an object is never
  * returned to the allocator, only to a free list for reuse.  A thread that

@@ -184,6 +184,20 @@ run_test TST-03-leak "$ROOT/tests/test_leak.sh" "$ECHO1"
 
 run_test FR-SV-supervise "$ROOT/tests/test_supervise.sh" "$WRAPPER" "$BUILD"
 
+# FR-SV-T1: the hook matrix, with the probe built -static, carried by the
+# supervisor -- directly, and through a chain of two.
+run_test FR-SV-T1-matrix \
+	timeout 180 "$WRAPPER" --supervise "$BUILD/test_matrix-static" "$ECHO1" "$ECHO6"
+run_test FR-SV-T1-matrix-2hop \
+	env UDPCHAINS_PROXY="127.0.0.1:$PROXY_PORT,127.0.0.1:$PROXY2_PORT" \
+	timeout 180 "$WRAPPER" --supervise "$BUILD/test_matrix-static" "$ECHO1" "$ECHO6"
+
+# TST-05 under the supervisor, with the two documented differences (D-51,
+# D-36) checked as such.
+run_test FR-SV-fidelity \
+	timeout 120 "$WRAPPER" --supervise "$BUILD/test_fidelity-static" \
+	"$ECHO1" "$ECHO2" "$ECHO6" supervised
+
 # --- fault injection: FR-P-08, FR-P-04, D-12 ---------------------------------
 
 run_test faults "$ROOT/tests/test_faults.sh"

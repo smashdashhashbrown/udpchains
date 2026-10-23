@@ -1,16 +1,11 @@
-/* supervise.c -- supervisor mode: the filter, the notification loop, and the
- * program's exit status and signals (D-48 to D-53, step 2 of
- * docs/FUTURE-STATIC-BINARIES.md §7).
+/* supervise.c -- supervisor mode: the filter, start-up, the notification
+ * loop, and the program's exit status and signals (D-48 to D-53).
  *
  * The wrapper forks.  The child sets no_new_privs, installs a seccomp filter
  * with a user-notification listener, and execs the program.  The parent takes a
  * copy of the listener and becomes the supervisor: the kernel stops the
- * program at each call the filter selects, and the supervisor answers it --
- * lets it continue, or fails it with an errno and a diagnostic.
- *
- * Not yet: carrying UDP.  Until step 3 does, a UDP socket is refused when the
- * program asks for one, so supervisor mode fails closed at every step of its
- * construction: nothing the filter selects is let through unchecked.
+ * program at each call the filter selects, and svcall.c answers it -- performs
+ * it, lets it continue, or fails it with an errno and a diagnostic.
  *
  * Written from the man pages only: seccomp(2), seccomp_unotify(2),
  * pidfd_open(2), pidfd_getfd(2) (D-01).
@@ -39,9 +34,12 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "dgram.h"
 #include "log.h"
+#include "svint.h"
 
 /* D-53: SECCOMP_ADDFD_FLAG_SEND, which step 3 needs to install a socket and
  * answer the call in one step. */
@@ -76,8 +74,16 @@ bool udpc_kernel_at_least(const char *release, int major, int minor)
  * One ABI: x86-64, without x32's call numbers (seccomp(2): x32 shares x86-64's
  * arch value, and is told apart by __X32_SYSCALL_BIT).  A call from any other
  * ABI fails with ENOSYS, never runs.  Then the calls the supervisor answers:
- * socket() for the families it must see, and on every descriptor the calls
- * that could send on, or connect, a socket it did not make. */
+ *
+ *   - socket() for the families it must see;
+ *   - on every descriptor, the calls that could send on, or connect, a socket
+ *     it did not make, and the routes around it (D-50, D-53);
+ *   - on a descriptor in the reserved range, where every UDP socket lives,
+ *     the calls that move data or change what the number refers to.  Below
+ *     the range, file and TCP I/O never leaves the kernel (D-50);
+ *   - dup2 and dup3 to or from the range, close_range reaching it, and fcntl
+ *     on it or duplicating anything.
+ */
 
 #if defined(__x86_64__)
 #define FILTER_ARCH AUDIT_ARCH_X86_64
@@ -87,79 +93,135 @@ bool udpc_kernel_at_least(const char *release, int major, int minor)
 #define X32_BIT 0u
 #endif
 
-/* Calls sent to the supervisor whatever their arguments. */
-static const int g_notified[] = {
+/* Sent to the supervisor whatever their arguments. */
+static const int g_always[] = {
 	SYS_connect, SYS_sendto, SYS_sendmsg, SYS_sendmmsg, SYS_sendfile,
 	SYS_splice, SYS_io_uring_setup, SYS_pidfd_getfd,
+};
+
+/* Sent to the supervisor when their first argument, a descriptor, is in the
+ * range.  pread64, pwrite64, preadv and pwritev are not: the kernel refuses
+ * them on a socket itself. */
+static const int g_in_range[] = {
+	SYS_read, SYS_write, SYS_readv, SYS_writev, SYS_preadv2, SYS_pwritev2,
+	SYS_recvfrom, SYS_recvmsg, SYS_recvmmsg, SYS_bind, SYS_getsockname,
+	SYS_getpeername, SYS_close, SYS_dup,
 };
 
 /* socket() families sent to the supervisor; any other family runs. */
 static const unsigned g_families[] = { AF_INET, AF_INET6, AF_PACKET };
 
-#define NNOTIFIED (sizeof(g_notified) / sizeof(g_notified[0]))
-#define NFAMILIES (sizeof(g_families) / sizeof(g_families[0]))
-/* arch check (3), call number and x32 check (3), socket (1), the list, allow
- * (1), the socket() family block (1 + families + 1), notify (1). */
-#define FILTER_LEN (3 + 3 + 1 + NNOTIFIED + 1 + 1 + NFAMILIES + 1 + 1)
+#define COUNT(a) (sizeof(a) / sizeof((a)[0]))
+#define FILTER_MAX 96
 
-/* Builds the filter.  BPF jumps only forward, so the one "notify" return is
- * last, and every match jumps to it. */
-static void build_filter(struct sock_filter *f)
+enum { L_NOTIFY, L_SOCKET, L_FD0, L_DUP, L_CLOSE_RANGE, L_FCNTL, L_COUNT };
+
+/* A small assembler: BPF jumps only forward, by at most 255, so every jump
+ * names a label placed later, and is resolved once all are placed. */
+struct bpf {
+	struct sock_filter f[FILTER_MAX];
+	unsigned n;
+	unsigned label[L_COUNT];
+	unsigned fix_at[FILTER_MAX];
+	int fix_to[FILTER_MAX];
+	unsigned nfix;
+};
+
+static void stmt(struct bpf *b, unsigned short code, unsigned k)
 {
-	const unsigned notify = FILTER_LEN - 1;
-	const unsigned sockblk = 7 + NNOTIFIED + 1;
-	unsigned i = 0, k;
+	b->f[b->n++] = (struct sock_filter)BPF_STMT(code, k);
+}
 
-	f[i++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-	                                      offsetof(struct seccomp_data, arch));
-	f[i++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FILTER_ARCH, 1, 0);
-	f[i++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
-	f[i++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-	                                      offsetof(struct seccomp_data, nr));
-	f[i++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, X32_BIT, 0, 1);
-	f[i++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
-	/* i == 6 */
-	f[i] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_socket,
-	                                    (unsigned char)(sockblk - i - 1), 0);
-	i++;
-	for (k = 0; k < NNOTIFIED; k++, i++)
-		f[i] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-		                                    (unsigned)g_notified[k],
-		                                    (unsigned char)(notify - i - 1), 0);
-	f[i++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
-	/* i == sockblk: socket()'s family, the low word of its first argument
-	 * on a little-endian machine. */
-	f[i++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-	                                      offsetof(struct seccomp_data, args[0]));
-	for (k = 0; k < NFAMILIES; k++, i++)
-		f[i] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, g_families[k],
-		                                    (unsigned char)(notify - i - 1), 0);
-	f[i++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
-	f[i] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
+static void load_word(struct bpf *b, unsigned off)
+{
+	stmt(b, BPF_LD | BPF_W | BPF_ABS, off);
+}
+
+/* If the accumulator compares (op) with k, jump to label; else fall through. */
+static void jump_if(struct bpf *b, unsigned short op, unsigned k, int label)
+{
+	b->fix_at[b->nfix] = b->n;
+	b->fix_to[b->nfix++] = label;
+	b->f[b->n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | op | BPF_K, k, 0, 0);
+}
+
+static void place(struct bpf *b, int label)
+{
+	b->label[label] = b->n;
+}
+
+/* The low word of a call's argument k: a descriptor, an int, on a
+ * little-endian machine. */
+#define ARG(k) (unsigned)offsetof(struct seccomp_data, args[k])
+
+/* Builds the filter for a range starting at range.  Returns its length. */
+static unsigned build_filter(struct bpf *b, unsigned range)
+{
+	const unsigned allow = SECCOMP_RET_ALLOW;
+	unsigned k;
+
+	memset(b, 0, sizeof(*b));
+	load_word(b, offsetof(struct seccomp_data, arch));
+	b->f[b->n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FILTER_ARCH, 1, 0);
+	stmt(b, BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
+	load_word(b, offsetof(struct seccomp_data, nr));
+	b->f[b->n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, X32_BIT, 0, 1);
+	stmt(b, BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
+
+	jump_if(b, BPF_JEQ, SYS_socket, L_SOCKET);
+	for (k = 0; k < COUNT(g_always); k++)
+		jump_if(b, BPF_JEQ, (unsigned)g_always[k], L_NOTIFY);
+	for (k = 0; k < COUNT(g_in_range); k++)
+		jump_if(b, BPF_JEQ, (unsigned)g_in_range[k], L_FD0);
+	jump_if(b, BPF_JEQ, SYS_dup2, L_DUP);
+	jump_if(b, BPF_JEQ, SYS_dup3, L_DUP);
+	jump_if(b, BPF_JEQ, SYS_close_range, L_CLOSE_RANGE);
+	jump_if(b, BPF_JEQ, SYS_fcntl, L_FCNTL);
+	stmt(b, BPF_RET | BPF_K, allow);
+
+	place(b, L_SOCKET);
+	load_word(b, ARG(0));
+	for (k = 0; k < COUNT(g_families); k++)
+		jump_if(b, BPF_JEQ, g_families[k], L_NOTIFY);
+	stmt(b, BPF_RET | BPF_K, allow);
+
+	/* Unsigned: a negative descriptor compares above the range, and is
+	 * answered with the kernel's own EBADF. */
+	place(b, L_FD0);
+	load_word(b, ARG(0));
+	jump_if(b, BPF_JGE, range, L_NOTIFY);
+	stmt(b, BPF_RET | BPF_K, allow);
+
+	place(b, L_DUP);
+	load_word(b, ARG(0));
+	jump_if(b, BPF_JGE, range, L_NOTIFY);
+	load_word(b, ARG(1));
+	jump_if(b, BPF_JGE, range, L_NOTIFY);
+	stmt(b, BPF_RET | BPF_K, allow);
+
+	place(b, L_CLOSE_RANGE);
+	load_word(b, ARG(1)); /* the last descriptor it closes */
+	jump_if(b, BPF_JGE, range, L_NOTIFY);
+	stmt(b, BPF_RET | BPF_K, allow);
+
+	place(b, L_FCNTL);
+	load_word(b, ARG(0));
+	jump_if(b, BPF_JGE, range, L_NOTIFY);
+	load_word(b, ARG(1));
+	jump_if(b, BPF_JEQ, F_DUPFD, L_NOTIFY);
+	jump_if(b, BPF_JEQ, F_DUPFD_CLOEXEC, L_NOTIFY);
+	stmt(b, BPF_RET | BPF_K, allow);
+
+	place(b, L_NOTIFY);
+	stmt(b, BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
+
+	for (k = 0; k < b->nfix; k++)
+		b->f[b->fix_at[k]].jt =
+			(unsigned char)(b->label[b->fix_to[k]] - b->fix_at[k] - 1);
+	return b->n;
 }
 
 /* --- descriptors -----------------------------------------------------------*/
-
-/* A socket the supervisor cannot carry: UDP, which it will carry only when it
- * made the socket itself (D-50), and raw and packet sockets (D-36), which it
- * never carries.  ICMP and UDP-Lite datagram sockets are refused when made
- * (D-29), so any other inet datagram socket is UDP. */
-static bool uncarriable(int fd)
-{
-	int domain = 0, type = 0;
-	socklen_t len = sizeof(domain);
-
-	if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &len) != 0)
-		return false; /* not a socket */
-	if (domain == AF_PACKET)
-		return true;
-	if (domain != AF_INET && domain != AF_INET6)
-		return false;
-	len = sizeof(type);
-	if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0)
-		return true; /* an inet socket it cannot classify: refuse */
-	return type == SOCK_DGRAM || type == SOCK_RAW || type == SOCK_PACKET;
-}
 
 /* D-50: the program must not start holding a socket the supervisor cannot
  * carry.  It could not be moved into the reserved range without changing the
@@ -188,7 +250,7 @@ static int refuse_inherited(void)
 		fl = fcntl((int)fd, F_GETFD);
 		if (fl < 0 || (fl & FD_CLOEXEC))
 			continue;
-		if (uncarriable((int)fd)) {
+		if (sv_uncarriable((int)fd)) {
 			bad = (int)fd;
 			break;
 		}
@@ -203,169 +265,31 @@ static int refuse_inherited(void)
 	return -1;
 }
 
-/* The thread group of a thread: a notification names the thread that made
- * the call, and pidfd_open() needs its process. */
-static pid_t tgid_of(pid_t tid)
-{
-	char path[64], line[128];
-	FILE *f;
-	pid_t tgid = -1;
+/* --- the loop --------------------------------------------------------------*/
 
-	snprintf(path, sizeof(path), "/proc/%d/status", (int)tid);
-	f = fopen(path, "re");
-	if (f == NULL)
-		return -1;
-	while (fgets(line, sizeof(line), f) != NULL)
-		if (sscanf(line, "Tgid: %d", &tgid) == 1)
-			break;
-	fclose(f);
-	return tgid;
+/* How soon after a descriptor in the range closes the sweep looks, so that a
+ * burst of closes costs one; and how often it looks regardless, for sockets
+ * that went with a process or an exec. */
+#define SWEEP_SOON_MS 200
+#define SWEEP_EVERY_MS 5000
+/* How often parked receives are asked whether their calls are still pending,
+ * when nothing else wakes the loop. */
+#define PRUNE_EVERY_MS 1000
+
+long long sv_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* --- answering a call ------------------------------------------------------*/
-
-struct sv {
-	int listener;
-	int sigfd;
-	pid_t child;      /* the program */
-	int child_status; /* once it has exited */
-	bool child_done;
-	struct seccomp_notif *req;
-	struct seccomp_notif_resp *resp;
-	struct seccomp_notif_sizes sizes;
-};
-
-/* D-33: once a second for each reason, so that one kind of refusal never
- * hides another: a refused UDP socket does not silence a refused raw one. */
-enum {
-	WHY_UDP, WHY_RAW, WHY_ICMP, WHY_URING, WHY_PIDFD, WHY_UNKNOWN_FD,
-	WHY_RECEIVED_FD, WHY_COUNT
-};
-static struct udpc_ratelimit g_rl_refuse[WHY_COUNT];
-
-static const char *call_name(int nr)
+void sv_sweep_soon(struct sv *sv)
 {
-	switch (nr) {
-	case SYS_socket: return "socket";
-	case SYS_connect: return "connect";
-	case SYS_sendto: return "sendto";
-	case SYS_sendmsg: return "sendmsg";
-	case SYS_sendmmsg: return "sendmmsg";
-	case SYS_sendfile: return "sendfile";
-	case SYS_splice: return "splice";
-	case SYS_io_uring_setup: return "io_uring_setup";
-	case SYS_pidfd_getfd: return "pidfd_getfd";
-	default: return "a call";
-	}
-}
+	long long at = sv_now_ms() + SWEEP_SOON_MS;
 
-static void refused(const struct seccomp_notif *req, int reason, const char *why)
-{
-	char note[64];
-	unsigned n = udpc_ratelimit(&g_rl_refuse[reason]);
-
-	if (n == 0)
-		return;
-	udpc_err("process %u: %s refused: %s%s", req->pid, call_name(req->data.nr), why,
-	         udpc_ratelimit_note(n, note, sizeof(note)));
-}
-
-/* Whether the program's descriptor fd is a socket the supervisor cannot
- * carry.  Returns 1 if it is, 0 if not (or if fd is not open, which the
- * kernel will report itself), and -1 if it cannot be told. */
-static int program_fd_uncarriable(struct sv *sv, int fd)
-{
-	pid_t tgid = tgid_of((pid_t)sv->req->pid);
-	int pidfd, copy, rc;
-
-	if (tgid <= 0)
-		return -1;
-	pidfd = (int)syscall(SYS_pidfd_open, tgid, 0);
-	if (pidfd < 0)
-		return -1;
-	/* seccomp_unotify(2): the thread named in the notification may have
-	 * gone, and its number been reused, between the notification and the
-	 * pidfd.  Still valid here means the pidfd is the program's. */
-	if (ioctl(sv->listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &sv->req->id) != 0) {
-		close(pidfd);
-		return 0; /* gone: nothing to answer */
-	}
-	copy = (int)syscall(SYS_pidfd_getfd, pidfd, fd, 0);
-	close(pidfd);
-	if (copy < 0)
-		return errno == EBADF ? 0 : -1;
-	rc = uncarriable(copy) ? 1 : 0;
-	close(copy);
-	return rc;
-}
-
-/* Decides one notification: fills in sv->resp. */
-static void decide(struct sv *sv)
-{
-	const struct seccomp_notif *req = sv->req;
-	struct seccomp_notif_resp *resp = sv->resp;
-	int nr = req->data.nr, fd = -1, rc;
-
-	resp->id = req->id;
-	resp->val = 0;
-	resp->error = 0;
-	resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-
-	switch (nr) {
-	case SYS_socket: {
-		/* Arguments are values, not pointers, so continuing after the
-		 * check cannot be raced. */
-		int domain = (int)req->data.args[0];
-		int type = (int)req->data.args[1] & SOCK_TYPE_MASK;
-		int proto = (int)req->data.args[2];
-
-		if (domain == AF_PACKET || type == SOCK_RAW || type == SOCK_PACKET) {
-			refused(req, WHY_RAW, "raw and packet sockets cannot be carried by "
-			             "SOCKS5 (D-36)");
-			resp->error = -EPERM;
-		} else if (type == SOCK_DGRAM &&
-		           (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6 ||
-		            proto == IPPROTO_UDPLITE)) {
-			refused(req, WHY_ICMP, "ICMP and UDP-Lite sockets cannot be carried by "
-			             "SOCKS5 (D-29)");
-			resp->error = -EPROTONOSUPPORT;
-		} else if (type == SOCK_DGRAM) {
-			refused(req, WHY_UDP, "supervisor mode does not carry UDP yet, so the "
-			             "socket is not made, rather than send directly");
-			resp->error = -EPROTONOSUPPORT;
-		}
-		break;
-	}
-	case SYS_io_uring_setup:
-		refused(req, WHY_URING, "io_uring would send around the supervisor (D-53)");
-		resp->error = -ENOSYS;
-		break;
-	case SYS_pidfd_getfd:
-		refused(req, WHY_PIDFD, "a descriptor copied from another process would "
-		             "escape the supervisor (D-53)");
-		resp->error = -EPERM;
-		break;
-	case SYS_splice:
-		fd = (int)req->data.args[2];
-		/* fall through */
-	default:
-		if (fd < 0)
-			fd = (int)req->data.args[0]; /* connect, send*, sendfile */
-		rc = program_fd_uncarriable(sv, fd);
-		if (rc == 0)
-			break;
-		if (rc < 0)
-			refused(req, WHY_UNKNOWN_FD, "cannot tell what the descriptor is, so "
-			             "cannot let it through");
-		else
-			refused(req, WHY_RECEIVED_FD, "a UDP, raw or packet socket the supervisor "
-			             "did not make, received from another process "
-			             "(D-50)");
-		resp->error = (nr == SYS_sendfile || nr == SYS_splice) ? -EINVAL : -EPERM;
-		break;
-	}
-	if (resp->error != 0)
-		resp->flags = 0;
+	if (sv->sweep_at_ms == 0 || sv->sweep_at_ms > at)
+		sv->sweep_at_ms = at;
 }
 
 static void serve_one(struct sv *sv)
@@ -374,9 +298,42 @@ static void serve_one(struct sv *sv)
 	if (ioctl(sv->listener, SECCOMP_IOCTL_NOTIF_RECV, sv->req) != 0)
 		return; /* EINTR or ENOENT: the call has gone */
 	memset(sv->resp, 0, sv->sizes.seccomp_notif_resp);
-	decide(sv);
-	/* ENOENT: interrupted by a signal, or the program has gone. */
-	(void)ioctl(sv->listener, SECCOMP_IOCTL_NOTIF_SEND, sv->resp);
+	if (svcall_decide(sv) == SV_ANSWER)
+		/* ENOENT: interrupted by a signal, or the program has gone. */
+		(void)ioctl(sv->listener, SECCOMP_IOCTL_NOTIF_SEND, sv->resp);
+}
+
+/* Whether the poll set says fd is readable, or has an error to report. */
+static bool ready(const struct pollfd *p, size_t np, int fd)
+{
+	size_t i;
+
+	for (i = 0; i < np; i++)
+		if (p[i].fd == fd)
+			return (p[i].revents & (POLLIN | POLLERR | POLLHUP)) != 0;
+	return false;
+}
+
+/* Retries every parked receive whose socket is readable or whose deadline has
+ * passed, and forgets those answered or gone.  Matched by descriptor, since
+ * answering a call may have parked or pruned others since the poll. */
+static void serve_parked(struct sv *sv, const struct pollfd *p, size_t np, long long now)
+{
+	struct sv_parked **pp = &sv->parked;
+
+	while (*pp != NULL) {
+		struct sv_parked *q = *pp;
+		bool due = ready(p, np, q->copy) ||
+		           (q->deadline_ms != 0 && now >= q->deadline_ms);
+
+		if (due && svcall_retry_parked(sv, q, now)) {
+			*pp = q->next;
+			close(q->copy);
+			free(q);
+			continue;
+		}
+		pp = &q->next;
+	}
 }
 
 /* --- signals and exit ------------------------------------------------------*/
@@ -412,6 +369,7 @@ static void on_signal(struct sv *sv, bool *none_left)
 	while (read(sv->sigfd, &si, sizeof(si)) == (ssize_t)sizeof(si)) {
 		if (si.ssi_signo == SIGCHLD) {
 			reap(sv, none_left);
+			sv_sweep_soon(sv);
 			continue;
 		}
 		if (si.ssi_code <= 0 && !sv->child_done)
@@ -474,15 +432,16 @@ static int hear(int fd, struct child_msg *m)
 
 /* In the child: the filter, then the program.  Never returns. */
 static void run_child(const char *program, char **argv, const sigset_t *orig,
-                      int up, int down)
+                      unsigned range, int up, int down)
 {
-	struct sock_filter filter[FILTER_LEN];
-	struct sock_fprog prog = { FILTER_LEN, filter };
+	static struct bpf filter;
+	struct sock_fprog prog;
 	int listener;
 	char ack;
 
 	sigprocmask(SIG_SETMASK, orig, NULL);
-	build_filter(filter);
+	prog.len = (unsigned short)build_filter(&filter, range);
+	prog.filter = filter.f;
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
 		tell(up, MSG_FILTER_FAILED, errno);
 		_exit(1);
@@ -522,17 +481,79 @@ static void run_child(const char *program, char **argv, const sigset_t *orig,
 	_exit(127);
 }
 
-int udpc_supervise(const char *program, char **argv)
+/* D-50: where the reserved range starts.  As D-26's band: 768, or half the
+ * soft RLIMIT_NOFILE when that is below 1024.  A higher limit does not move it
+ * up, since the kernel sizes a descriptor table to the highest number in
+ * use. */
+static unsigned range_start(void)
+{
+	struct rlimit rl;
+
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
+	    rl.rlim_cur < 1024)
+		return (unsigned)(rl.rlim_cur / 2);
+	return 768;
+}
+
+/* The loop's poll set: the listener, the signals, and each parked receive's
+ * socket.  Returns how many, or 0 if out of memory. */
+static size_t poll_set(struct sv *sv, struct pollfd **p, size_t *cap)
+{
+	struct sv_parked *q;
+	size_t n = 2;
+
+	for (q = sv->parked; q != NULL; q = q->next)
+		n++;
+	if (n > *cap) {
+		struct pollfd *more = realloc(*p, n * sizeof(**p));
+
+		if (more == NULL)
+			return 0;
+		*p = more;
+		*cap = n;
+	}
+	(*p)[0] = (struct pollfd){ sv->listener, POLLIN, 0 };
+	(*p)[1] = (struct pollfd){ sv->sigfd, POLLIN, 0 };
+	n = 2;
+	for (q = sv->parked; q != NULL; q = q->next)
+		(*p)[n++] = (struct pollfd){ q->copy, POLLIN, 0 };
+	return n;
+}
+
+/* How long the loop may sleep: until the next sweep, parked deadline or
+ * prune, or for ever. */
+static int poll_timeout(const struct sv *sv, long long now)
+{
+	const struct sv_parked *q;
+	long long until = -1;
+
+	if (sv->sweep_at_ms != 0)
+		until = sv->sweep_at_ms;
+	for (q = sv->parked; q != NULL; q = q->next)
+		if (q->deadline_ms != 0 && (until < 0 || q->deadline_ms < until))
+			until = q->deadline_ms;
+	if (sv->parked != NULL && (until < 0 || until > now + PRUNE_EVERY_MS))
+		until = now + PRUNE_EVERY_MS;
+	if (until < 0)
+		return -1;
+	return until <= now ? 0 : (int)(until - now);
+}
+
+int udpc_supervise(const struct udpc_config *cfg, const char *program, char **argv)
 {
 	struct sv sv;
 	struct utsname u;
 	sigset_t fwd, orig;
 	int up[2], down[2];
 	struct child_msg m = { 0, 0 };
-	size_t k;
+	struct pollfd *p = NULL;
+	size_t k, pcap = 0;
 	bool none_left = false;
+	long long last_prune = 0;
 
 	memset(&sv, 0, sizeof(sv));
+	sv.cfg = cfg;
+	sv.range = range_start();
 
 	if (FILTER_ARCH == 0) {
 		udpc_err("supervisor mode supports x86-64 only so far; refusing to "
@@ -581,7 +602,7 @@ int udpc_supervise(const char *program, char **argv)
 	if (sv.child == 0) {
 		close(up[0]);
 		close(down[1]);
-		run_child(program, argv, &orig, up[1], down[0]);
+		run_child(program, argv, &orig, sv.range, up[1], down[0]);
 	}
 	close(up[1]);
 	close(down[0]);
@@ -631,38 +652,70 @@ int udpc_supervise(const char *program, char **argv)
 
 	sv.req = calloc(1, sv.sizes.seccomp_notif);
 	sv.resp = calloc(1, sv.sizes.seccomp_notif_resp);
-	if (sv.req == NULL || sv.resp == NULL) {
+	sv.buflen = udpc_dgram_scratch_need(cfg);
+	sv.buf = malloc(sv.buflen);
+	if (sv.req == NULL || sv.resp == NULL || sv.buf == NULL) {
 		kill(sv.child, SIGKILL);
 		waitpid(sv.child, NULL, 0);
 		udpc_err("out of memory");
 		return 1;
 	}
-	udpc_debug("supervising %s as process %d", program, (int)sv.child);
+	/* The supervisor holds a control connection per hop for every socket
+	 * the program has: as many descriptors as it may have, raised in the
+	 * supervisor alone.  The program keeps the limit it was given. */
+	{
+		struct rlimit rl;
+
+		if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+			rl.rlim_cur = rl.rlim_max;
+			(void)setrlimit(RLIMIT_NOFILE, &rl);
+		}
+	}
+	udpc_debug("supervising %s as process %d; UDP sockets at fd %u and up", program,
+	           (int)sv.child, sv.range);
 
 	/* Until no supervised process is left: the listener reports end of file
 	 * once the last one has gone and been reaped (seccomp_unotify(2)), and
 	 * waitpid() reports no children once every descendant has been. */
 	while (!none_left) {
-		struct pollfd p[2] = {
-			{ sv.listener, POLLIN, 0 },
-			{ sv.sigfd, POLLIN, 0 },
-		};
+		size_t np = poll_set(&sv, &p, &pcap);
+		long long now = sv_now_ms();
+		int rc;
 
-		if (poll(p, 2, -1) < 0) {
-			if (errno == EINTR)
-				continue;
+		if (np == 0) {
+			udpc_err("out of memory");
+			break;
+		}
+		rc = poll(p, (nfds_t)np, poll_timeout(&sv, now));
+		if (rc < 0 && errno != EINTR) {
 			udpc_err("poll: %s", strerror(errno));
 			break;
 		}
-		if (p[1].revents & POLLIN)
+		now = sv_now_ms();
+		if (rc > 0 && (p[1].revents & POLLIN))
 			on_signal(&sv, &none_left);
-		if (p[0].revents & POLLIN)
+		if (rc > 0 && (p[0].revents & POLLIN))
 			serve_one(&sv);
-		if (p[0].revents & (POLLHUP | POLLERR))
+		if (rc > 0 && (p[0].revents & (POLLHUP | POLLERR)))
 			break;
+		if (sv.parked != NULL) {
+			serve_parked(&sv, rc > 0 ? p + 2 : NULL, rc > 0 ? np - 2 : 0, now);
+			if (now - last_prune >= PRUNE_EVERY_MS) {
+				svcall_prune_parked(&sv, 0);
+				last_prune = now;
+			}
+		}
+		if (sv.sweep_at_ms != 0 && now >= sv.sweep_at_ms) {
+			sv.sweep_at_ms = 0;
+			svsock_sweep(sv.range);
+		}
+		if (sv.sweep_at_ms == 0 && svsock_count() > 0)
+			sv.sweep_at_ms = now + SWEEP_EVERY_MS;
 	}
+	free(p);
 	free(sv.req);
 	free(sv.resp);
+	free(sv.buf);
 	close(sv.listener);
 	if (!sv.child_done) {
 		waitpid(sv.child, &sv.child_status, 0);

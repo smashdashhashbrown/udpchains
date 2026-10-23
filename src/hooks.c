@@ -16,7 +16,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <netinet/udp.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -34,6 +33,7 @@
 #include "assoc.h"
 #include "config.h"
 #include "core.h"
+#include "dgram.h"
 #include "fdtable.h"
 #include "guard.h"
 #include "log.h"
@@ -771,31 +771,11 @@ static bool iovlen_ok(const struct msghdr *m)
 	return true;
 }
 
-/* D-36: a UDP_SEGMENT control message asks the kernel to split one buffer into
- * many datagrams (GSO).  Each would need its own SOCKS header, and the kernel
- * cannot add them, so the request is refused rather than sent as one garbled
- * datagram.  Other ancillary data on send is ignored (FR-F-11). */
-static struct udpc_ratelimit g_rl_gso;
-
+/* D-36: GSO would split one buffer into datagrams without headers. */
 static bool refuse_gso(int fd, const struct msghdr *m)
 {
-	struct cmsghdr *c;
-	char note[80];
-	unsigned n;
-
-	if (m->msg_control == NULL || m->msg_controllen < sizeof(struct cmsghdr))
+	if (!udpc_dgram_wants_gso(fd, m))
 		return false;
-	for (c = CMSG_FIRSTHDR(m); c != NULL;
-	     c = CMSG_NXTHDR((struct msghdr *)(uintptr_t)m, c))
-		if (c->cmsg_level == SOL_UDP && c->cmsg_type == UDP_SEGMENT)
-			break;
-	if (c == NULL)
-		return false;
-	if ((n = udpc_ratelimit(&g_rl_gso)) != 0)
-		udpc_warn("refusing UDP_SEGMENT on descriptor %d: each datagram "
-		          "needs its own SOCKS header, which the kernel cannot "
-		          "add%s",
-		          fd, udpc_ratelimit_note(n, note, sizeof(note)));
 	errno = EOPNOTSUPP;
 	return true;
 }

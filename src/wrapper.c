@@ -349,13 +349,15 @@ static int set_preload(const char *shim)
 
 /* D-49: a supervised program is not also given the shim.  Removes
  * libudpchains.so from an LD_PRELOAD the program would inherit, keeping
- * whatever else is there. */
+ * whatever else is there.  Returns 1 if it was there, 0 if not, -1 on
+ * failure. */
 static int strip_preload(void)
 {
 	const char *existing = getenv("LD_PRELOAD");
 	char in[8192], out[8192];
 	char *tok, *save = NULL;
 	size_t off = 0;
+	int found = 0;
 
 	if (existing == NULL)
 		return 0;
@@ -366,12 +368,16 @@ static int strip_preload(void)
 	for (tok = strtok_r(in, ": ", &save); tok != NULL; tok = strtok_r(NULL, ": ", &save)) {
 		const char *base = strrchr(tok, '/');
 
-		if (strcmp(base != NULL ? base + 1 : tok, "libudpchains.so") == 0)
+		if (strcmp(base != NULL ? base + 1 : tok, "libudpchains.so") == 0) {
+			found = 1;
 			continue;
+		}
 		off += (size_t)snprintf(out + off, sizeof(out) - off, "%s%s",
 		                        off ? ":" : "", tok);
 	}
-	return out[0] != '\0' ? setenv("LD_PRELOAD", out, 1) : unsetenv("LD_PRELOAD");
+	if ((out[0] != '\0' ? setenv("LD_PRELOAD", out, 1) : unsetenv("LD_PRELOAD")) != 0)
+		return -1;
+	return found;
 }
 
 int main(int argc, char **argv)
@@ -493,13 +499,34 @@ int main(int argc, char **argv)
 		return 1;
 
 	if (cfg.supervise) {
-		if (udpc_config_export(&cfg) != 0 || strip_preload() != 0) {
+		int stripped = strip_preload();
+
+		if (stripped < 0) {
 			fprintf(stderr, "udpchains: cannot set up the environment: %s\n",
 			        strerror(errno));
 			return 1;
 		}
+		/* The same LD_PRELOAD loaded the shim into udpchains itself,
+		 * where it would wrap the supervisor's own datagrams to the
+		 * relay a second time.  Run again without it, before the
+		 * environment is changed in any other way. */
+		if (stripped > 0) {
+			execv("/proc/self/exe", argv);
+			fprintf(stderr, "udpchains: libudpchains.so is preloaded into "
+			        "udpchains itself, and it cannot run again without it "
+			        "(%s); refusing to supervise '%s' (D-49)\n",
+			        strerror(errno), argv[i]);
+			return 1;
+		}
+		if (udpc_config_export(&cfg) != 0) {
+			fprintf(stderr, "udpchains: cannot set up the environment: %s\n",
+			        strerror(errno));
+			return 1;
+		}
+		/* The supervisor keeps the password: it, not the program,
+		 * speaks to the proxy. */
 		explicit_bzero(cli.password, sizeof(cli.password));
-		return udpc_supervise(program, &argv[i]);
+		return udpc_supervise(&cfg, program, &argv[i]);
 	}
 
 	if (find_shim(shim, sizeof(shim)) != 0)
