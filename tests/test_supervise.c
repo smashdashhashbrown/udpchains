@@ -23,6 +23,18 @@
  *                                        proxy: a signal arriving while the
  *                                        association is set up is handled at
  *                                        once, and the send made again (D-54)
+ *   test_supervise lifecycle <echo port> under the supervisor: threads, a thread
+ *                                        with its own descriptor table,
+ *                                        clone(CLONE_FILES), close_range,
+ *                                        posix_spawn and exec, from the first
+ *                                        thread and another (FR-SV-11, T3);
+ *                                        runs itself again as "execed"
+ *   test_supervise threadexit            under the supervisor: two threads make
+ *                                        and close sockets, and exit before
+ *                                        the program does
+ *   test_supervise spray <ip> <port> <secs>
+ *                                        a datagram every 5 ms, for the wire
+ *                                        capture: a line per one sent
  *   test_supervise nodump <tcp port>     under the supervisor: a process that
  *                                        makes itself non-dumpable fails
  *                                        closed, and files still work
@@ -50,7 +62,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
+#include <spawn.h>
+#include <linux/close_range.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/sendfile.h>
@@ -390,6 +406,19 @@ struct tally {
 	int lost, dups, recv_eintr, send_eintr;
 };
 
+/* The far end of a TCP connection, read until it closes. */
+static int g_tcp_peer;
+
+static void *drain_tcp(void *arg)
+{
+	char buf[4096];
+
+	(void)arg;
+	while (read(g_tcp_peer, buf, sizeof(buf)) > 0)
+		;
+	return NULL;
+}
+
 /* Waits, up to two seconds, until pid sleeps in a call: a child's receive
  * waiting for its datagram, rather than one still being set up, which its
  * thread spends stopped for the supervisor. */
@@ -600,6 +629,69 @@ static int signals(int delayed_port, int echo_port)
 		TAP_EQ_INT(fcntl_eintr, 0, "and fcntl(F_GETFD), no longer trapped, never did");
 	}
 
+	TAP_GROUP("installing descriptors, close_range and TCP under a storm (D-54)");
+	{
+		int i, sock_eintr = 0, dup_eintr = 0, cr_eintr = 0, left = 0, tcp_eintr = 0;
+		int l = socket(AF_INET, SOCK_STREAM, 0), c = socket(AF_INET, SOCK_STREAM, 0);
+		struct sockaddr_in a = loopback(0);
+		socklen_t alen = sizeof(a);
+		char chunk[64];
+		pthread_t reader;
+
+		/* A TCP connection below the range, read by a thread. */
+		bind(l, (struct sockaddr *)&a, sizeof(a));
+		listen(l, 1);
+		getsockname(l, (struct sockaddr *)&a, &alen);
+		connect(c, (struct sockaddr *)&a, sizeof(a));
+		g_tcp_peer = accept(l, NULL, NULL);
+		pthread_create(&reader, NULL, drain_tcp, NULL);
+		memset(chunk, 0, sizeof(chunk));
+
+		/* Each of these is traced, and a UDP socket() or a dup of one is
+		 * then installed by notification with the thread's signals
+		 * blocked: none fails with EINTR, which natively none does. */
+		g_signals = 0;
+		storm(100, 0);
+		for (i = 0; i < 2000; i++) {
+			int u, d;
+
+			if ((u = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+				sock_eintr += errno == EINTR;
+				continue;
+			}
+			if ((d = fcntl(u, F_DUPFD, 0)) < 0)
+				dup_eintr += errno == EINTR;
+			else
+				close(d);
+			if (syscall(SYS_close_range, u, u, 0) != 0 && errno == EINTR) {
+				cr_eintr++;
+				if (fcntl(u, F_GETFD) != -1) {
+					left++;
+					close(u);
+				}
+			}
+			if (send(c, chunk, sizeof(chunk), 0) < 0 && errno == EINTR)
+				tcp_eintr++;
+		}
+		storm(0, 0);
+		shutdown(c, SHUT_WR);
+		pthread_join(reader, NULL);
+		close(c);
+		close(g_tcp_peer);
+		close(l);
+		TAP_EQ_INT(sock_eintr, 0, "2000 UDP socket() calls under a signal every 100 us "
+		                          "(%d signals): none failed with EINTR",
+		           (int)g_signals);
+		TAP_EQ_INT(dup_eintr, 0, "nor fcntl(F_DUPFD) of one");
+		TAP_EQ_INT(cr_eintr, 0, "nor close_range() of one");
+		TAP_EQ_INT(left, 0, "and none was left open");
+		TAP_EQ_INT(tcp_eintr, 0, "2000 sends on a TCP connection below the range: none failed "
+		                         "with EINTR");
+		for (left = 0, i = RANGE; i < RANGE + 4096; i++)
+			left += fcntl(i, F_GETFD) != -1;
+		TAP_EQ_INT(left, 0, "and no descriptor was left in the range");
+	}
+
 	TAP_GROUP("the program is traced by the supervisor (D-54)");
 	{
 		char line[128];
@@ -678,6 +770,377 @@ static int abandon(int echo_port)
 	       elapsed_ms(&t0));
 	close(fd);
 	TAP_DONE();
+}
+
+/* --- lifecycle -------------------------------------------------------------*/
+
+/* A thread's own socket, used for n round trips. */
+struct own {
+	int n, ok;
+	char tag[16];
+};
+
+static void *own_socket(void *arg)
+{
+	struct own *o = arg;
+	int fd = udp_timed(5000), i;
+
+	for (i = 0; i < o->n; i++)
+		o->ok += fd >= 0 && round_trip(fd, fd, o->tag);
+	close(fd);
+	return NULL;
+}
+
+/* One of several threads waiting on the same socket: what it got. */
+struct waiter {
+	int fd;
+	char got[16];
+};
+
+static void *wait_one(void *arg)
+{
+	struct waiter *w = arg;
+
+	if (recv(w->fd, w->got, sizeof(w->got) - 1, 0) < 0)
+		strcpy(w->got, "none");
+	return NULL;
+}
+
+/* Round trips under a storm of signals, on a socket made under it, receives
+ * retried on EINTR as a program must.  socket() natively never fails with
+ * EINTR, so it is not retried (D-54). */
+static void *stormy(void *arg)
+{
+	struct own *o = arg;
+	int fd = udp_timed(5000), i;
+
+	for (i = 0; i < o->n && fd >= 0; i++) {
+		char back[16];
+		ssize_t r;
+
+		if (sendto(fd, o->tag, strlen(o->tag), 0, (struct sockaddr *)&g_echo,
+		           sizeof(g_echo)) != (ssize_t)strlen(o->tag))
+			continue;
+		while ((r = recv(fd, back, sizeof(back), 0)) < 0 && errno == EINTR)
+			;
+		o->ok += r == (ssize_t)strlen(o->tag) && memcmp(back, o->tag, (size_t)r) == 0;
+	}
+	close(fd);
+	return NULL;
+}
+
+/* A thread with a descriptor table of its own (unshare(CLONE_FILES)).  Both
+ * tables start with s and t.  The thread closes t in its own and makes a
+ * socket, which belongs at t's number there; the first thread then closes s in
+ * its own, leaving the thread's table the only holder of s. */
+struct unshared {
+	int s, t, fd, ok_new, ok_kept;
+	volatile int stage;
+};
+
+static void *unshare_files(void *arg)
+{
+	struct unshared *u = arg;
+
+	if (unshare(CLONE_FILES) != 0) {
+		u->stage = 1;
+		return NULL;
+	}
+	close(u->t);
+	u->fd = udp_timed(5000);
+	u->ok_new = u->fd >= 0 && round_trip(u->fd, u->fd, "unshared");
+	u->stage = 1;
+	while (u->stage != 2)
+		usleep(1000);
+	u->ok_kept = round_trip(u->s, u->s, "kept");
+	close(u->fd);
+	close(u->s);
+	return NULL;
+}
+
+/* exec from a thread other than the first. */
+static char **g_exec_argv;
+
+static void *exec_from_thread(void *arg)
+{
+	(void)arg;
+	execv("/proc/self/exe", g_exec_argv);
+	_exit(126);
+}
+
+/* clone(CLONE_FILES) without CLONE_VM: a process sharing the parent's
+ * descriptor table, which makes a socket there. */
+
+static int cloned(void *arg)
+{
+	int fd = udp_timed(5000);
+
+	(void)arg;
+	if (fd < 0 || !round_trip(fd, fd, "cloned"))
+		return 1;
+	/* Left open: the parent finds it at the same number. */
+	return write(*(int *)arg, &fd, sizeof(fd)) == sizeof(fd) ? 0 : 1;
+}
+
+static int lifecycle(int echo_port, const char *self)
+{
+	char countbuf[16], failbuf[16], keepbuf[16], gonebuf[16], portbuf[16];
+	struct own own[8];
+	struct waiter w[4];
+	pthread_t th[8];
+	int i, ok, fd, keep, gone, st, p[2];
+	pid_t pid;
+
+	g_echo = loopback(echo_port);
+
+	TAP_GROUP("threads, each with its own socket (FR-SV-11)");
+	for (i = 0; i < 8; i++) {
+		memset(&own[i], 0, sizeof(own[i]));
+		own[i].n = 50;
+		snprintf(own[i].tag, sizeof(own[i].tag), "thread-%d", i);
+		pthread_create(&th[i], NULL, own_socket, &own[i]);
+	}
+	for (ok = 0, i = 0; i < 8; i++) {
+		pthread_join(th[i], NULL);
+		ok += own[i].ok;
+	}
+	TAP_EQ_INT(ok, 400, "8 threads, 50 round trips each, all carried");
+
+	TAP_GROUP("threads waiting on one socket");
+	fd = udp_timed(5000);
+	for (i = 0; i < 4; i++) {
+		w[i].fd = fd;
+		memset(w[i].got, 0, sizeof(w[i].got));
+		pthread_create(&th[i], NULL, wait_one, &w[i]);
+	}
+	usleep(200000); /* all four waiting */
+	for (i = 0; i < 4; i++) {
+		char what[8];
+
+		snprintf(what, sizeof(what), "w%d", i);
+		sendto(fd, what, strlen(what), 0, (struct sockaddr *)&g_echo, sizeof(g_echo));
+	}
+	for (ok = 0, i = 0; i < 4; i++) {
+		int k;
+
+		pthread_join(th[i], NULL);
+		for (k = 0; k < 4; k++) {
+			char what[8];
+
+			snprintf(what, sizeof(what), "w%d", k);
+			ok += strcmp(w[i].got, what) == 0;
+		}
+	}
+	TAP_EQ_INT(ok, 4, "4 datagrams to 4 waiting threads: each got one");
+	TAP_OK(strcmp(w[0].got, w[1].got) != 0 && strcmp(w[2].got, w[3].got) != 0 &&
+	               strcmp(w[0].got, w[2].got) != 0 && strcmp(w[1].got, w[3].got) != 0 &&
+	               strcmp(w[0].got, w[3].got) != 0 && strcmp(w[1].got, w[2].got) != 0,
+	       "and no two the same");
+	close(fd);
+
+	TAP_GROUP("threads under a storm of signals");
+	g_signals = 0;
+	storm(200, 0);
+	for (i = 0; i < 4; i++) {
+		memset(&own[i], 0, sizeof(own[i]));
+		own[i].n = 200;
+		snprintf(own[i].tag, sizeof(own[i].tag), "storm-%d", i);
+		pthread_create(&th[i], NULL, stormy, &own[i]);
+	}
+	for (ok = 0, i = 0; i < 4; i++) {
+		pthread_join(th[i], NULL);
+		ok += own[i].ok;
+	}
+	storm(0, 0);
+	TAP_EQ_INT(ok, 800, "4 threads, 200 round trips each, under %d signals: all carried",
+	           (int)g_signals);
+
+	TAP_GROUP("a thread with a descriptor table of its own");
+	{
+		struct unshared u;
+		pthread_t t;
+
+		memset(&u, 0, sizeof(u));
+		u.s = udp_timed(5000);
+		u.t = udp_timed(5000);
+		u.fd = -1;
+		pthread_create(&t, NULL, unshare_files, &u);
+		while (u.stage != 1)
+			usleep(1000);
+		TAP_EQ_INT(u.fd, u.t, "after unshare(CLONE_FILES), a thread's new socket takes "
+		                      "a number free in its own table, though not in the first's");
+		TAP_OK(u.ok_new, "and is carried");
+		TAP_OK(round_trip(u.t, u.t, "first"), "while the first thread's socket at that "
+		                                      "number still is");
+		/* Long enough for the sweep after this close to have run. */
+		close(u.s);
+		usleep(700000);
+		u.stage = 2;
+		pthread_join(t, NULL);
+		TAP_OK(u.ok_kept, "a socket held only in the thread's table is not forgotten "
+		                  "by the sweep");
+		close(u.t);
+	}
+
+	TAP_GROUP("clone(CLONE_FILES): a process sharing the descriptor table");
+	{
+		static char stack[64 * 1024];
+		int got = -1;
+
+		if (pipe(p) == 0) {
+			pid = clone(cloned, stack + sizeof(stack), CLONE_FILES | SIGCHLD, &p[1]);
+			TAP_OK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) &&
+			               WEXITSTATUS(st) == 0,
+			       "the cloned process makes a socket and is carried");
+			TAP_OK(read(p[0], &got, sizeof(got)) == sizeof(got) && got >= RANGE,
+			       "at fd %d, in the table it shares", got);
+			TAP_OK(got >= RANGE && round_trip(got, got, "shared-table"),
+			       "where the parent uses it too, after the child has gone");
+			if (got >= 0)
+				close(got);
+			close(p[0]);
+			close(p[1]);
+		}
+	}
+
+	TAP_GROUP("close_range (FR-SV-T3)");
+	{
+		int a = udp_timed(5000), b = udp_timed(5000), c;
+
+		TAP_OK(round_trip(a, a, "a") && round_trip(b, b, "b"), "two sockets, carried");
+		TAP_EQ_INT((int)syscall(SYS_close_range, b, b, CLOSE_RANGE_CLOEXEC), 0,
+		           "close_range(CLOSE_RANGE_CLOEXEC) on one");
+		TAP_OK(fcntl(b, F_GETFD) & FD_CLOEXEC, "marks it close-on-exec, and leaves it open");
+		TAP_EQ_INT((int)syscall(SYS_close_range, RANGE, ~0U, 0), 0,
+		           "close_range() over the whole range");
+		TAP_OK(fcntl(a, F_GETFD) == -1 && fcntl(b, F_GETFD) == -1, "closes both");
+		c = udp_timed(5000);
+		TAP_EQ_INT(c, RANGE, "the range's first number is given out again");
+		TAP_OK(round_trip(c, c, "c"), "and carries");
+		close(c);
+	}
+
+	TAP_GROUP("posix_spawn (vfork and exec) keeps an inherited socket");
+	keep = udp_timed(5000);
+	gone = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	snprintf(keepbuf, sizeof(keepbuf), "%d", keep);
+	snprintf(gonebuf, sizeof(gonebuf), "%d", gone);
+	snprintf(portbuf, sizeof(portbuf), "%d", echo_port);
+	{
+		char *argv[] = { (char *)(uintptr_t)self, (char *)(uintptr_t)"execed", portbuf,
+			         keepbuf, gonebuf, NULL };
+		extern char **environ;
+
+		TAP_EQ_INT(posix_spawn(&pid, "/proc/self/exe", NULL, NULL, argv, environ), 0,
+		           "posix_spawn() of this program");
+		TAP_OK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+		       "which carries the inherited socket, and finds the close-on-exec one "
+		       "gone (status %#x)",
+		       st);
+	}
+
+	TAP_GROUP("exec from a thread other than the first");
+	{
+		char *argv[] = { (char *)(uintptr_t)self, (char *)(uintptr_t)"execed", portbuf,
+			         keepbuf, gonebuf, NULL };
+		pthread_t t;
+
+		fflush(stdout);
+		pid = fork();
+		if (pid == 0) {
+			g_exec_argv = argv;
+			pthread_create(&t, NULL, exec_from_thread, NULL);
+			pause();
+		}
+		TAP_OK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+		       "the new program carries the socket (status %#x)", st);
+	}
+
+	/* Last: this process becomes the exec'd program, which prints the
+	 * plan.  The close-on-exec socket's association is let go after the
+	 * exec, which test_supervise.sh looks for. */
+	TAP_GROUP("exec keeps an inherited socket, and drops a close-on-exec one");
+	{
+		char *argv[] = { (char *)(uintptr_t)self, (char *)(uintptr_t)"execed", portbuf,
+			         keepbuf, gonebuf, countbuf, failbuf, NULL };
+
+		TAP_OK(round_trip(gone, gone, "before"), "the close-on-exec socket is carried "
+		                                         "before the exec");
+		snprintf(countbuf, sizeof(countbuf), "%d", tap_count);
+		snprintf(failbuf, sizeof(failbuf), "%d", tap_failed);
+		/* The sweeps due to what came before are over by then, so only
+		 * the exec can prompt the next. */
+		usleep(600000);
+		fflush(stdout);
+		execv("/proc/self/exe", argv);
+		TAP_OK(0, "execv: %s", strerror(errno));
+	}
+	TAP_DONE();
+}
+
+/* After an exec: keep must still be carried and gone must be closed.  With a
+ * count, this is the end of lifecycle's run, numbered after its checks and
+ * counting its failures. */
+static int execed(int echo_port, int keep, int gone, int count, int failed)
+{
+	g_echo = loopback(echo_port);
+	if (count < 0)
+		return round_trip(keep, keep, "spawned") && fcntl(gone, F_GETFD) == -1 ? 0 : 1;
+	tap_count = count;
+	tap_failed = failed;
+	TAP_OK(round_trip(keep, keep, "exec'd"), "after the exec, the inherited socket is "
+	                                         "carried");
+	TAP_OK(fcntl(gone, F_GETFD) == -1, "and the close-on-exec one is gone");
+	/* Long enough for the supervisor to notice the dropped socket, which
+	 * test_supervise.sh looks for now: it should hold one association. */
+	usleep(300000);
+	printf("# waiting\n");
+	fflush(stdout);
+	usleep(1000000);
+	TAP_DONE();
+}
+
+/* Two threads making and closing UDP sockets, then gone before the first
+ * returns: the supervisor must reap traced threads to see the program exit. */
+static void *churn_sockets(void *arg)
+{
+	int i;
+
+	(void)arg;
+	for (i = 0; i < 200; i++)
+		close(socket(AF_INET, SOCK_DGRAM, 0));
+	return NULL;
+}
+
+static int threadexit(void)
+{
+	pthread_t a, b;
+
+	pthread_create(&a, NULL, churn_sockets, NULL);
+	pthread_create(&b, NULL, churn_sockets, NULL);
+	pthread_join(a, NULL);
+	pthread_join(b, NULL);
+	return 0;
+}
+
+/* For the wire capture (FR-SV-T2): a datagram to ip:port every 5 ms for secs
+ * seconds, a line for each one sent, so a run killed part way still says how
+ * far it got. */
+static int spray(const char *ip, int port, int secs)
+{
+	struct sockaddr_in d = loopback(port);
+	int fd = socket(AF_INET, SOCK_DGRAM, 0), i;
+
+	if (inet_pton(AF_INET, ip, &d.sin_addr) != 1 || fd < 0)
+		return 2;
+	for (i = 0; i < secs * 200; i++) {
+		if (sendto(fd, "spray", 5, 0, (struct sockaddr *)&d, sizeof(d)) == 5) {
+			printf("SENT %d\n", i);
+			fflush(stdout);
+		}
+		usleep(5000);
+	}
+	return 0;
 }
 
 /* D-48: the supervisor cannot inspect a non-dumpable process, so what needs
@@ -857,6 +1320,17 @@ int main(int argc, char **argv)
 		return signals(atoi(argv[2]), atoi(argv[3]));
 	if (argc == 2 && strcmp(argv[1], "silent") == 0)
 		return silent();
+	if (argc == 2 && strcmp(argv[1], "threadexit") == 0)
+		return threadexit();
+	if (argc == 5 && strcmp(argv[1], "spray") == 0)
+		return spray(argv[2], atoi(argv[3]), atoi(argv[4]));
+	if (argc == 3 && strcmp(argv[1], "lifecycle") == 0)
+		return lifecycle(atoi(argv[2]), argv[0]);
+	if (argc == 5 && strcmp(argv[1], "execed") == 0)
+		return execed(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), -1, 0);
+	if (argc == 7 && strcmp(argv[1], "execed") == 0)
+		return execed(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]),
+		              atoi(argv[6]));
 	if (argc == 3 && strcmp(argv[1], "abandon") == 0)
 		return abandon(atoi(argv[2]));
 	if (argc == 3 && strcmp(argv[1], "nodump") == 0)
@@ -869,7 +1343,8 @@ int main(int argc, char **argv)
 		return received(argv[2]);
 	fprintf(stderr, "usage: test_supervise refusals <tcp port> | range <echo port> | "
 	                "signals <delayed echo port> <echo port> | silent | "
-	                "abandon <echo port> | nodump <tcp port> | "
+	                "abandon <echo port> | lifecycle <echo port> | "
+	                "spray <ip> <port> <secs> | threadexit | nodump <tcp port> | "
 	                "churn <echo port> <n> <secs> | "
 	                "pass <path> <port> | "
 	                "received <path>\n");

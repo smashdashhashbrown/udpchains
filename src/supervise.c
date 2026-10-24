@@ -76,18 +76,21 @@ bool udpc_kernel_at_least(const char *release, int major, int minor)
  *
  * One ABI: x86-64, without x32's call numbers (seccomp(2): x32 shares x86-64's
  * arch value, and is told apart by __X32_SYSCALL_BIT).  A call from any other
- * ABI fails with ENOSYS, never runs.  Then the calls the supervisor answers:
+ * ABI fails with ENOSYS, never runs.  Then the calls the supervisor answers,
+ * every one traced, so that its thread is stopped while it is handled (D-54):
  *
  *   - on a descriptor in the reserved range, where every UDP socket lives,
- *     the calls that move data, connect, bind, name or close: traced (D-54).
+ *     the calls that move data, connect, bind, name, close or duplicate.
  *     Below the range, file and TCP I/O never leaves the kernel (D-50);
- *   - below the range, the calls that could send on, or connect, a socket the
- *     supervisor did not make, and on every descriptor the routes around it:
- *     notified (D-50, D-53);
- *   - socket() for the families it must see, dup of a descriptor in the
- *     range, dup2 and dup3 to or from it, close_range reaching it, and fcntl
- *     duplicating anything: notified, since only notification can place a
- *     descriptor at a chosen number (D-54).
+ *   - on any descriptor, the calls that could send on, or connect, a socket
+ *     the supervisor did not make, and the routes around it (D-50, D-53);
+ *   - socket() for the families it must see, dup2 and dup3 to or from the
+ *     range, close_range reaching it, and fcntl duplicating anything.
+ *
+ * A call that must install a descriptor at a chosen number -- a UDP socket(),
+ * a dup of a carried one -- is marked at its stop, and on the re-check the
+ * kernel makes after it (seccomp(2)) the mark sends it by notification, the
+ * only way to install one, with the thread's signals blocked meanwhile.
  *
  * With no tracer attached, a traced call fails with ENOSYS and never runs
  * (seccomp(2)); with the supervisor gone, so does a notified one.
@@ -101,15 +104,10 @@ bool udpc_kernel_at_least(const char *release, int major, int minor)
 #define X32_BIT 0u
 #endif
 
-/* Notified whatever their arguments. */
+/* Traced whatever their arguments. */
 static const int g_always[] = {
-	SYS_sendfile, SYS_splice, SYS_io_uring_setup, SYS_pidfd_getfd,
-};
-
-/* Traced on a descriptor in the range; notified on any other, which must not
- * be a UDP socket (D-50). */
-static const int g_sends[] = {
-	SYS_connect, SYS_sendto, SYS_sendmsg, SYS_sendmmsg,
+	SYS_connect, SYS_sendto, SYS_sendmsg, SYS_sendmmsg, SYS_sendfile,
+	SYS_splice, SYS_io_uring_setup, SYS_pidfd_getfd,
 };
 
 /* Traced when their first argument, a descriptor, is in the range.  pread64,
@@ -128,7 +126,7 @@ static const unsigned g_families[] = { AF_INET, AF_INET6, AF_PACKET };
 #define FILTER_MAX 96
 
 enum {
-	L_NOTIFY, L_TRACE, L_SOCKET, L_FD0, L_SEND, L_DUP1, L_DUP, L_CLOSE_RANGE, L_FCNTL,
+	L_NOTIFY, L_TRACE, L_SOCKET, L_FD0, L_DUP1, L_DUP, L_CLOSE_RANGE, L_FCNTL,
 	L_COUNT
 };
 
@@ -170,6 +168,13 @@ static void place(struct bpf *b, int label)
  * little-endian machine. */
 #define ARG(k) (unsigned)offsetof(struct seccomp_data, args[k])
 
+/* Jumps to L_NOTIFY if the call carries the install mark (D-54). */
+static void if_marked(struct bpf *b)
+{
+	load_word(b, ARG(5));
+	jump_if(b, BPF_JEQ, SV_INSTALL_MARK, L_NOTIFY);
+}
+
 /* Builds the filter for a range starting at range.  Returns its length. */
 static unsigned build_filter(struct bpf *b, unsigned range)
 {
@@ -186,9 +191,7 @@ static unsigned build_filter(struct bpf *b, unsigned range)
 
 	jump_if(b, BPF_JEQ, SYS_socket, L_SOCKET);
 	for (k = 0; k < COUNT(g_always); k++)
-		jump_if(b, BPF_JEQ, (unsigned)g_always[k], L_NOTIFY);
-	for (k = 0; k < COUNT(g_sends); k++)
-		jump_if(b, BPF_JEQ, (unsigned)g_sends[k], L_SEND);
+		jump_if(b, BPF_JEQ, (unsigned)g_always[k], L_TRACE);
 	for (k = 0; k < COUNT(g_in_range); k++)
 		jump_if(b, BPF_JEQ, (unsigned)g_in_range[k], L_FD0);
 	jump_if(b, BPF_JEQ, SYS_dup, L_DUP1);
@@ -199,9 +202,10 @@ static unsigned build_filter(struct bpf *b, unsigned range)
 	stmt(b, BPF_RET | BPF_K, allow);
 
 	place(b, L_SOCKET);
+	if_marked(b);
 	load_word(b, ARG(0));
 	for (k = 0; k < COUNT(g_families); k++)
-		jump_if(b, BPF_JEQ, g_families[k], L_NOTIFY);
+		jump_if(b, BPF_JEQ, g_families[k], L_TRACE);
 	stmt(b, BPF_RET | BPF_K, allow);
 
 	/* Unsigned: a negative descriptor compares above the range, and is
@@ -211,34 +215,31 @@ static unsigned build_filter(struct bpf *b, unsigned range)
 	jump_if(b, BPF_JGE, range, L_TRACE);
 	stmt(b, BPF_RET | BPF_K, allow);
 
-	place(b, L_SEND);
-	load_word(b, ARG(0));
-	jump_if(b, BPF_JGE, range, L_TRACE);
-	stmt(b, BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
+	/* Only duplicating: every other command leaves a descriptor as it is,
+	 * and runs in the kernel (D-54).  Placed before L_DUP1, as
+	 * BPF jumps only forward. */
+	place(b, L_FCNTL);
+	load_word(b, ARG(1));
+	jump_if(b, BPF_JEQ, F_DUPFD, L_DUP1);
+	jump_if(b, BPF_JEQ, F_DUPFD_CLOEXEC, L_DUP1);
+	stmt(b, BPF_RET | BPF_K, allow);
 
 	place(b, L_DUP1);
+	if_marked(b);
 	load_word(b, ARG(0));
-	jump_if(b, BPF_JGE, range, L_NOTIFY);
+	jump_if(b, BPF_JGE, range, L_TRACE);
 	stmt(b, BPF_RET | BPF_K, allow);
 
 	place(b, L_DUP);
 	load_word(b, ARG(0));
-	jump_if(b, BPF_JGE, range, L_NOTIFY);
+	jump_if(b, BPF_JGE, range, L_TRACE);
 	load_word(b, ARG(1));
-	jump_if(b, BPF_JGE, range, L_NOTIFY);
+	jump_if(b, BPF_JGE, range, L_TRACE);
 	stmt(b, BPF_RET | BPF_K, allow);
 
 	place(b, L_CLOSE_RANGE);
 	load_word(b, ARG(1)); /* the last descriptor it closes */
-	jump_if(b, BPF_JGE, range, L_NOTIFY);
-	stmt(b, BPF_RET | BPF_K, allow);
-
-	/* Only duplicating: every other command leaves a descriptor as it is,
-	 * and runs in the kernel (D-54). */
-	place(b, L_FCNTL);
-	load_word(b, ARG(1));
-	jump_if(b, BPF_JEQ, F_DUPFD, L_NOTIFY);
-	jump_if(b, BPF_JEQ, F_DUPFD_CLOEXEC, L_NOTIFY);
+	jump_if(b, BPF_JGE, range, L_TRACE);
 	stmt(b, BPF_RET | BPF_K, allow);
 
 	place(b, L_NOTIFY);
@@ -247,9 +248,15 @@ static unsigned build_filter(struct bpf *b, unsigned range)
 	place(b, L_TRACE);
 	stmt(b, BPF_RET | BPF_K, SECCOMP_RET_TRACE);
 
-	for (k = 0; k < b->nfix; k++)
-		b->f[b->fix_at[k]].jt =
-			(unsigned char)(b->label[b->fix_to[k]] - b->fix_at[k] - 1);
+	/* A label placed before its jump, or out of reach, is a mistake here:
+	 * 0 makes the kernel refuse the filter, so the program never runs. */
+	for (k = 0; k < b->nfix; k++) {
+		unsigned to = b->label[b->fix_to[k]];
+
+		if (to <= b->fix_at[k] || to - b->fix_at[k] - 1 > 255)
+			return 0;
+		b->f[b->fix_at[k]].jt = (unsigned char)(to - b->fix_at[k] - 1);
+	}
 	return b->n;
 }
 
@@ -485,19 +492,24 @@ static int poll_timeout(const struct sv *sv, long long now)
 	return sv->sweep_at_ms <= now ? 0 : (int)(sv->sweep_at_ms - now);
 }
 
-/* The program's status once it has gone.  Traced, it may still report stops
- * before its exit; each is let go. */
+/* The program's status once it has gone.  Every traced thread is waited for
+ * too: a traced leader's exit is not reported until its other threads' have
+ * been (ptrace(2)), so waiting for the program alone could wait for ever.  A
+ * stop still reported is let go. */
 static void wait_for_child(struct sv *sv)
 {
 	int st;
+	pid_t p;
 
-	while (!sv->child_done && waitpid(sv->child, &st, __WALL) == sv->child) {
+	while (!sv->child_done && (p = waitpid(-1, &st, __WALL)) > 0) {
 		if (WIFSTOPPED(st)) {
-			(void)ptrace(PTRACE_CONT, sv->child, 0, 0);
+			(void)ptrace(PTRACE_CONT, p, 0, 0);
 			continue;
 		}
-		sv->child_status = st;
-		sv->child_done = true;
+		if (p == sv->child) {
+			sv->child_status = st;
+			sv->child_done = true;
+		}
 	}
 }
 

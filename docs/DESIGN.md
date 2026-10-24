@@ -706,12 +706,12 @@ once a second, with no vaguer line after it (D-43). A dropped datagram names its
 
 ## 13. Supervisor mode (FR-SV-*), in progress
 
-**Status:** step 4 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
+**Status:** step 5 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
 D-48 to D-54, the requirements §2b. The supervisor carries a static program's UDP through the
 proxy or chain, from sockets it makes in a reserved range. Calls on those sockets are carried
 while their thread is stopped by `ptrace`, so a signal can never part what was done for a call
-from what it returns (D-54). Not yet: the thread tests and the wire capture (step 5), DNS
-redirection and aarch64 (step 6).
+from what it returns (D-54). Threads, `fork`, `vfork`, `clone` and `exec` are followed (step 5).
+Not yet: DNS redirection and aarch64 (step 6).
 
 ### 13.1 Where it lives
 
@@ -765,21 +765,26 @@ read inside the loop rather than waited on, since a signal reaching the traced c
 ### 13.3 The filter
 
 Built at run time, x86-64 only so far, by a small assembler that resolves forward jumps to labels.
-A call from another ABI, or with `__X32_SYSCALL_BIT`, fails with `ENOSYS` in the kernel. Sent to
-the supervisor, by one of two routes (D-54):
+A call from another ABI, or with `__X32_SYSCALL_BIT`, fails with `ENOSYS` in the kernel. Traced
+(`SECCOMP_RET_TRACE`, D-54):
 
-- **traced** (`SECCOMP_RET_TRACE`), when the descriptor is in the range: `read`, `write`, `readv`,
-  `writev`, `preadv2`, `pwritev2`, `recvfrom`, `recvmsg`, `recvmmsg`, `connect`, `sendto`,
-  `sendmsg`, `sendmmsg`, `bind`, `getsockname`, `getpeername`, `close`;
-- **notified** (`SECCOMP_RET_USER_NOTIF`): `socket()` for `AF_INET`, `AF_INET6` and `AF_PACKET`;
-  `connect`, `sendto`, `sendmsg` and `sendmmsg` below the range; always `sendfile`, `splice`,
-  `io_uring_setup` and `pidfd_getfd`; `dup` of a descriptor in the range; `dup2` and `dup3` from or
-  to it; `close_range` reaching it; and `fcntl`'s `F_DUPFD` and `F_DUPFD_CLOEXEC`, on any
-  descriptor. Only notification can place a descriptor at a chosen number.
+- when the descriptor is in the range: `read`, `write`, `readv`, `writev`, `preadv2`, `pwritev2`,
+  `recvfrom`, `recvmsg`, `recvmmsg`, `bind`, `getsockname`, `getpeername`, `close`, `dup`;
+- always: `connect`, `sendto`, `sendmsg`, `sendmmsg`, `sendfile`, `splice`, `io_uring_setup`,
+  `pidfd_getfd`;
+- `socket()` for `AF_INET`, `AF_INET6` and `AF_PACKET`; `dup2` and `dup3` from or to the range;
+  `close_range` reaching it; `fcntl`'s `F_DUPFD` and `F_DUPFD_CLOEXEC` of a descriptor in it.
+
+Notified (`SECCOMP_RET_USER_NOTIF`): `socket()`, `dup()` and `fcntl(F_DUPFD*)` carrying the
+install mark (`SV_INSTALL_MARK`) in their sixth argument, which they do not use. The supervisor
+sets it at a traced call's stop when the call must install a descriptor, and the re-check the
+kernel makes after the stop sends the marked call by notification, the only way to install one
+at a chosen number.
 
 Everything else runs in the kernel, so file and TCP I/O below the range never reaches the
 supervisor, nor does any other `fcntl`. With no tracer attached, a traced call fails with `ENOSYS`
-and never runs (`seccomp(2)`). `pread64`, `pwrite64`, `preadv` and `pwritev` are not sent: the kernel refuses them on
+and never runs (`seccomp(2)`). The assembler refuses a jump to a label placed before it, as BPF
+jumps only forward, and the kernel then refuses the empty filter. `pread64`, `pwrite64`, `preadv` and `pwritev` are not sent: the kernel refuses them on
 a socket itself. A descriptor is compared unsigned, so a negative one counts as in the range and
 gets the kernel's own `EBADF`.
 
@@ -803,11 +808,17 @@ supervisor's copy (the same open file), so replies arrive on it and `poll`, `sel
 work unaided (FR-I-07).
 
 **The sweep.** The kernel does not say when the last descriptor for a socket closes. 200 ms after
-a `close`, `close_range`, `dup2` or `dup3` in the range, or a child's exit, and every 5 s while any
-socket is carried, the supervisor lists `/proc`, picks its descendants by their parent links, and
-reads the socket inodes in their descriptors at or above the range's start. An entry no descendant
-holds has its association closed. If a descendant's descriptors cannot be read, nothing is
-forgotten that time.
+a `close`, `close_range`, `dup2` or `dup3` in the range, a child's exit or an `exec`, and every 5 s
+while any socket is carried, the supervisor lists `/proc`, picks its descendants by their parent
+links, and reads the socket inodes in their descriptors at or above the range's start. It reads
+the tables of their threads with tables of their own too (`/proc/<pid>/task/<tid>/fd`, for each
+thread `kcmp(KCMP_FILES)` says differs). An entry nothing holds has its association closed. If a
+table cannot be read, nothing is forgotten that time.
+
+**Which table.** A call names its thread. Its descriptors are looked up through a pidfd for its
+process, kept in a small cache. A thread whose table is not its process's (`unshare(CLONE_FILES)`,
+as `kcmp` tells) is reached through a pidfd for the thread itself (`PIDFD_THREAD`, Linux 6.9),
+opened for the call. Before 6.9, its calls that need its table are refused with `EPERM` (D-50).
 
 ### 13.5 Answering
 
@@ -821,8 +832,9 @@ it, so it cannot be abandoned.
 decides it, and then:
 
 - **skips it, returning a result:** the call number set to -1 and the result where a result goes;
-- **lets it run** as the program made it: `close`, and calls on a descriptor in the range that the
-  supervisor does not carry;
+- **lets it run** as the program made it: `close`, `close_range`, `dup2` and `dup3` into the range,
+  calls below the range on anything but a UDP socket it did not make, and calls on a descriptor in
+  the range that it does not carry;
 - **makes it again,** after any signal waiting has been handled, by stepping back over the
   two-byte `syscall` instruction: when an association's setup was abandoned for a signal;
 - **lets a receive wait natively,** when nothing is queued and the call may block. The call is
@@ -834,6 +846,14 @@ decides it, and then:
   included. The datagram is then taken and delivered while the thread is stopped; if another
   reader took it, the call is made again. Otherwise the peek's own result stands, and a restart is
   the kernel's, of the program's own call.
+
+- **installs a descriptor through a notification:** a UDP `socket()`, and a `dup` or `F_DUPFD` of
+  a carried socket. It saves the thread's signal mask and blocks every signal
+  (`PTRACE_GETSIGMASK`, `PTRACE_SETSIGMASK`), sets the install mark, and resumes the thread until
+  the call returns. The marked call is then notified, and answered as below with
+  `SECCOMP_ADDFD_FLAG_SETFD | SECCOMP_ADDFD_FLAG_SEND`. At the exit stop the program's registers
+  and mask are put back. If the call was interrupted before it was answered -- by `SIGSTOP`, or a
+  signal pending from before the mask was set -- nothing was installed, and it is made again.
 
 **Abandoning a setup.** While a traced call sets up an association, the SOCKS client's waits are
 cut into 50 ms slices (`udpc_socks_set_cancel`). Between slices the supervisor reads the thread's
@@ -883,6 +903,8 @@ shim mode, naming the process and descriptor (FR-C-06).
   no child is left.
 - **Status.** It exits with the program's status; if the program was killed by a signal, the
   supervisor dies of the same one, with core dumps off, so a shell sees what it would have seen.
+  Waiting for that status, it reaps every traced thread (`waitpid(-1, __WALL)`), since a traced
+  leader's exit is not reported until its other threads' have been.
 
 ### 13.7 Tests
 
@@ -899,11 +921,18 @@ shim mode, naming the process and descriptor (FR-C-06).
   connection; the signal tests (`test_supervise signals`, FR-SV-T4): receives under storms of
   signals with and without `SA_RESTART` losing nothing and sends never failing with `EINTR` or
   repeated, `SO_RCVTIMEO` and `SIGSTOP`/`SIGCONT` as signal(7) describes them, 2,000 `close`s
-  under a storm none left open, `fcntl(F_GETFD)` never interrupted, and the program traced by
+  under a storm none left open, `fcntl(F_GETFD)` never interrupted, 2,000 UDP `socket()`,
+  `F_DUPFD`, `close_range` and TCP sends under a storm never failing with `EINTR` and leaving no
+  descriptor behind, and the program traced by
   `udpchains` and refused `PTRACE_TRACEME`; a signal during a hung handshake handled at once and
   the send made again (`test_supervise abandon`, against `test_supervise silent`), and `SIGTERM`
   then ending the program at once; the program killed with the supervisor; a refusal to start
-  under `strace -f`; the leak client, static and dynamic, against a dead proxy sending nothing; a UDP
+  under `strace -f`; the lifecycle probe (`test_supervise lifecycle`, FR-SV-11, FR-SV-T3):
+  threads each with a socket, four waiting on one, threads under a storm of signals, a thread with
+  its own table (its socket placed by its own table, and a socket only it holds kept by the sweep),
+  `clone(CLONE_FILES)`, `close_range` with and without `CLOSE_RANGE_CLOEXEC`, `posix_spawn`, `exec`
+  from the first thread and from another, and the close-on-exec socket's association let go after
+  an `exec`; the leak client, static and dynamic, against a dead proxy sending nothing; a UDP
   socket received from an unsupervised process refused on every send route but D-50's `write()`
   gap, which delivers its one byte; and an inherited UDP socket refusing the run.
 - `FR-SV-T1-matrix`: the hook matrix, built `-static`, under the supervisor, directly and through
@@ -913,3 +942,7 @@ shim mode, naming the process and descriptor (FR-C-06).
   socket is carried.
 - Under ASan and UBSan in `run_sanitizers.sh`: the script, and the static matrix and fidelity
   tests, with the supervisor instrumented.
+- By hand, as root, `tests/test_failclosed_capture.sh` (FR-SV-T2): the static probe unsupervised
+  as a positive control, then supervised with the proxy unreachable, refusing `ASSOCIATE`, and
+  each hop of three dead, and `udpchains` killed while the program sends through a proxy that
+  drops every datagram; no packet to the destination on the wire in any.

@@ -9,9 +9,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/kcmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -135,16 +137,14 @@ static bool descends_from(const struct proc *procs, size_t n, pid_t pid, pid_t s
 	return false;
 }
 
-/* Marks every carried socket that pid holds at a descriptor in the range.
- * False if its descriptors cannot be read, which says nothing about what it
- * holds. */
-static bool mark_held(pid_t pid, unsigned range_start)
+/* Marks every carried socket held at a descriptor in the range of the table
+ * listed at path.  False if it cannot be read, which says nothing about what
+ * it holds. */
+static bool mark_table(const char *path, unsigned range_start)
 {
-	char path[64];
 	struct dirent *e;
 	DIR *d;
 
-	snprintf(path, sizeof(path), "/proc/%d/fd", (int)pid);
 	d = opendir(path);
 	if (d == NULL)
 		return errno == ENOENT; /* gone: holds nothing */
@@ -170,6 +170,40 @@ static bool mark_held(pid_t pid, unsigned range_start)
 			for (s = g_bucket[b]; s != NULL; s = s->next)
 				if (s->ino == ino)
 					s->seen = true;
+	}
+	closedir(d);
+	return true;
+}
+
+/* Marks every carried socket pid holds in the range: in its table, and in that
+ * of any thread of it with a table of its own (unshare(CLONE_FILES)), as
+ * kcmp(2) tells.  False if any cannot be read. */
+static bool mark_held(pid_t pid, unsigned range_start)
+{
+	char path[96];
+	struct dirent *e;
+	DIR *d;
+
+	snprintf(path, sizeof(path), "/proc/%d/fd", (int)pid);
+	if (!mark_table(path, range_start))
+		return false;
+	snprintf(path, sizeof(path), "/proc/%d/task", (int)pid);
+	d = opendir(path);
+	if (d == NULL)
+		return true; /* gone since: what it held went with it */
+	while ((e = readdir(d)) != NULL) {
+		long tid;
+
+		if (!isdigit((unsigned char)e->d_name[0]))
+			continue;
+		tid = strtol(e->d_name, NULL, 10);
+		if (tid == pid || syscall(SYS_kcmp, pid, (pid_t)tid, KCMP_FILES, 0, 0) == 0)
+			continue;
+		snprintf(path, sizeof(path), "/proc/%d/task/%ld/fd", (int)pid, tid);
+		if (!mark_table(path, range_start) && errno != ENOENT) {
+			closedir(d);
+			return false;
+		}
 	}
 	closedir(d);
 	return true;

@@ -202,6 +202,24 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
    - **The result:** no datagram lost, send repeated or `close` left undone, under storms of
      signals.
 5. `fork`, threads and `exec`; the refused routes; the supervisor-killed test; the wire capture.
+   *Done 2026-10-23,* except the capture's run as root, which is by hand. A static probe covers:
+   - threads each with a socket, several waiting on one, and threads under a storm of signals;
+   - a thread with its own descriptor table;
+   - `clone(CLONE_FILES)`, `close_range`, `posix_spawn`, and `exec` from the first thread and
+     from another.
+
+   Fixed on the way:
+   - a thread with its own table was looked up in its process's (D-50);
+   - an `exec` did not prompt a sweep;
+   - the supervisor could wait for ever on a traced leader whose threads had not been reaped.
+
+   The capture gains supervised cases, including `udpchains` killed while the program sends;
+   run as root by the maintainer, all 40 cases passed.
+
+   Also found: the calls still notified failed with `EINTR` under signals, often with threads
+   (`socket()` 252 times in 20,000), and an interrupted `close_range` left descriptors open. D-54
+   was amended: every call is now traced, and notification is kept only to install a descriptor,
+   with the thread's signals blocked meanwhile. None fails with `EINTR` now.
 6. DNS. Then aarch64, interop, `make compare`, and documentation.
 
 ## 8. Risks and open questions
@@ -237,7 +255,8 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
 - **A thread with its own descriptor table.** A notification names a thread; the supervisor reads
   the descriptor through its process (`pidfd_open` takes a process before Linux 6.9). A thread
   that has unshared its descriptor table (`unshare(CLONE_FILES)`) would be checked against the
-  wrong table. Rare; step 5 (threads) settles it.
+  wrong table. Rare; step 5 (threads) settles it. *Settled in step 5 (D-50):* such a thread is
+  reached through a thread pidfd on Linux 6.9 and later, and fails closed before.
 - **Clean room (D-01).** graftcp is GPL-3.0 and must not be read. The design comes from the man
   pages: `seccomp(2)`, `seccomp_unotify(2)`, `pidfd_getfd(2)`, `process_vm_readv(2)`, `ptrace(2)`
   (for the access rules).
@@ -287,6 +306,8 @@ the mode is built (FR-SV-19). Each is explained in its record.
     sends, but not by `write` and `read` there;
   - stdio on a UDP socket is carried, where the shim refuses it (D-36): a difference between the
     modes, not a limitation.
+- **Found in step 5** (D-50): before Linux 6.9, a thread with a descriptor table of its own
+  (`unshare(CLONE_FILES)`) is refused its UDP calls, with a diagnostic.
 - **Found in step 4** (D-54):
   - the program is traced by the supervisor, so it cannot be debugged with `gdb` or `strace` from
     inside the supervision, a program that uses `ptrace` itself gets `EPERM`, and `udpchains`
@@ -294,6 +315,5 @@ the mode is built (FR-SV-19). Each is explained in its record.
   - a program built with LeakSanitizer cannot run its leak check, which uses `ptrace`;
   - a send or receive whose association setup is abandoned for a signal is made again once the
     signal is handled, never failing with `EINTR`;
-  - `socket()` and the other calls still notified can fail with `EINTR` when a signal arrives
-    while the supervisor holds them, where `socket()` natively never does; nothing is lost or
-    repeated.
+  - an install interrupted by `SIGSTOP`, or by a signal pending before its mask was set, is made
+    again once the signal is handled (D-54, as amended in step 5).

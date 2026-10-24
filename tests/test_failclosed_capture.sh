@@ -15,6 +15,9 @@
 # nothing can answer.  Pass a real proxy's destination instead to run this
 # against a real deployment.
 #
+# Supervisor mode (FR-SV-T2) is checked too, with a static client, and with the
+# supervisor killed while the program sends.
+#
 # THE POSITIVE CONTROL IS THE POINT.  A capture that sees nothing because the
 # filter or interface is wrong would "pass" every fail-closed assertion while
 # proving nothing.  So the first case runs the client WITHOUT the shim and
@@ -358,6 +361,97 @@ if command -v getent > /dev/null 2>&1; then
 	fi
 else
 	echo "# SKIP D-22 lookups -- getent not installed"
+fi
+
+# --- 6. supervisor mode (FR-SV-T2) -----------------------------------------
+#
+# The same cases for a static client, which only the supervisor can see, and
+# one the shim cannot have: the supervisor killed while the program sends.
+# Its proxy accepts the association and drops every datagram, so nothing it
+# relays reaches the destination either: any packet to the destination is the
+# program sending on its own (D-54: it is killed with the supervisor).
+if [ -x "$BUILD/test_supervise" ] && [ -x "$BUILD/leakclient-static" ]; then
+	got=$(capture_run svcontrol "$BUILD/test_supervise" spray "$DEST" "$DPORT" 1)
+	if [ "${got:-0}" -gt 0 ]; then
+		ok "SUPERVISOR POSITIVE CONTROL: the static probe unsupervised IS captured ($got packets)"
+	else
+		notok "SUPERVISOR POSITIVE CONTROL FAILED: the static probe was not captured; the supervisor cases would prove nothing"
+	fi
+
+	got=$(capture_run svdead "$WRAPPER" -q --supervise -p 127.0.0.1:9 \
+		"$BUILD/leakclient-static" "$DEST" "$DPORT")
+	sent=$(sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p' "$TMP/svdead.client")
+	[ "${sent:-x}" = "0" ] && ok "supervised, unreachable proxy: every send fails" \
+		|| notok "supervised, unreachable proxy: $sent sends succeeded, want 0"
+	[ "${got:-1}" -eq 0 ] && ok "supervised, unreachable proxy: ZERO packets on the wire" \
+		|| notok "LEAK: $got packets reached the wire from a supervised program with the proxy down"
+
+	got=$(capture_run svrefused "$WRAPPER" -q --supervise -p "127.0.0.1:$RPORT" \
+		"$BUILD/leakclient-static" "$DEST" "$DPORT")
+	sent=$(sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p' "$TMP/svrefused.client")
+	[ "${sent:-x}" = "0" ] && ok "supervised, refused ASSOCIATE: every send fails" \
+		|| notok "supervised, refused ASSOCIATE: $sent sends succeeded, want 0"
+	[ "${got:-1}" -eq 0 ] && ok "supervised, refused ASSOCIATE: ZERO packets on the wire" \
+		|| notok "LEAK: $got packets reached the wire from a supervised program after a refused ASSOCIATE"
+
+	for dead in 1 2 3; do
+		case $dead in
+		1) chain="127.0.0.1:9,127.0.0.1:$LPORT,127.0.0.1:$L2PORT" ;;
+		2) chain="127.0.0.1:$LPORT,127.0.0.1:9,127.0.0.1:$L2PORT" ;;
+		3) chain="127.0.0.1:$LPORT,127.0.0.1:$L2PORT,127.0.0.1:9" ;;
+		esac
+		got=$(capture_run "svchain$dead" env "UDPCHAINS_PROXY=$chain" \
+			"$WRAPPER" -q --supervise "$BUILD/leakclient-static" "$DEST" "$DPORT")
+		sent=$(sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p' "$TMP/svchain$dead.client")
+		[ "${sent:-x}" = "0" ] && ok "supervised, hop $dead of 3 dead: every send fails" \
+			|| notok "supervised, hop $dead of 3 dead: $sent sends succeeded, want 0"
+		[ "${got:-1}" -eq 0 ] && ok "supervised, hop $dead of 3 dead: ZERO packets on the wire" \
+			|| notok "LEAK: $got packets reached the wire from a supervised program with hop $dead of 3 dead"
+	done
+
+	: > "$TMP/drop.out"
+	"$BUILD/socks5d" --port 0 --drop-nth 1 --quiet > "$TMP/drop.out" 2>&1 &
+	PIDS+=($!)
+	DROPPORT=""
+	for ((i = 0; i < 100; i++)); do
+		DROPPORT=$(awk '/^PORT/{print $2; exit}' "$TMP/drop.out" 2>/dev/null)
+		[ -n "$DROPPORT" ] && break
+		sleep 0.05
+	done
+	# udpchains is killed a second into four seconds of sending; the
+	# capture runs on for the rest of them.
+	killed_midrun() {
+		local w prog="" i
+
+		"$WRAPPER" -q --supervise -p "127.0.0.1:$DROPPORT" \
+			"$BUILD/test_supervise" spray "$DEST" "$DPORT" 4 > "$TMP/killed.sent" 2>&1 &
+		w=$!
+		for ((i = 0; i < 100; i++)); do
+			prog=$(pgrep -P "$w" -x test_supervise)
+			[ -n "$prog" ] && break
+			sleep 0.05
+		done
+		sleep 1
+		kill -KILL "$w"
+		wait "$w" 2>/dev/null
+		sleep 0.5
+		if [ -n "$prog" ] && [ ! -e "/proc/$prog" ]; then
+			echo gone
+		else
+			echo "alive ${prog:-not found}"
+		fi > "$TMP/killed.prog"
+		sleep 3
+	}
+	got=$(capture_run killed killed_midrun)
+	sent=$(grep -c '^SENT' "$TMP/killed.sent" || true)
+	[ "${sent:-0}" -gt 0 ] && ok "supervisor killed mid-run: the program was sending ($sent sends carried first)" \
+		|| notok "supervisor killed mid-run: the program never sent, so this case proved nothing"
+	[ "$(cat "$TMP/killed.prog")" = gone ] && ok "supervisor killed mid-run: the program died with it" \
+		|| notok "supervisor killed mid-run: the program outlived it ($(cat "$TMP/killed.prog"))"
+	[ "${got:-1}" -eq 0 ] && ok "supervisor killed mid-run: ZERO packets on the wire" \
+		|| notok "LEAK: $got packets reached the wire after the supervisor was killed"
+else
+	echo "# SKIP supervisor mode -- build/test_supervise or leakclient-static missing (make tests)"
 fi
 
 echo "#"

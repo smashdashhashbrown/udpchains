@@ -263,6 +263,38 @@ nfd=$(ls "/proc/$svpid/fd" 2> /dev/null | wc -l)
 wait "$churn"
 check "and the program exits 0" "$?" 0
 
+echo "# threads, fork, vfork, clone, exec and close_range (FR-SV-11, FR-SV-T3)"
+"${SV[@]}" "$P" lifecycle "$ECHO" > "$TMP/lifecycle.tap" 2> /dev/null &
+pid=$!
+(sleep 120; kill -KILL "$pid") 2> /dev/null &
+dog=$!
+# While the exec'd program waits, the supervisor should hold one control
+# connection: the inherited socket's, the close-on-exec one's let go once the
+# exec closed it.  Descriptors 0 to 2 are not the supervisor's own.
+for ((i = 0; i < 600; i++)); do
+	grep -q '^# waiting' "$TMP/lifecycle.tap" 2> /dev/null && break
+	sleep 0.05
+done
+nsock=0
+for f in /proc/$pid/fd/*; do
+	fd=${f##*/}
+	[ "$fd" -ge 3 ] && [[ $(readlink "$f" 2> /dev/null) == socket:* ]] && nsock=$((nsock + 1))
+done
+wait "$pid"
+rc=$?
+kill "$dog" 2> /dev/null
+sed 's/^/#   /' "$TMP/lifecycle.tap"
+check "test_supervise lifecycle passes, -static" "$rc" 0
+check "after an exec, the close-on-exec socket's association is let go" "$nsock" 1
+
+# A traced leader's exit is reported only once its other threads have been
+# reaped; waiting for the program alone hung about one run in three.
+bad=0
+for ((i = 0; i < 20; i++)); do
+	timeout -k 2 10 "${SV[@]}" "$P" threadexit > /dev/null 2>&1 || bad=$((bad + 1))
+done
+check "20 runs of a program whose threads exit first: none hung or failed" "$bad" 0
+
 echo "# fail-closed: with the proxy down, nothing is sent (SEC-01)"
 before=$(echoed)
 # A sanitiser build's leakclient cannot run LeakSanitizer once supervised, as

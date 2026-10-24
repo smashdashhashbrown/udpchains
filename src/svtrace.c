@@ -25,6 +25,7 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,6 +97,20 @@ static void again_at_exit(regs_t *r)
 	r->rip -= 2;
 }
 
+/* A call to be installed by notification: marked in its sixth argument. */
+static void mark_install(regs_t *r)
+{
+	r->r9 = SV_INSTALL_MARK;
+}
+
+/* A result that says a call was interrupted before it could be answered:
+ * EINTR, or one of the kernel's restart codes (ERESTARTSYS to
+ * ERESTART_RESTARTBLOCK, 512 to 516), seen at a syscall-exit stop. */
+static bool interrupted(long long ret)
+{
+	return ret == -EINTR || (ret <= -512 && ret >= -516);
+}
+
 /* The receive's wait, in the program's own kernel: a zero-length peek on the
  * same descriptor blocks until a datagram is queued, and takes nothing. */
 static void as_peek(regs_t *r)
@@ -108,13 +123,15 @@ static void as_peek(regs_t *r)
 	r->r9 = 0;
 }
 
-/* --- receives waiting -------------------------------------------------------*/
+/* --- calls waiting ----------------------------------------------------------*/
 
-/* A thread waiting in its peek: its registers as the program made the call,
- * put back when the peek returns, and the call as svcall_traced left it. */
+/* A thread let go on with its call rewritten or marked, until the call
+ * returns: its registers as the program made the call, put back then, and
+ * the call as svcall_traced left it. */
 struct waiting {
 	regs_t regs;
 	struct sv_traced t;
+	uint64_t mask;   /* SV_INSTALL: the thread's own signal mask */
 	struct waiting *next;
 };
 
@@ -208,12 +225,36 @@ static void with_abandon(struct sv *sv, struct sv_traced *t, long long peeked, b
 
 /* --- stops ------------------------------------------------------------------*/
 
+/* Every signal but SIGKILL and SIGSTOP, which cannot be blocked. */
+static const uint64_t g_all_blocked = ~0ULL;
+
+/* Lets tid go on with its call as r now has it, until the call returns:
+ * stopped again then, at its exit (PTRACE_SYSCALL).  False if out of
+ * memory. */
+static bool let_go_until_return(pid_t tid, const regs_t *program, const regs_t *r,
+                                const struct sv_traced *t, uint64_t mask)
+{
+	struct waiting *w = calloc(1, sizeof(*w));
+
+	if (w == NULL)
+		return false;
+	forget(tid);
+	w->regs = *program;
+	w->t = *t;
+	w->mask = mask;
+	w->next = g_wait[(unsigned)tid % NWAIT];
+	g_wait[(unsigned)tid % NWAIT] = w;
+	set_regs(tid, r);
+	(void)ptrace(PTRACE_SYSCALL, tid, 0, 0);
+	return true;
+}
+
 /* A traced call's entry. */
 static void on_entry(struct sv *sv, pid_t tid)
 {
 	struct sv_traced t;
-	struct waiting *w;
-	regs_t r;
+	uint64_t mask = 0;
+	regs_t r, program;
 
 	if (get_regs(tid, &r) != 0)
 		return; /* killed while stopped */
@@ -222,45 +263,74 @@ static void on_entry(struct sv *sv, pid_t tid)
 	t.copy = -1;
 	call_of(&r, &t);
 	with_abandon(sv, &t, 0, false);
+	program = r;
 
 	switch (t.verdict) {
 	case SV_RETURN:
 		skip_returning(&r, t.ret);
 		break;
 	case SV_NATIVE:
-		break;
+		(void)ptrace(PTRACE_CONT, tid, 0, 0);
+		return;
 	case SV_AGAIN:
 		again_at_entry(&r);
 		break;
 	case SV_WAIT:
-		w = calloc(1, sizeof(*w));
-		if (w == NULL) {
-			close(t.copy);
-			skip_returning(&r, -ENOMEM);
-			break;
-		}
-		forget(tid);
-		w->regs = r;
-		w->t = t;
-		w->next = g_wait[(unsigned)tid % NWAIT];
-		g_wait[(unsigned)tid % NWAIT] = w;
 		as_peek(&r);
-		set_regs(tid, &r);
 		/* Stopped again when the peek returns. */
-		(void)ptrace(PTRACE_SYSCALL, tid, 0, 0);
-		return;
+		if (let_go_until_return(tid, &program, &r, &t, 0))
+			return;
+		close(t.copy);
+		r = program;
+		skip_returning(&r, -ENOMEM);
+		break;
+	case SV_INSTALL:
+		/* No signal can interrupt the notification, so none can
+		 * part the descriptor installed from the call returning it.
+		 * SIGSTOP and SIGKILL, which cannot be blocked, still can: the
+		 * call is then made again (on_exit_stop). */
+		if (ptrace(PTRACE_GETSIGMASK, tid, (void *)sizeof(mask), &mask) == 0 &&
+		    ptrace(PTRACE_SETSIGMASK, tid, (void *)sizeof(g_all_blocked),
+		           &g_all_blocked) == 0) {
+			mark_install(&r);
+			if (let_go_until_return(tid, &program, &r, &t, mask))
+				return;
+			(void)ptrace(PTRACE_SETSIGMASK, tid, (void *)sizeof(mask), &mask);
+		}
+		r = program;
+		skip_returning(&r, -ENOMEM);
+		break;
 	}
 	set_regs(tid, &r);
 	(void)ptrace(PTRACE_CONT, tid, 0, 0);
 }
 
-/* A waiting receive's peek has returned. */
+/* A call let go on until it returned has returned: a waiting receive's peek,
+ * or an install's notification. */
 static void on_exit_stop(struct sv *sv, pid_t tid)
 {
 	struct waiting **pp = wait_slot(tid), *w = *pp;
 	regs_t r;
 
 	if (w == NULL || get_regs(tid, &r) != 0) {
+		(void)ptrace(PTRACE_CONT, tid, 0, 0);
+		return;
+	}
+	if (w->t.verdict == SV_INSTALL) {
+		long long ret = (long long)r.rax;
+
+		/* Interrupted before it was answered, by a signal pending
+		 * from before its mask was set, or by SIGSTOP: nothing was
+		 * installed, and the call is made again once the signal is
+		 * handled -- as socket() natively never fails with EINTR. */
+		r = w->regs;
+		if (interrupted(ret))
+			again_at_exit(&r);
+		else
+			r.rax = (unsigned long long)ret;
+		set_regs(tid, &r);
+		(void)ptrace(PTRACE_SETSIGMASK, tid, (void *)sizeof(w->mask), &w->mask);
+		forget(tid);
 		(void)ptrace(PTRACE_CONT, tid, 0, 0);
 		return;
 	}
@@ -306,9 +376,13 @@ static void on_stop(struct sv *sv, pid_t tid, int st)
 	}
 	if (event != 0) {
 		/* fork, vfork, clone or exec.  An exec ends every other
-		 * thread, and may give the execing one the leader's number. */
-		if (event == PTRACE_EVENT_EXEC)
+		 * thread, and may give the execing one the leader's number;
+		 * and it closes the close-on-exec descriptors, which the
+		 * sweep notices (FR-SV-11). */
+		if (event == PTRACE_EVENT_EXEC) {
 			forget(tid);
+			sv_sweep_soon(sv);
+		}
 		(void)ptrace(PTRACE_CONT, tid, 0, 0);
 		return;
 	}

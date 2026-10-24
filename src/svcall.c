@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/kcmp.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stddef.h>
@@ -72,6 +73,8 @@ struct call {
 	const struct seccomp_notif *req; /* for a traced call, made from its registers */
 	pid_t tgid;  /* 0 until looked up */
 	int pidfd;   /* -1 until looked up; the cache's, never closed here */
+	bool own_pidfd;    /* pidfd is this call's, a thread's: closed after it */
+	bool own_table;    /* a thread with a table of its own, unreachable */
 	bool traced; /* stopped by ptrace (D-54), not notified */
 	bool native; /* traced: to run in the kernel as made */
 	long long ret;     /* traced: the result, or -errno */
@@ -119,7 +122,7 @@ static enum sv_outcome let_through(struct call *c)
  * another: a refused raw socket does not silence a refused io_uring. */
 enum {
 	WHY_RAW, WHY_ICMP, WHY_URING, WHY_PIDFD, WHY_UNKNOWN_FD, WHY_RECEIVED_FD,
-	WHY_DUP_OUT, WHY_NOT_INSPECTABLE, WHY_COUNT
+	WHY_DUP_OUT, WHY_NOT_INSPECTABLE, WHY_OWN_TABLE, WHY_COUNT
 };
 static struct udpc_ratelimit g_rl_refuse[WHY_COUNT];
 
@@ -165,6 +168,13 @@ static void refused(const struct call *c, int reason, const char *why)
  * the diagnostic says why, so the cause is not mistaken for a fault. */
 static void refused_uninspectable(const struct call *c)
 {
+	if (c->own_table) {
+		refused(c, WHY_OWN_TABLE, "the thread has a descriptor table of its own "
+		                          "(unshare(CLONE_FILES)), which this kernel lets the "
+		                          "supervisor reach only from Linux 6.9, so the call is "
+		                          "not let through unchecked");
+		return;
+	}
 	refused(c, WHY_NOT_INSPECTABLE, "the process cannot be inspected: it has made "
 	                                "itself non-dumpable, or ptrace access to it is "
 	                                "restricted, so the call is not let through "
@@ -242,7 +252,44 @@ static void forget_pidfd(pid_t tgid)
 		}
 }
 
-/* The calling thread's process, and a descriptor for it.  -1 if it has gone. */
+#ifndef PIDFD_THREAD
+#define PIDFD_THREAD O_EXCL /* Linux 6.9 */
+#endif
+
+/* Whether a thread's descriptor table is not its process's: 1 if it has one
+ * of its own (unshare(CLONE_FILES)), 0 if they share one, -1 if it cannot be
+ * told (kcmp(2), which needs CONFIG_KCMP). */
+static int own_table(pid_t tgid, pid_t tid)
+{
+	long r = syscall(SYS_kcmp, tgid, tid, KCMP_FILES, 0, 0);
+
+	return r < 0 ? -1 : r != 0;
+}
+
+/* A thread with its own descriptor table is reached through a pidfd for the
+ * thread itself, which pidfd_getfd() reads that table through (Linux 6.9).
+ * Returns it, or -1 with own_table set if the thread has its own table and
+ * cannot be reached, or -1 alone if the answer is to use the process's. */
+static int thread_pidfd(struct call *c, pid_t tid)
+{
+	int differs = own_table(c->tgid, tid), fd;
+
+	if (differs == 0)
+		return -1;
+	fd = (int)syscall(SYS_pidfd_open, tid, PIDFD_THREAD);
+	if (fd >= 0) {
+		c->own_pidfd = true;
+		return fd;
+	}
+	/* Without kcmp, every thread is taken to share its process's table,
+	 * as before Linux 6.9 there is no other way to reach it. */
+	c->own_table = differs == 1;
+	return -1;
+}
+
+/* The calling thread's process, and a descriptor for it: for a thread with a
+ * table of its own, a descriptor for the thread.  -1 if it has gone, or with
+ * own_table set if its table cannot be reached. */
 static int process_of(struct call *c)
 {
 	pid_t tid = (pid_t)c->req->pid;
@@ -251,6 +298,8 @@ static int process_of(struct call *c)
 
 	if (c->pidfd >= 0)
 		return c->pidfd;
+	if (c->own_table)
+		return -1;
 	/* Most calls come from a process's first thread, whose number is the
 	 * process's. */
 	fd = cached_pidfd(tid);
@@ -261,6 +310,13 @@ static int process_of(struct call *c)
 	}
 	c->tgid = tgid_of(tid);
 	if (c->tgid <= 0)
+		return -1;
+	fd = thread_pidfd(c, tid);
+	if (fd >= 0) {
+		c->pidfd = fd;
+		return fd;
+	}
+	if (c->own_table)
 		return -1;
 	fd = cached_pidfd(c->tgid);
 	if (fd < 0) {
@@ -288,12 +344,14 @@ static int copy_of(struct call *c, int fd)
 	for (attempt = 0; attempt < 2; attempt++) {
 		int pidfd = process_of(c);
 
+		if (pidfd < 0 && c->own_table)
+			return -EPERM;
 		if (pidfd < 0)
 			return still_pending(c) ? -ESRCH : -ENOENT;
 		copy = (int)syscall(SYS_pidfd_getfd, pidfd, fd, 0);
 		if (copy >= 0)
 			break;
-		if (errno != ESRCH)
+		if (errno != ESRCH || c->own_pidfd)
 			return -errno;
 		/* The cached process has gone; look again. */
 		forget_pidfd(c->tgid);
@@ -333,7 +391,7 @@ static int free_number(struct call *c, unsigned from)
 	int pidfd = process_of(c);
 
 	if (pidfd < 0)
-		return -ESRCH;
+		return c->own_table ? -EPERM : -ESRCH;
 	if (prlimit(c->tgid, RLIMIT_NOFILE, NULL, &rl) == 0 && rl.rlim_cur < limit)
 		limit = (unsigned long)rl.rlim_cur;
 	if (from < c->sv->range)
@@ -1060,8 +1118,13 @@ static enum sv_outcome do_name(struct call *c, struct sv_sock *s, int copy)
  * range too (FR-SV-04). */
 static enum sv_outcome do_dup(struct call *c, int copy, unsigned from, bool cloexec)
 {
-	int n = free_number(c, from), rc;
+	int n, rc;
 
+	if (c->traced) {
+		close(copy);
+		return SV_TO_INSTALL; /* by notification, as socket() */
+	}
+	n = free_number(c, from);
 	if (n < 0) {
 		close(copy);
 		return answer(c, 0, -n);
@@ -1166,6 +1229,9 @@ static enum sv_outcome decide_socket(struct call *c)
 	}
 	if (kind != SOCK_DGRAM)
 		return let_through(c); /* TCP and the rest: not carried */
+	/* Installed by notification, the call made again marked (D-54). */
+	if (c->traced)
+		return SV_TO_INSTALL;
 
 	/* D-50: a UDP socket is made here, and placed in the program at a
 	 * number in the reserved range, where every call on it comes to the
@@ -1340,11 +1406,19 @@ static enum sv_outcome decide(struct call *c)
 	return decide_other(c, copy);
 }
 
+/* After a call: a thread's own pidfd is not cached. */
+static void done(struct call *c)
+{
+	if (c->own_pidfd)
+		close(c->pidfd);
+}
+
 enum sv_outcome svcall_decide(struct sv *sv)
 {
-	struct call c = { sv, sv->req, 0, -1, false, false, 0, -1, 0 };
+	struct call c = { sv, sv->req, 0, -1, false, false, false, false, 0, -1, 0 };
 	enum sv_outcome o = decide(&c);
 
+	done(&c);
 	if (o == SV_PARKED) {
 		/* The filter traces every receive in the range (D-54), so none
 		 * can wait here; were one to, it would be told to try again
@@ -1364,7 +1438,7 @@ static void traced_call(struct sv *sv, const struct sv_traced *t, struct seccomp
 	req->pid = (__u32)t->tid;
 	req->data.nr = t->nr;
 	memcpy(req->data.args, t->args, sizeof(req->data.args));
-	*c = (struct call){ sv, req, 0, -1, true, false, -ENOSYS, -1, 0 };
+	*c = (struct call){ sv, req, 0, -1, false, false, true, false, -ENOSYS, -1, 0 };
 }
 
 void svcall_traced(struct sv *sv, struct sv_traced *t)
@@ -1375,11 +1449,14 @@ void svcall_traced(struct sv *sv, struct sv_traced *t)
 
 	traced_call(sv, t, &req, &c);
 	o = decide(&c);
+	done(&c);
 	t->copy = -1;
 	if (o == SV_PARKED) {
 		t->verdict = SV_WAIT;
 		t->copy = c.wait_copy;
 		t->cookie = c.wait_cookie;
+	} else if (o == SV_TO_INSTALL) {
+		t->verdict = SV_INSTALL;
 	} else if (c.native) {
 		t->verdict = SV_NATIVE;
 	} else {
@@ -1424,6 +1501,7 @@ void svcall_waited(struct sv *sv, struct sv_traced *t, long long peeked)
 		return;
 	}
 	r = recv_all(&c, s, t->copy, fd);
+	done(&c);
 	if (r == -EAGAIN)
 		t->verdict = SV_AGAIN; /* another reader took it: wait again */
 	else

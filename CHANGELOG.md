@@ -16,7 +16,7 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 - **Supervisor mode** (D-48 to D-54), in progress, for static and Go binaries, which the shim
   cannot see. `udpchains --supervise` (or `supervise = yes`, or `UDPCHAINS_SUPERVISE=1`) runs the
   program under a seccomp filter whose calls udpchains answers, instead of preloading the shim.
-  - **So far** (steps 2 to 4 of `docs/FUTURE-STATIC-BINARIES.md`): a static program's UDP is
+  - **So far** (steps 2 to 5 of `docs/FUTURE-STATIC-BINARIES.md`): a static program's UDP is
     carried through the proxy or chain. The supervisor makes each UDP socket in a reserved range
     of descriptors (768 and up) and performs its sends and receives there: headers added and
     checked, the true sender reported, blocking and non-blocking receives, `SO_RCVTIMEO`,
@@ -30,6 +30,15 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     waits in the program's own kernel, so `SO_RCVTIMEO`, `EINTR` and `SA_RESTART` behave exactly
     as natively. A signal arriving while an association is set up is handled at once. If
     `udpchains` is killed, so is the program.
+  - **Threads, `fork`, `vfork`, `clone` and `exec`** (step 5): followed and tested. A thread with
+    a descriptor table of its own is reached through a thread pidfd (Linux 6.9), and the sweep
+    for closed sockets reads its table too; an `exec` prompts a sweep. Fixed: a traced program
+    whose threads exited before it could leave `udpchains` waiting for ever.
+  - **Every supervised call is now handled while its thread is stopped** (D-54, amended): the
+    checks below the range, `close_range` and the refusals too. Notification is kept only to
+    install a descriptor, with the thread's signals blocked meanwhile. So `socket()`, `dup`,
+    `close_range` and TCP sends no longer fail with `EINTR` under signals, and an interrupted
+    `close_range` no longer leaves descriptors open.
   - **Refused, as decided:** raw, packet, ICMP and UDP-Lite sockets; `io_uring_setup`;
     `pidfd_getfd`; sends, connects, `sendfile` and `splice` on a UDP socket received from another
     process; `dup2` of a carried socket below the range; and starting with an inherited UDP
@@ -41,8 +50,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     - a blocking `recvmmsg` returns the datagrams already queued rather than waiting for all;
     - the program is traced, so it cannot be debugged with `gdb` or `strace` from inside, and
       `udpchains` refuses to start under `strace -f`;
-    - a program built with LeakSanitizer cannot run its leak check.
-  - **Not yet:** threads, DNS redirection, aarch64. Not yet in the README, man page or
+    - a program built with LeakSanitizer cannot run its leak check;
+    - before Linux 6.9, a thread with a descriptor table of its own is refused its UDP calls.
+  - **Not yet:** DNS redirection, aarch64. Not yet in the README, man page or
     `udpchains -h`.
 
 ### Changed
@@ -55,8 +65,8 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 2287 assertions across 26 groups. Supervisor mode adds `unit-supervise` (11), 6 to
-  unit-config, `FR-SV-supervise` (43 checks, with static probes making 18, 6, 37, 19 and 4
+- 2290 assertions across 26 groups. Supervisor mode adds `unit-supervise` (11), 6 to
+  unit-config, `FR-SV-supervise` (46 checks, with static probes making 18, 6, 37, 25, 4 and 24
   assertions), the hook matrix built `-static` under the supervisor (108, and 108 more through two
   hops), and the fidelity test built `-static` under it (172). The supervisor also runs under ASan and UBSan,
   with the static matrix and fidelity tests.

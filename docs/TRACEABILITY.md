@@ -25,7 +25,7 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 2287 assertions across 26 groups (`tests/run.sh`), all passing, plus the 91-check
+**Test totals:** 2290 assertions across 26 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
@@ -51,7 +51,7 @@ from a run rather than editing it by hand.
 | wrapper loadability | 17 |
 | TST-03 leak | 23 checks |
 | fault injection | 43 |
-| FR-SV supervisor mode | 43 checks, five of them running static probes making 18, 6, 37, 19 and 4 assertions of their own |
+| FR-SV supervisor mode | 46 checks, six of them running static probes making 18, 6, 37, 25, 4 and 24 assertions of their own |
 | FR-SV-T1 hook matrix, `-static`, under the supervisor | 108 |
 | FR-SV-T1 the same through 2 hops | 108 |
 | FR-SV fidelity, `-static`, under the supervisor | 172 |
@@ -211,10 +211,10 @@ means no code yet.
 ## Supervisor mode (§2b), in progress
 
 Not part of v1 scope, and not counted in the summary above. Design: D-48 to D-53, decided
-2026-10-22, and D-54, 2026-10-23. Steps 2 to 4 of the plan are built: the supervisor runs a
+2026-10-22, and D-54, 2026-10-23. Steps 2 to 5 of the plan are built: the supervisor runs a
 program under its filter and carries its UDP, for x86-64, with calls on its UDP sockets made while
-their thread is stopped by `ptrace`, so signals lose nothing. Threads and the wire capture
-(step 5), DNS and aarch64 (step 6) remain. The accepted limitations are listed in
+their thread is stopped by `ptrace`, so signals lose nothing, and follows its threads, children
+and `exec`s. The wire capture's run as root is by hand. DNS and aarch64 (step 6) remain. The accepted limitations are listed in
 [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §9.
 
 | ID | Pri | Test | Status |
@@ -229,9 +229,9 @@ their thread is stopped by `ptrace`, so signals lose nothing. Threads and the wi
 | FR-SV-08 | M | FR-SV-supervise | **Verified** (D-54) — `O_NONBLOCK` and `MSG_DONTWAIT` give `EAGAIN` at once; a blocking receive waits in the program's own kernel, so `SO_RCVTIMEO` times out with `EAGAIN`, a signal gives `EINTR` without `SA_RESTART` and a restart with it, and with `SO_RCVTIMEO` set `EINTR` even under `SA_RESTART` and after `SIGSTOP`/`SIGCONT`, as signal(7) says. No datagram lost: 100 datagrams under a signal every 2 ms, with and without `SA_RESTART`, and 1,000 under one every 100 µs, each run; 20 runs gave 5,293 interrupted receives and no loss |
 | FR-SV-09 | M | FR-SV-supervise | **Partial** — `io_uring_setup` `ENOSYS`, `pidfd_getfd` `EPERM`, raw and packet sockets `EPERM`, ICMP datagram sockets `EPROTONOSUPPORT`, and `sendfile`/`splice` onto a received UDP socket `EINVAL`, each with a diagnostic not hidden by another's, from a static probe. `sendfile`/`splice` onto a carried socket `EINVAL` (FR-SV-fidelity) |
 | FR-SV-10 | M | FR-SV-supervise, FR-SV-fidelity | **Verified** — `getsockname` reports the bound address with the port the kernel chose; `getpeername` the connected destination, never the relay, and `ENOTCONN` unconnected or after `connect(AF_UNSPEC)` |
-| FR-SV-11 | M | FR-SV-supervise | **Partial** — the supervisor exits with the program's status, or dies of the signal that killed it; signals sent to it reach the program, and one the program handles is handled; it stays for a descendant the program leaves running, which is supervised. State is kept per socket, so a socket inherited across `fork` is carried in the child, including after the parent has closed its descriptor. Threads, `exec` and their tests: step 5 |
+| FR-SV-11 | M | FR-SV-supervise | **Verified** — the supervisor exits with the program's status, or dies of the signal that killed it; signals sent to it reach the program; it stays for a descendant the program leaves running, which is supervised. A static probe (`test_supervise lifecycle`): 8 threads each with a socket, 4 waiting on one socket each getting one datagram, 4 threads under a storm of signals; a thread with its own descriptor table, whose socket is placed by that table and kept by the sweep while only it holds it (D-50); `clone(CLONE_FILES)`; `posix_spawn`; `exec` from the first thread and from another, the inherited socket carried and the close-on-exec one closed, its association let go after the `exec`. 20 runs of a program whose threads exit first never hang. Mutations: the sweep ignoring threads' tables (1 check failed); no sweep after an `exec` (2 connections held, not 1); waiting for the program alone (7 of 20 runs failed or hung) |
 | FR-SV-12 | M | — | **Not started** |
-| FR-SV-13 | M | FR-SV-supervise | **Partial** (D-54) — with `udpchains` killed, its program is killed with it (`PTRACE_O_EXITKILL`, tested); a traced call with no tracer fails with `ENOSYS` (checked by hand); notified calls fail with `ENOSYS` once the listener has gone (`seccomp_unotify(2)`). The wire capture with the supervisor killed mid-run: step 5 |
+| FR-SV-13 | M | FR-SV-supervise, capture | **Verified** (D-54) — with `udpchains` killed, its program is killed with it (`PTRACE_O_EXITKILL`, tested); a traced call with no tracer fails with `ENOSYS` (checked by hand); notified calls fail with `ENOSYS` once the listener has gone (`seccomp_unotify(2)`). On the wire, `udpchains` killed while its program sent: the program died with it and no packet reached the destination (capture, run as root) |
 | FR-SV-14 | M | inspection, FR-SV-supervise | **Verified** by inspection — the supervisor's only sockets are the program's (made for it, then closed) and its control connections to the proxy; nothing listens. Its debug lines carry addresses, lengths and the ATYP byte, never payload (NFR-05). setuid, setgid and capability targets are refused before supervision, as in shim mode |
 | FR-SV-15 | S | — | **Not started** |
 | FR-SV-16 | S | — | **Not started** |
@@ -239,9 +239,9 @@ their thread is stopped by `ptrace`, so signals lose nothing. Threads and the wi
 | FR-SV-18 | M | FR-SV-supervise | **Verified** — a UDP socket received over `SCM_RIGHTS` from an unsupervised process: `sendto`, `send`, `sendmsg`, `sendmmsg` and `connect` fail with `EPERM`, `sendfile` and `splice` onto it with `EINVAL`; D-50's documented `write()` gap is shown to deliver its one byte and nothing else. An inherited UDP socket refuses the run, naming the descriptor. With the `socket()` trap removed (a mutation), the dynamic and static leak clients still sent nothing |
 | FR-SV-19 | M | — | **Not started** |
 | FR-SV-T1 | M | FR-SV-T1-matrix, FR-SV-T1-matrix-2hop | **Verified** — the 108-cell matrix with the probe built `-static`, directly and through two hops; also under ASan and UBSan. With `read` removed from the filter's range calls (a mutation), the 9 `read` cells failed |
-| FR-SV-T2 | M | FR-SV-supervise | **Partial** — against a dead proxy, the leak client, static and dynamic, sends nothing and the destination receives nothing; with the proxy up, the same sends are carried; killed, the supervisor takes its program with it. The wire capture, including with the supervisor killed mid-run: step 5 |
-| FR-SV-T3 | M | FR-SV-supervise | **Partial** — the `dup` family, `fork` (a child sending on, and outliving the parent's descriptor for, an inherited socket), `SCM_RIGHTS` from an unsupervised process, and each refused route. `exec`, threads and `close_range`: step 5. With the sweep's marking removed (a mutation), the socket a child still held was forgotten and 7 checks failed |
-| FR-SV-T4 | M | FR-SV-supervise | **Verified** — `test_supervise signals` (19 assertions) and `abandon` (4): receives under storms of signals with and without `SA_RESTART`, none lost; sends never interrupted or repeated; `SO_RCVTIMEO` and `SIGSTOP`/`SIGCONT` as natively; 2,000 `close`s under a storm, none left open; `fcntl(F_GETFD)` never interrupted; a signal during a hung handshake handled at once, and `SIGTERM` then ending the program at once. Mutations: `close` sent by notification again left descriptors open (2 checks failed); `fcntl` trapped on the range again was interrupted (1); with abandoning disabled, the signal waited for the 1,000 ms timeout (1). Soaked 20 runs; also under ASan and UBSan |
+| FR-SV-T2 | M | FR-SV-supervise, capture | **Verified** — against a dead proxy, the leak client, static and dynamic, sends nothing and the destination receives nothing; with the proxy up, the same sends are carried; killed, the supervisor takes its program with it. `test_failclosed_capture.sh` gains the supervised cases (a positive control; the proxy unreachable, refusing `ASSOCIATE`, each hop of three dead; `udpchains` killed while the program sends). Run as root by the maintainer on 2026-10-23: all 40 cases passed, the 13 supervised ones included: no packet on the wire, and the program, 194 sends in, killed with the supervisor |
+| FR-SV-T3 | M | FR-SV-supervise | **Verified** — `fork` (a child sending on, and outliving the parent's descriptor for, an inherited socket), `vfork` (`posix_spawn`), `exec`, threads and `clone(CLONE_FILES)` (`test_supervise lifecycle`); the `dup` family; `close_range`, with and without `CLOSE_RANGE_CLOEXEC`; `SCM_RIGHTS` from an unsupervised process; and each refused route. With the sweep's marking removed (a mutation), the socket a child still held was forgotten and 7 checks failed |
+| FR-SV-T4 | M | FR-SV-supervise | **Verified** — `test_supervise signals` (25 assertions) and `abandon` (4): receives under storms of signals with and without `SA_RESTART`, none lost; sends never interrupted or repeated; `SO_RCVTIMEO` and `SIGSTOP`/`SIGCONT` as natively; 2,000 `close`s under a storm, none left open; `fcntl(F_GETFD)` never interrupted; 2,000 UDP `socket()`s, `F_DUPFD`s, `close_range`s and TCP sends under a storm, none failing with `EINTR` and no descriptor left behind (98, 148, 43 and 46 failed before D-54's step-5 amendment); a signal during a hung handshake handled at once, and `SIGTERM` then ending the program at once. Mutations: `close` sent by notification again left descriptors open (2 checks failed); `fcntl` trapped on the range again was interrupted (1); with abandoning disabled, the signal waited for the 1,000 ms timeout (1); an interrupted install not made again failed with `EINTR` (2). Soaked 20 runs; also under ASan and UBSan |
 | FR-SV-T5 | S | — | **Not started** |
 
 ---

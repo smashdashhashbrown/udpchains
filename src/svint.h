@@ -98,7 +98,9 @@ enum sv_outcome {
 	SV_ANSWER,   /* answered: resp filled in for the loop to send, or for a
 	              * traced call, its result decided */
 	SV_ANSWERED, /* already answered, or gone: nothing to send */
-	SV_PARKED    /* a traced receive that must wait for a datagram */
+	SV_PARKED,   /* a traced receive that must wait for a datagram */
+	SV_TO_INSTALL /* a traced call that must install a descriptor: made by
+	               * notification, with the thread's signals blocked */
 };
 
 /* Fills in sv->resp for sv->req, or answers it: a call the filter sent by user
@@ -117,9 +119,18 @@ enum sv_verdict {
 	SV_NATIVE,  /* runs in the kernel as the program made it */
 	SV_WAIT,    /* a receive with nothing queued: the thread waits natively,
 	             * in a zero-length peek, holding copy */
-	SV_AGAIN    /* made again: once a waiting signal has been handled, or to
+	SV_AGAIN,   /* made again: once a waiting signal has been handled, or to
 	             * wait for the next datagram */
+	SV_INSTALL  /* marked and let go on with the thread's signals blocked,
+	             * to be notified and answered with a descriptor */
 };
+
+/* The mark a traced call that installs a descriptor carries in its sixth
+ * argument, which socket(), dup() and fcntl() do not use.  The filter sends a
+ * marked call by notification, which alone can install a descriptor at a
+ * chosen number (D-54).  A program marking a call itself gains nothing: it is
+ * answered the same way, only without its signals blocked. */
+#define SV_INSTALL_MARK 0x5ec0de1u
 
 struct sv_traced {
 	pid_t tid;
