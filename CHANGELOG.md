@@ -52,8 +52,15 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
       `udpchains` refuses to start under `strace -f`;
     - a program built with LeakSanitizer cannot run its leak check;
     - before Linux 6.9, a thread with a descriptor table of its own is refused its UDP calls.
-  - **Not yet:** DNS redirection, aarch64. Not yet in the README, man page or
-    `udpchains -h`.
+  - **Name lookups** (step 6, D-52): the program's own resolver runs. Queries to the system
+    resolver (a loopback address, or a nameserver in `/etc/resolv.conf`, re-read when it changes)
+    go through the proxy to `dns`, and their replies are reported from the address asked. Port 53
+    elsewhere is proxied as addressed. TCP to the system resolver's port 53 is refused.
+  - **Tested** with a static Go client, through the seven interop proxies, and in `make compare`,
+    where supervisor mode carried every combination and the static Go binary through the proxy.
+  - **Documented** in the README, the man page and `udpchains -h`, with the limits of each mode.
+  - **Not yet:** aarch64. Lookups through an NSS module that asks a local daemon (`nss-resolve`,
+    `nscd`, `mdns`) are not seen.
 
 ### Changed
 
@@ -65,11 +72,11 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 2290 assertions across 26 groups. Supervisor mode adds `unit-supervise` (11), 6 to
-  unit-config, `FR-SV-supervise` (46 checks, with static probes making 18, 6, 37, 25, 4 and 24
-  assertions), the hook matrix built `-static` under the supervisor (108, and 108 more through two
-  hops), and the fidelity test built `-static` under it (172). The supervisor also runs under ASan and UBSan,
-  with the static matrix and fidelity tests.
+- 2313 assertions across 26 groups. Supervisor mode adds `unit-supervise` (27), 6 to
+  unit-config, `FR-SV-supervise` (53 checks, with static programs making 18, 6, 37, 25, 4, 24, 12,
+  3 and 4 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
+  through two hops), and the fidelity test built `-static` under it (172). The supervisor also
+  runs under ASan and UBSan, with the static matrix and fidelity tests.
 
 ## [0.2.0] — 2026-10-21
 

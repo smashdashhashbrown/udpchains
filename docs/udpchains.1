@@ -28,6 +28,14 @@ if a datagram cannot be proxied the call fails with an appropriate
 .IR errno .
 It never falls back to sending directly.
 .PP
+A statically linked program, a Go program, or one making system calls without
+libc cannot be helped by a shim.
+.B udpchains \-\-supervise
+runs such a program under a supervisor instead, which carries its UDP from
+outside it.
+See
+.BR "SUPERVISOR MODE" .
+.PP
 There is no built\-in default proxy. If none is configured,
 .B udpchains
 prints a diagnostic and refuses to run the program rather than running it
@@ -49,6 +57,11 @@ Proxy address, as \fIhost:port\fR or \fI[v6]:port\fR.
 Repeat it for a chain: the first is hop 1.
 Given on the command line, it replaces any chain from the environment or the
 configuration file.
+.TP
+.B \-\-supervise
+Run the program in supervisor mode instead of with the shim.
+See
+.BR "SUPERVISOR MODE" .
 .TP
 .B \-q
 Quiet: errors only.
@@ -147,6 +160,11 @@ Each takes a boolean:
 .BR true / false
 or
 .BR on / off .
+.TP
+.B UDPCHAINS_SUPERVISE
+A boolean, as
+.BR \-\-supervise .
+It is not passed to the program.
 .PP
 .B udpchains
 sets
@@ -185,9 +203,10 @@ Keys:
 (relative to the current directory),
 .B password
 (inline; the file must then not be readable by others),
-.B quiet
+.BR quiet ,
+.B debug
 and
-.BR debug .
+.BR supervise .
 Each matches the environment variable of the same name.
 An unknown key is an error.
 .IP
@@ -327,6 +346,119 @@ onto that number then fails with
 Chains add no encryption.
 Every hop can read every datagram, and hop \fIk\fR's credentials pass through
 hops 1 to \fIk\fR\-1 in cleartext.
+.SH SUPERVISOR MODE
+With
+.BR \-\-supervise ,
+.B supervise = yes
+or
+.BR UDPCHAINS_SUPERVISE=1 ,
+.B udpchains
+stays running as the program's parent, the supervisor.
+The program runs under a
+.BR seccomp (2)
+filter, and the supervisor, attached as its tracer with
+.BR ptrace (2),
+handles each system call the filter selects while the calling thread is
+stopped: it carries the program's UDP through the proxy or chain, lets other
+calls run, or fails them with an
+.IR errno .
+Nothing changes in the program, so statically linked programs, Go programs and
+programs making system calls themselves are carried.
+The program is never given the shim.
+It is never chosen automatically.
+.PP
+It needs Linux 5.14 or later on x86\-64, a
+.I /proc/sys/kernel/yama/ptrace_scope
+of 1 or less, permission to install a seccomp filter and to trace (some
+container runtimes forbid one or the other), and a program that is not already
+being traced.
+Otherwise
+.B udpchains
+refuses to run the program; it never runs it unsupervised.
+If the supervisor is killed, so is the program.
+.PP
+.B The program's UDP sockets live at descriptors 768 and up
+(lower if the file limit is under 1024), where the supervisor places them.
+A UDP socket among the descriptors the program would inherit makes
+.B udpchains
+refuse to start.
+.PP
+.B Name lookups.
+The program runs its own resolver, which reads
+.IR /etc/resolv.conf .
+A query to port 53 of the system resolver \- a loopback address, or a
+nameserver listed in
+.IR /etc/resolv.conf ,
+read again when it changes \- is sent through the proxy to
+.B dns
+instead, and its reply reported as from the address asked.
+Without
+.BR dns ,
+such a query fails with
+.BR ENETUNREACH .
+Port 53 anywhere else is proxied as addressed.
+A TCP connection to the system resolver's port 53 is refused with
+.BR ECONNREFUSED ,
+so a truncated answer fails rather than reaching the resolver around the
+proxy.
+.PP
+.B Refused:
+.BR io_uring_setup (2)
+.RB ( ENOSYS ),
+.BR pidfd_getfd (2)
+.RB ( EPERM ),
+raw and packet sockets
+.RB ( EPERM ),
+ICMP and UDP\-Lite sockets
+.RB ( EPROTONOSUPPORT ),
+.BR sendfile (2)
+and
+.BR splice (2)
+onto a UDP socket
+.RB ( EINVAL ),
+and a send or connect on a UDP socket the supervisor did not make, received
+from another process
+.RB ( EPERM ).
+.PP
+.B Limitations.
+It is not a sandbox: a call let through after a check can be changed by the
+program in between, from another thread, so it keeps a cooperative program
+from leaking by accident but does not contain a hostile one.
+A UDP socket received from an unsupervised process already connected, then
+written with
+.BR write (2),
+.BR writev (2)
+or
+.BR pwritev2 (2),
+is sent directly.
+The program cannot be debugged with
+.BR gdb (1)
+or traced with
+.BR strace (1)
+from inside the supervision, and one that uses
+.BR ptrace (2)
+itself gets
+.BR EPERM ;
+.B udpchains
+itself under
+.B strace \-f
+refuses to start.
+A program built with LeakSanitizer cannot run its leak check.
+A process that makes itself non\-dumpable, such as
+.BR ssh\-agent (1),
+cannot be inspected, and its connects and sends fail with
+.BR EPERM .
+Before Linux 6.9, a thread that has unshared its descriptor table is refused
+its UDP calls.
+Every send and connect, UDP or not, and every call on a UDP socket costs a
+round trip to the supervisor, of tens of microseconds.
+While an association is set up, the program's other supervised calls wait.
+A blocking
+.BR recvmmsg (2)
+returns the datagrams already queued, at least one, rather than waiting until
+it has as many as asked.
+A signal arriving while an association is set up is handled at once, and the
+call made again.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -355,11 +487,16 @@ port forward carries the control connection but not the UDP relay traffic.
 Report vulnerabilities privately, as described in
 .IR SECURITY.md .
 .SH LIMITATIONS
-Cannot help statically\-linked binaries, Go binaries, or programs making
+Without
+.BR \-\-supervise ,
+cannot help statically\-linked binaries, Go binaries, or programs making
 system calls without libc: there is no libc call to interpose on.
 Calls made through libc's
 .BR syscall (2)
-are routed to the hooks. Refuses setuid, setgid and
+are routed to the hooks. These limitations are the shim's; supervisor mode
+has its own, under
+.BR "SUPERVISOR MODE" .
+Refuses setuid, setgid and
 capability\-endowed binaries, because the loader ignores
 .B LD_PRELOAD
 for them and running them would mean running them unproxied.
@@ -477,6 +614,15 @@ udpchains \-f /etc/proxychains.conf dig @9.9.9.9 example.com
 .EE
 .RE
 .PP
+Run a static or Go program in supervisor mode, its lookups sent to 9.9.9.9
+through the proxy:
+.PP
+.RS
+.EX
+UDPCHAINS_DNS=9.9.9.9 udpchains \-\-supervise \-p 127.0.0.1:1080 ./static\-client
+.EE
+.RE
+.PP
 Confirm the traffic really takes the tunnel \- this should report the proxy's
 egress address, not the local one:
 .PP
@@ -488,6 +634,8 @@ udpchains \-p 127.0.0.1:1080 dig +short myip.opendns.com @208.67.222.222
 .SH SEE ALSO
 .BR proxychains (1),
 .BR ld.so (8),
+.BR seccomp (2),
+.BR ptrace (2),
 .BR socket (7),
 .BR udp (7)
 .PP

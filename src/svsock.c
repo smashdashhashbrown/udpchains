@@ -317,11 +317,14 @@ static int establish(const struct udpc_config *cfg, struct sv_sock *s, int copy,
                      pid_t pid, int fd)
 {
 	char abuf[UDPC_ADDRSTRLEN], rbuf[UDPC_SOCKS_CHAIN_PATH_MAX];
+	const struct sockaddr *dst = s->connected ? (const struct sockaddr *)&s->app_dst : NULL;
 	int err = 0;
 
-	if (udpc_dgram_loopback_guard(
-		    cfg, s->connected ? (const struct sockaddr *)&s->app_dst : NULL,
-		    &err) != 0)
+	/* D-52: a socket connected to the system resolver sends to dns, which
+	 * is what the guard is about; with no dns, its sends fail anyway. */
+	if (dst != NULL && svdns_system_resolver(dst))
+		dst = cfg->dns_set ? (const struct sockaddr *)&cfg->dns : NULL;
+	if (udpc_dgram_loopback_guard(cfg, dst, &err) != 0)
 		return err;
 	/* FR-P-05: declare the bound address only when the program bound a
 	 * concrete one. */

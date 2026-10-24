@@ -29,6 +29,12 @@
  *                                        posix_spawn and exec, from the first
  *                                        thread and another (FR-SV-11, T3);
  *                                        runs itself again as "execed"
+ *   test_supervise dns <dnsd port>       under the supervisor, with dns set to
+ *                                        dnsd: queries to the system resolver
+ *                                        reach it, and port 53 elsewhere and TCP
+ *                                        to the resolver do not (D-52)
+ *   test_supervise nodns                 under the supervisor, no dns: queries
+ *                                        to the system resolver fail
  *   test_supervise threadexit            under the supervisor: two threads make
  *                                        and close sockets, and exit before
  *                                        the program does
@@ -56,6 +62,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1123,6 +1130,215 @@ static int threadexit(void)
 	return 0;
 }
 
+/* --- DNS (D-52) ------------------------------------------------------------*/
+
+/* A query for name, type A, with id. */
+static size_t dns_query(uint8_t *q, uint16_t id, const char *name)
+{
+	size_t n = 12;
+	const char *p = name;
+
+	memset(q, 0, 12);
+	q[0] = (uint8_t)(id >> 8);
+	q[1] = (uint8_t)id;
+	q[2] = 0x01; /* RD */
+	q[5] = 1;    /* QDCOUNT */
+	while (*p != '\0') {
+		const char *dot = strchr(p, '.');
+		size_t len = dot != NULL ? (size_t)(dot - p) : strlen(p);
+
+		q[n++] = (uint8_t)len;
+		memcpy(q + n, p, len);
+		n += len;
+		p += len + (dot != NULL);
+	}
+	q[n++] = 0;
+	q[n++] = 0;
+	q[n++] = 1; /* A */
+	q[n++] = 0;
+	q[n++] = 1; /* IN */
+	return n;
+}
+
+/* Whether r is the answer to id carrying want, an IPv4 address. */
+static int dns_answers(const uint8_t *r, ssize_t n, uint16_t id, const char *want)
+{
+	struct in_addr a;
+	ssize_t i;
+
+	if (n < 12 || r[0] != (uint8_t)(id >> 8) || r[1] != (uint8_t)id || (r[3] & 0x0f) != 0 ||
+	    inet_pton(AF_INET, want, &a) != 1)
+		return 0;
+	for (i = 12; i + 4 <= n; i++)
+		if (memcmp(r + i, &a, 4) == 0)
+			return 1;
+	return 0;
+}
+
+static struct sockaddr_storage addr_of(const char *ip, int port)
+{
+	struct sockaddr_storage ss;
+
+	memset(&ss, 0, sizeof(ss));
+	if (strchr(ip, ':') != NULL) {
+		struct sockaddr_in6 *a = (struct sockaddr_in6 *)&ss;
+
+		a->sin6_family = AF_INET6;
+		a->sin6_port = htons((uint16_t)port);
+		inet_pton(AF_INET6, ip, &a->sin6_addr);
+	} else {
+		struct sockaddr_in *a = (struct sockaddr_in *)&ss;
+
+		a->sin_family = AF_INET;
+		a->sin_port = htons((uint16_t)port);
+		inet_pton(AF_INET, ip, &a->sin_addr);
+	}
+	return ss;
+}
+
+static socklen_t len_of(const struct sockaddr_storage *ss)
+{
+	return ss->ss_family == AF_INET6 ? sizeof(struct sockaddr_in6)
+	                                 : sizeof(struct sockaddr_in);
+}
+
+/* Asks the system resolver at ip for name on a fresh socket, sendto() and
+ * recvfrom(), and reports whether the answer came, from ip:53. */
+static int ask(const char *ip, uint16_t id, const char *name, const char *want)
+{
+	struct sockaddr_storage to = addr_of(ip, 53), from;
+	socklen_t flen = sizeof(from);
+	struct timeval tv = { 3, 0 };
+	uint8_t q[512], r[512];
+	size_t qn = dns_query(q, id, name);
+	int fd = socket(to.ss_family, SOCK_DGRAM, 0), ok;
+	ssize_t n;
+
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	if (sendto(fd, q, qn, 0, (struct sockaddr *)&to, len_of(&to)) != (ssize_t)qn) {
+		close(fd);
+		return 0;
+	}
+	memset(&from, 0, sizeof(from));
+	n = recvfrom(fd, r, sizeof(r), 0, (struct sockaddr *)&from, &flen);
+	ok = dns_answers(r, n, id, want) && flen == len_of(&to) &&
+	     memcmp(&from, &to, len_of(&to)) == 0;
+	close(fd);
+	return ok;
+}
+
+/* Under the supervisor with dns set to dnsd's port: queries to the system
+ * resolver reach dnsd, through the proxy, and port 53 elsewhere does not. */
+static int dns(int dnsd_port)
+{
+	struct sockaddr_storage to = addr_of("127.0.0.53", 53), peer;
+	struct sockaddr_in direct = loopback(dnsd_port);
+	struct timeval tv = { 0, 500000 };
+	struct addrinfo hints, *res = NULL;
+	socklen_t plen = sizeof(peer);
+	uint8_t q[512], r[512];
+	size_t qn;
+	ssize_t n;
+	int fd;
+
+	TAP_GROUP("FR-SV-12: queries to the system resolver go to dns (D-52)");
+	TAP_OK(ask("127.0.0.53", 0x1201, "a.test", "192.0.2.1"),
+	       "sendto() 127.0.0.53:53 is answered by dns, reported from 127.0.0.53:53");
+	TAP_OK(ask("::1", 0x1202, "a.test", "192.0.2.1"), "and [::1]:53 likewise, on an AF_INET6 "
+	                                                   "socket");
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	TAP_EQ_INT(connect(fd, (struct sockaddr *)&to, len_of(&to)), 0,
+	           "connect() to 127.0.0.53:53, as glibc's resolver does");
+	qn = dns_query(q, 0x1203, "multi.test");
+	TAP_EQ_INT((int)send(fd, q, qn, 0), (int)qn, "send() the query");
+	n = recv(fd, r, sizeof(r), 0);
+	TAP_OK(dns_answers(r, n, 0x1203, "192.0.2.10"), "and recv() gets dns's answer: the "
+	                                                "connected socket accepts it");
+	TAP_OK(getpeername(fd, (struct sockaddr *)&peer, &plen) == 0 &&
+	               memcmp(&peer, &to, len_of(&to)) == 0,
+	       "getpeername() still says 127.0.0.53:53");
+	close(fd);
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+	TAP_OK(getaddrinfo("v4only.test", NULL, &hints, &res) == 0 && res != NULL &&
+	               ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr ==
+	                       htonl(0xc0000204),
+	       "getaddrinfo() in this static program resolves through it: 192.0.2.4");
+	if (res != NULL)
+		freeaddrinfo(res);
+
+	TAP_GROUP("port 53 elsewhere is proxied as addressed (D-52)");
+	{
+		struct sockaddr_storage other = addr_of("192.0.2.53", 53);
+
+		fd = socket(AF_INET, SOCK_DGRAM, 0);
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		qn = dns_query(q, 0x1204, "elsewhere.test");
+		TAP_EQ_INT((int)sendto(fd, q, qn, 0, (struct sockaddr *)&other, len_of(&other)),
+		           (int)qn, "sendto() 192.0.2.53:53 is sent");
+		/* Some networks answer port 53 whatever its address, so a reply
+		 * may come; it is 192.0.2.53's, never dns's.  test_supervise.sh
+		 * checks that dns never saw the query. */
+		{
+			struct sockaddr_storage from;
+			socklen_t flen = sizeof(from);
+
+			n = recvfrom(fd, r, sizeof(r), 0, (struct sockaddr *)&from, &flen);
+			TAP_OK(n < 0 || (flen == len_of(&other) &&
+			                 memcmp(&from, &other, len_of(&other)) == 0),
+			       "to 192.0.2.53, through the proxy: any reply is reported as "
+			       "192.0.2.53's (%s)",
+			       n < 0 ? "none came" : "one came");
+		}
+		close(fd);
+	}
+
+	TAP_GROUP("TCP to the system resolver's port 53 is refused (D-52)");
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	TAP_OK(fails_with(connect(fd, (struct sockaddr *)&to, len_of(&to)), ECONNREFUSED),
+	       "connect() to 127.0.0.53:53: ECONNREFUSED, so the resolver's query cannot go "
+	       "upstream around the proxy");
+	close(fd);
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	qn = dns_query(q, 0x1205, "a.test");
+	TAP_OK(fails_with(sendto(fd, q, qn, MSG_FASTOPEN, (struct sockaddr *)&to, len_of(&to)),
+	                  ECONNREFUSED),
+	       "and by TCP Fast Open: ECONNREFUSED");
+	close(fd);
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	TAP_EQ_INT(connect(fd, (struct sockaddr *)&direct, sizeof(direct)), 0,
+	           "TCP to another port of loopback is not refused");
+	close(fd);
+	TAP_DONE();
+}
+
+/* Under the supervisor with no dns: a query to the system resolver fails,
+ * and port 53 elsewhere is still sent. */
+static int nodns(void)
+{
+	struct sockaddr_storage to = addr_of("127.0.0.53", 53), other = addr_of("192.0.2.53", 53);
+	struct addrinfo hints, *res = NULL;
+	uint8_t q[512];
+	size_t qn = dns_query(q, 0x1301, "a.test");
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	TAP_GROUP("FR-SV-12: with no dns, queries to the system resolver fail (D-52)");
+	TAP_OK(fails_with(sendto(fd, q, qn, 0, (struct sockaddr *)&to, len_of(&to)), ENETUNREACH),
+	       "sendto() 127.0.0.53:53: ENETUNREACH");
+	TAP_EQ_INT((int)sendto(fd, q, qn, 0, (struct sockaddr *)&other, len_of(&other)), (int)qn,
+	           "sendto() 192.0.2.53:53 is still sent, through the proxy");
+	close(fd);
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	TAP_OK(getaddrinfo("a.test", NULL, &hints, &res) != 0, "getaddrinfo() fails");
+	if (res != NULL)
+		freeaddrinfo(res);
+	TAP_DONE();
+}
+
 /* For the wire capture (FR-SV-T2): a datagram to ip:port every 5 ms for secs
  * seconds, a line for each one sent, so a run killed part way still says how
  * far it got. */
@@ -1320,6 +1536,10 @@ int main(int argc, char **argv)
 		return signals(atoi(argv[2]), atoi(argv[3]));
 	if (argc == 2 && strcmp(argv[1], "silent") == 0)
 		return silent();
+	if (argc == 3 && strcmp(argv[1], "dns") == 0)
+		return dns(atoi(argv[2]));
+	if (argc == 2 && strcmp(argv[1], "nodns") == 0)
+		return nodns();
 	if (argc == 2 && strcmp(argv[1], "threadexit") == 0)
 		return threadexit();
 	if (argc == 5 && strcmp(argv[1], "spray") == 0)
@@ -1344,7 +1564,8 @@ int main(int argc, char **argv)
 	fprintf(stderr, "usage: test_supervise refusals <tcp port> | range <echo port> | "
 	                "signals <delayed echo port> <echo port> | silent | "
 	                "abandon <echo port> | lifecycle <echo port> | "
-	                "spray <ip> <port> <secs> | threadexit | nodump <tcp port> | "
+	                "spray <ip> <port> <secs> | threadexit | dns <dnsd port> | nodns | "
+	                "nodump <tcp port> | "
 	                "churn <echo port> <n> <secs> | "
 	                "pass <path> <port> | "
 	                "received <path>\n");

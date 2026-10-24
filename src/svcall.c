@@ -122,7 +122,7 @@ static enum sv_outcome let_through(struct call *c)
  * another: a refused raw socket does not silence a refused io_uring. */
 enum {
 	WHY_RAW, WHY_ICMP, WHY_URING, WHY_PIDFD, WHY_UNKNOWN_FD, WHY_RECEIVED_FD,
-	WHY_DUP_OUT, WHY_NOT_INSPECTABLE, WHY_OWN_TABLE, WHY_COUNT
+	WHY_DUP_OUT, WHY_NOT_INSPECTABLE, WHY_OWN_TABLE, WHY_NO_DNS, WHY_DNS_TCP, WHY_COUNT
 };
 static struct udpc_ratelimit g_rl_refuse[WHY_COUNT];
 
@@ -655,6 +655,20 @@ static int send_one(struct call *c, struct sv_sock *s, int copy, int fd,
 	if (err != 0)
 		return err;
 
+	/* D-52: a query to the system resolver goes to dns instead, through
+	 * the proxy; its reply is reported as from the address asked.  With no
+	 * dns, it fails, as lookups do in shim mode (D-22). */
+	if (svdns_system_resolver((const struct sockaddr *)&dst)) {
+		if (!c->sv->cfg->dns_set) {
+			refused(c, WHY_NO_DNS, "a query to the system resolver, with no dns "
+			                       "configured; set dns, or UDPCHAINS_DNS (D-52)");
+			return ENETUNREACH;
+		}
+		s->dns_asked = dst;
+		s->dns_redirected = true;
+		dst = c->sv->cfg->dns;
+	}
+
 	/* FR-F-07 / D-12: the limit is configured; above it is EMSGSIZE, never
 	 * a silent drop. */
 	if (total > c->sv->cfg->max_datagram)
@@ -835,6 +849,18 @@ static int recv_dest_of(const struct call *c, unsigned i, struct recv_dest *d)
 	return EINVAL;
 }
 
+/* The peer a connected socket accepts datagrams from (NULL if it is not
+ * connected): the one it connected to, or for the system resolver, dns, where
+ * its queries went (D-52). */
+static const struct sockaddr_storage *peer_of(const struct sv *sv, const struct sv_sock *s)
+{
+	if (!s->connected)
+		return NULL;
+	if (sv->cfg->dns_set && svdns_system_resolver((const struct sockaddr *)&s->app_dst))
+		return &sv->cfg->dns;
+	return &s->app_dst;
+}
+
 /* Delivers the datagram at sv->buf + hlen into the program.  0, or an
  * errno. */
 static int deliver(struct call *c, struct sv_sock *s, const struct recv_dest *d,
@@ -852,8 +878,14 @@ static int deliver(struct call *c, struct sv_sock *s, const struct recv_dest *d,
 		return EFAULT;
 	/* FR-F-02: the true origin, never the relay. */
 	if (d->name != 0) {
-		srclen = udpc_dgram_source(hdr, s->family, s->connected ? &s->app_dst : NULL,
-		                           &src);
+		srclen = udpc_dgram_source(hdr, s->family, peer_of(c->sv, s), &src);
+		/* D-52: dns answers for the system resolver it stood in for. */
+		if (srclen > 0 && s->dns_redirected &&
+		    svdns_same((const struct sockaddr *)&src,
+		               (const struct sockaddr *)&c->sv->cfg->dns) &&
+		    udpc_addr_for_family((const struct sockaddr *)&s->dns_asked, s->family,
+		                         &src) == 0)
+			srclen = udpc_sa_len((const struct sockaddr *)&src);
 		if (write_sockaddr(c, d->name, d->namelen, &src, srclen) != 0)
 			return EFAULT;
 	}
@@ -918,7 +950,7 @@ static long long take(struct call *c, struct sv_sock *s, int copy, int fd,
 			return -(long long)err;
 		}
 		hlen = udpc_dgram_unwrap(c->sv->buf, n, c->sv->buflen, c->sv->cfg, &s->chain,
-		                         s->family, s->connected ? &s->app_dst : NULL, &hdr);
+		                         s->family, peer_of(c->sv, s), &hdr);
 		if (hlen < 0) {
 			/* Never delivered; consumed at once, as in shim mode. */
 			consume(c->sv, copy);
@@ -1311,12 +1343,66 @@ static enum sv_outcome decide_dup2(struct call *c)
 /* A call on a descriptor that is not a socket the supervisor carries: through
  * to the kernel, unless it is a UDP, raw or packet socket it did not make
  * (D-50) and the call would send, connect or move data on it. */
+/* D-52: whether a call connects a TCP socket to the system resolver's port 53,
+ * by connect(), or by a sendto() or sendmsg() naming it (TCP Fast Open). */
+static bool tcp_to_system_resolver(struct call *c, int copy)
+{
+	const __u64 *a = c->req->data.args;
+	struct sockaddr_storage dst;
+	uint64_t name;
+	socklen_t namelen, len;
+	int type = 0, domain = 0;
+
+	len = sizeof(type);
+	if (getsockopt(copy, SOL_SOCKET, SO_TYPE, &type, &len) != 0 || type != SOCK_STREAM)
+		return false;
+	len = sizeof(domain);
+	if (getsockopt(copy, SOL_SOCKET, SO_DOMAIN, &domain, &len) != 0 ||
+	    (domain != AF_INET && domain != AF_INET6))
+		return false;
+	switch (c->req->data.nr) {
+	case SYS_connect:
+		name = a[1];
+		namelen = (socklen_t)a[2];
+		break;
+	case SYS_sendto:
+		name = a[4];
+		namelen = (socklen_t)a[5];
+		break;
+	case SYS_sendmsg: {
+		struct msghdr m;
+
+		if (mem_read(c, a[1], &m, sizeof(m)) != 0)
+			return false;
+		name = (uint64_t)(uintptr_t)m.msg_name;
+		namelen = m.msg_namelen;
+		break;
+	}
+	default:
+		return false;
+	}
+	if (name == 0 || namelen == 0 || read_sockaddr(c, name, namelen, &dst) != 0)
+		return false;
+	return svdns_system_resolver((const struct sockaddr *)&dst);
+}
+
 static enum sv_outcome decide_other(struct call *c, int copy)
 {
 	int nr = c->req->data.nr;
 	bool moves_data = nr != SYS_close && nr != SYS_bind && nr != SYS_getsockname &&
 	                  nr != SYS_getpeername && nr != SYS_dup && nr != SYS_fcntl;
 
+	/* D-52: the local resolver would send the queries upstream itself,
+	 * around the proxy.  Refused until such a connection can be carried by
+	 * SOCKS5 CONNECT to dns, so a truncated answer fails rather than
+	 * leaks. */
+	if ((nr == SYS_connect || nr == SYS_sendto || nr == SYS_sendmsg) &&
+	    tcp_to_system_resolver(c, copy)) {
+		close(copy);
+		refused(c, WHY_DNS_TCP, "a TCP connection to the system resolver's port 53, "
+		                        "which would send queries around the proxy (D-52)");
+		return answer(c, 0, ECONNREFUSED);
+	}
 	if (moves_data && sv_uncarriable(copy)) {
 		close(copy);
 		refused(c, WHY_RECEIVED_FD, "a UDP, raw or packet socket the supervisor did "

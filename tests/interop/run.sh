@@ -9,6 +9,10 @@
 # reaches a destination while it is dead.  Results and their meaning are in
 # docs/INTEROP-CHECKLIST.md section 12.
 #
+# Each proxy also carries static programs under the supervisor (D-48): the
+# matrix and fidelity tests built -static, the DNS redirect (D-52), and a Go
+# client when a Go toolchain is installed (FR-SV-T5).
+#
 # Then the same proxies as the hops of chains (FR-CH-T4): a ring of 2-hop
 # chains, in which each proxy is once a middle hop and once the exit hop, and
 # one chain of all of them.  Results are in section 13.
@@ -126,7 +130,8 @@ if ! command -v docker > /dev/null 2>&1 || ! docker info > /dev/null 2>&1; then
 	echo "run.sh: needs a working Docker; skipping interop" >&2
 	exit 2
 fi
-for f in "$W" "$B/test_matrix" "$B/udpecho" "$B/dnsd" "$PROBE"; do
+for f in "$W" "$B/test_matrix" "$B/udpecho" "$B/dnsd" "$PROBE" "$B/test_matrix-static" \
+	"$B/test_fidelity-static" "$B/test_supervise"; do
 	if [ ! -x "$f" ]; then
 		echo "run.sh: $f is missing; run it as \`make interop\`" >&2
 		exit 2
@@ -393,17 +398,39 @@ check_prog() {	# <check> <timeout> <proxy> <cmd...>
 	fi
 }
 
-check_fidelity() {
-	local f="$LOGS/$CUR.fidelity.log" bad
-	shim 180 "$1" "$B/test_fidelity" "$E1" "$E2" "$E6" > "$f" 2>&1
+# The same, a static program under the supervisor (D-48).
+sv() {
+	local HOPS
+	hop_args "$2"
+	UDPCHAINS_QUIET=1 timeout "$1" "$W" --supervise "${HOPS[@]}" "${@:3}"
+}
+
+check_sv() {	# <check> <timeout> <proxy> <cmd...>
+	local name=$1
+	if sv "$2" "$3" "${@:4}" > "$LOGS/$CUR.$name.log" 2>&1; then
+		result ok "$name"
+	else
+		result FAIL "$name" "see $LOGS/$CUR.$name.log"
+	fi
+}
+
+check_fidelity() {	# <proxy addr> [sv]
+	local name=fidelity bad f
+	[ "${2:-}" = sv ] && name=sv-fidelity
+	f="$LOGS/$CUR.$name.log"
+	if [ "$name" = sv-fidelity ]; then
+		sv 180 "$1" "$B/test_fidelity-static" "$E1" "$E2" "$E6" supervised > "$f" 2>&1
+	else
+		shim 180 "$1" "$B/test_fidelity" "$E1" "$E2" "$E6" > "$f" 2>&1
+	fi
 	bad=$(grep '^not ok' "$f")
 	if [ -z "$bad" ]; then
-		[ "${ZERO[$P]}" = deliver ] && result ok fidelity ||
-			result FAIL fidelity "passed, but this proxy was known to drop zero-length datagrams"
+		[ "${ZERO[$P]}" = deliver ] && result ok "$name" ||
+			result FAIL "$name" "passed, but this proxy was known to drop zero-length datagrams"
 	elif [ "${ZERO[$P]}" = drop ] && ! grep -v 'zero-length' <<< "$bad" | grep -q .; then
-		result expected fidelity "only the zero-length check fails: the proxy drops them"
+		result expected "$name" "only the zero-length check fails: the proxy drops them"
 	else
-		result FAIL fidelity "see $f"
+		result FAIL "$name" "see $f"
 	fi
 }
 
@@ -563,6 +590,13 @@ start_bg E2 echo2 "$B/udpecho" --port 0 --quiet
 start_bg E6 echo6 "$B/udpecho" --port 0 -6 --quiet
 start_bg ESW echosw "$B/udpecho" --port 0 --switch-port --quiet
 start_bg DNS dnsd "$B/dnsd" --port 0
+# FR-SV-T5: the Go client, when a Go toolchain is installed.
+GOCLIENT=""
+if command -v go > /dev/null && (cd "$ROOT/tests/goclient" &&
+	CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS= go build -o "$TMP/goclient" main.go) \
+	> "$LOGS/goclient.build.log" 2>&1; then
+	GOCLIENT=$TMP/goclient
+fi
 printf '127.0.0.1\tlocalhost\n203.0.113.5\thostsonly.test\n' > "$TMP/hosts"
 
 ONE=$SELECTED
@@ -587,6 +621,24 @@ for P in $ONE; do
 	check_sizes "$A" "${WHOLE[$P]}" "${CUT[$P]}"
 	check_ipv6 "$A"
 	check_resolve "$A"
+
+	# Supervisor mode (D-48), with static programs.
+	check_sv sv-matrix 300 "$A" "$B/test_matrix-static" "$E1" "$E6"
+	check_fidelity "$A" sv
+	if UDPCHAINS_DNS="127.0.0.1:$DNS" sv 60 "$A" "$B/test_supervise" dns "$DNS" \
+		> "$LOGS/$P.sv-dns.log" 2>&1; then
+		result ok sv-dns "queries to the system resolver reached dnsd (D-52)"
+	else
+		result FAIL sv-dns "see $LOGS/$P.sv-dns.log"
+	fi
+	if [ -n "$GOCLIENT" ]; then
+		if UDPCHAINS_DNS="127.0.0.1:$DNS" sv 120 "$A" "$GOCLIENT" "$E1" \
+			> "$LOGS/$P.sv-go.log" 2>&1; then
+			result ok sv-go "a static Go client, its own resolver included"
+		else
+			result FAIL sv-go "see $LOGS/$P.sv-go.log"
+		fi
+	fi
 
 	if [ "${AUTHE[$P]}" != - ]; then
 		aport=$(start_proxy "$P" auth) && check_auth "127.0.0.1:$aport" ||

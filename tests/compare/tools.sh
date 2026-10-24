@@ -25,6 +25,10 @@ none)
 udpchains)
 	export UDPCHAINS_LIB=/udpchains/libudpchains.so UDPCHAINS_DNS=$SERVER4
 	W="/udpchains/udpchains -q -p 10.77.0.20:1080" ;;
+udpchains-sv)
+	# Supervisor mode (D-48): the static Go binary is what it is for.
+	export UDPCHAINS_DNS=$SERVER4
+	W="/udpchains/udpchains -q --supervise -p 10.77.0.20:1080" ;;
 socksify)
 	# Without SOCKS_AUTOADD_LANROUTES=no, Dante sends the lab's own
 	# network directly by design.

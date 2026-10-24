@@ -25,7 +25,7 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 2290 assertions across 26 groups (`tests/run.sh`), all passing, plus the 91-check
+**Test totals:** 2313 assertions across 26 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
@@ -37,7 +37,7 @@ from a run rather than editing it by hand.
 | unit-chain | 135 |
 | unit-fdtable | 22 |
 | unit-dns | 52 |
-| unit-supervise | 11 |
+| unit-supervise | 27 |
 | TST-01 hook matrix | 108 |
 | TST-05 fidelity | 171 |
 | port switch (TFTP pattern) | 12 |
@@ -51,7 +51,7 @@ from a run rather than editing it by hand.
 | wrapper loadability | 17 |
 | TST-03 leak | 23 checks |
 | fault injection | 43 |
-| FR-SV supervisor mode | 46 checks, six of them running static probes making 18, 6, 37, 25, 4 and 24 assertions of their own |
+| FR-SV supervisor mode | 53 checks, nine of them running static programs making 18, 6, 37, 25, 4, 24, 12, 3 and 4 assertions of their own |
 | FR-SV-T1 hook matrix, `-static`, under the supervisor | 108 |
 | FR-SV-T1 the same through 2 hops | 108 |
 | FR-SV fidelity, `-static`, under the supervisor | 172 |
@@ -211,10 +211,13 @@ means no code yet.
 ## Supervisor mode (§2b), in progress
 
 Not part of v1 scope, and not counted in the summary above. Design: D-48 to D-53, decided
-2026-10-22, and D-54, 2026-10-23. Steps 2 to 5 of the plan are built: the supervisor runs a
-program under its filter and carries its UDP, for x86-64, with calls on its UDP sockets made while
-their thread is stopped by `ptrace`, so signals lose nothing, and follows its threads, children
-and `exec`s. The wire capture's run as root is by hand. DNS and aarch64 (step 6) remain. The accepted limitations are listed in
+2026-10-22, and D-54, 2026-10-23. Steps 2 to 6 of the plan are built, for x86-64:
+- the supervisor runs a program under its filter and carries its UDP;
+- every call is handled while its thread is stopped by `ptrace`, so signals lose nothing;
+- it follows the program's threads, children and `exec`s;
+- queries to the system resolver are redirected to `dns`.
+
+The wire capture's run as root is by hand. aarch64 remains. The accepted limitations are listed in
 [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §9.
 
 | ID | Pri | Test | Status |
@@ -230,19 +233,19 @@ and `exec`s. The wire capture's run as root is by hand. DNS and aarch64 (step 6)
 | FR-SV-09 | M | FR-SV-supervise | **Partial** — `io_uring_setup` `ENOSYS`, `pidfd_getfd` `EPERM`, raw and packet sockets `EPERM`, ICMP datagram sockets `EPROTONOSUPPORT`, and `sendfile`/`splice` onto a received UDP socket `EINVAL`, each with a diagnostic not hidden by another's, from a static probe. `sendfile`/`splice` onto a carried socket `EINVAL` (FR-SV-fidelity) |
 | FR-SV-10 | M | FR-SV-supervise, FR-SV-fidelity | **Verified** — `getsockname` reports the bound address with the port the kernel chose; `getpeername` the connected destination, never the relay, and `ENOTCONN` unconnected or after `connect(AF_UNSPEC)` |
 | FR-SV-11 | M | FR-SV-supervise | **Verified** — the supervisor exits with the program's status, or dies of the signal that killed it; signals sent to it reach the program; it stays for a descendant the program leaves running, which is supervised. A static probe (`test_supervise lifecycle`): 8 threads each with a socket, 4 waiting on one socket each getting one datagram, 4 threads under a storm of signals; a thread with its own descriptor table, whose socket is placed by that table and kept by the sweep while only it holds it (D-50); `clone(CLONE_FILES)`; `posix_spawn`; `exec` from the first thread and from another, the inherited socket carried and the close-on-exec one closed, its association let go after the `exec`. 20 runs of a program whose threads exit first never hang. Mutations: the sweep ignoring threads' tables (1 check failed); no sweep after an `exec` (2 connections held, not 1); waiting for the program alone (7 of 20 runs failed or hung) |
-| FR-SV-12 | M | — | **Not started** |
+| FR-SV-12 | M | unit-supervise, FR-SV-supervise, interop | **Verified** (D-52) — which addresses are the system resolver, unit-tested against a resolv.conf of the test's own, including one rewritten as a VPN would; a static probe through the fixture proxy to `dnsd` as `dns`: `sendto()` to `127.0.0.53` and `::1` answered and reported from them, a `connect()`ed socket as glibc's resolver uses, `getpeername` unchanged, a static `getaddrinfo()`, a static Go client's own resolver; port 53 elsewhere never reaching `dns` (`dnsd`'s log); TCP to the system resolver refused, by `connect` and by TCP Fast Open; with `dns` unset, the query fails with `ENETUNREACH`. Through each of the seven interop proxies. Mutations: the connected-peer check left on `127.0.0.53` (2 checks failed), no relabelling of the reply (2), no TCP refusal (2). Lookups through NSS modules that ask a local daemon are a recorded limitation |
 | FR-SV-13 | M | FR-SV-supervise, capture | **Verified** (D-54) — with `udpchains` killed, its program is killed with it (`PTRACE_O_EXITKILL`, tested); a traced call with no tracer fails with `ENOSYS` (checked by hand); notified calls fail with `ENOSYS` once the listener has gone (`seccomp_unotify(2)`). On the wire, `udpchains` killed while its program sent: the program died with it and no packet reached the destination (capture, run as root) |
 | FR-SV-14 | M | inspection, FR-SV-supervise | **Verified** by inspection — the supervisor's only sockets are the program's (made for it, then closed) and its control connections to the proxy; nothing listens. Its debug lines carry addresses, lengths and the ATYP byte, never payload (NFR-05). setuid, setgid and capability targets are refused before supervision, as in shim mode |
-| FR-SV-15 | S | — | **Not started** |
+| FR-SV-15 | S | manual (benchmark) | **Measured** 2026-10-23 with `bench_latency` (a send and a receive per round trip, 2000 round trips, three runs each, this 2-CPU host, the fixture proxy on loopback). Median per round trip: direct 7.2–7.7 µs, shim 43.5–67.5 µs, supervised 66.6–84.5 µs; p99 15–33, 245–323 and 367–726 µs. Supervised, the added latency, proxy hop included, is 59–77 µs at the median, under NFR-04's 100 µs, and up to about 700 µs at the 99th percentile. Reported, not a gate (D-08) |
 | FR-SV-16 | S | — | **Not started** |
 | FR-SV-17 | C | — | **Not started** |
 | FR-SV-18 | M | FR-SV-supervise | **Verified** — a UDP socket received over `SCM_RIGHTS` from an unsupervised process: `sendto`, `send`, `sendmsg`, `sendmmsg` and `connect` fail with `EPERM`, `sendfile` and `splice` onto it with `EINVAL`; D-50's documented `write()` gap is shown to deliver its one byte and nothing else. An inherited UDP socket refuses the run, naming the descriptor. With the `socket()` trap removed (a mutation), the dynamic and static leak clients still sent nothing |
-| FR-SV-19 | M | — | **Not started** |
+| FR-SV-19 | M | inspection | **Verified** by inspection — the README's "Supervisor mode" section, the man page's SUPERVISOR MODE and `-h` state what each mode cannot see: the shim's bypasses (`io_uring`, system calls without libc), supervisor mode's write-family gap (D-50), that it is not a sandbox (D-48), and its other limits |
 | FR-SV-T1 | M | FR-SV-T1-matrix, FR-SV-T1-matrix-2hop | **Verified** — the 108-cell matrix with the probe built `-static`, directly and through two hops; also under ASan and UBSan. With `read` removed from the filter's range calls (a mutation), the 9 `read` cells failed |
 | FR-SV-T2 | M | FR-SV-supervise, capture | **Verified** — against a dead proxy, the leak client, static and dynamic, sends nothing and the destination receives nothing; with the proxy up, the same sends are carried; killed, the supervisor takes its program with it. `test_failclosed_capture.sh` gains the supervised cases (a positive control; the proxy unreachable, refusing `ASSOCIATE`, each hop of three dead; `udpchains` killed while the program sends). Run as root by the maintainer on 2026-10-23: all 40 cases passed, the 13 supervised ones included: no packet on the wire, and the program, 194 sends in, killed with the supervisor |
 | FR-SV-T3 | M | FR-SV-supervise | **Verified** — `fork` (a child sending on, and outliving the parent's descriptor for, an inherited socket), `vfork` (`posix_spawn`), `exec`, threads and `clone(CLONE_FILES)` (`test_supervise lifecycle`); the `dup` family; `close_range`, with and without `CLOSE_RANGE_CLOEXEC`; `SCM_RIGHTS` from an unsupervised process; and each refused route. With the sweep's marking removed (a mutation), the socket a child still held was forgotten and 7 checks failed |
 | FR-SV-T4 | M | FR-SV-supervise | **Verified** — `test_supervise signals` (25 assertions) and `abandon` (4): receives under storms of signals with and without `SA_RESTART`, none lost; sends never interrupted or repeated; `SO_RCVTIMEO` and `SIGSTOP`/`SIGCONT` as natively; 2,000 `close`s under a storm, none left open; `fcntl(F_GETFD)` never interrupted; 2,000 UDP `socket()`s, `F_DUPFD`s, `close_range`s and TCP sends under a storm, none failing with `EINTR` and no descriptor left behind (98, 148, 43 and 46 failed before D-54's step-5 amendment); a signal during a hung handshake handled at once, and `SIGTERM` then ending the program at once. Mutations: `close` sent by notification again left descriptors open (2 checks failed); `fcntl` trapped on the range again was interrupted (1); with abandoning disabled, the signal waited for the 1,000 ms timeout (1); an interrupted install not made again failed with `EINTR` (2). Soaked 20 runs; also under ASan and UBSan |
-| FR-SV-T5 | S | — | **Not started** |
+| FR-SV-T5 | S | FR-SV-supervise, interop, compare | **Verified** — a static Go client (`tests/goclient`), built by the test when Go is installed (`make` still needs only a C compiler): connected and unconnected round trips, 16 goroutines, and Go's own resolver through the D-52 redirect; through each of the seven interop proxies. `make compare` gained a supervisor-mode column: 54 of 54 combinations through the proxy over IPv4 and IPv6, the static Go binary through the proxy, and nothing sent directly with the proxy stopped |
 
 ---
 

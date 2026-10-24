@@ -1,8 +1,9 @@
 # udpchains
 
-Routes a dynamically linked program's **UDP** through a SOCKS5 proxy that supports
-`UDP ASSOCIATE`, or through a [chain](#chains) of them, using `LD_PRELOAD`. The program is not
-modified or recompiled.
+Routes a program's **UDP** through a SOCKS5 proxy that supports `UDP ASSOCIATE`, or through a
+[chain](#chains) of them. A dynamically linked program is given a shim with `LD_PRELOAD`; any
+other, static and Go programs included, can be run in [supervisor mode](#supervisor-mode-static-and-go-programs),
+which carries its UDP from outside it. The program is not modified or recompiled.
 
 ```
 udpchains -p 127.0.0.1:1080 dig @9.9.9.9 example.com
@@ -19,7 +20,8 @@ under [Traffic that bypasses the shim](#traffic-that-bypasses-the-shim).
 
 ## Build and install
 
-Linux, glibc 2.34 or later, a C compiler. No other dependencies.
+Linux, glibc 2.34 or later, a C compiler. No other dependencies. Supervisor mode also needs Linux
+5.14 or later, on x86-64.
 
 ```sh
 make
@@ -35,6 +37,7 @@ udpchains [options] <program> [args...]
 
   -f <file>    config file
   -p <addr>    proxy as host:port or [v6]:port; repeat for a chain
+  --supervise  supervisor mode, for static and Go programs
   -q           errors only
   -v           protocol steps (never payload)
 ```
@@ -239,12 +242,17 @@ dying mid-stream. No proxy-specific udpchains defect was found.
 - **In a chain,** each of the seven worked as a middle hop and as the exit hop, with a later hop
   given by name, and seven of them together. What only the exit hop decides — zero-length
   datagrams, a reply from another port — follows the exit hop's row.
+- **In supervisor mode,** each carried the static matrix, the fidelity test, the DNS redirect and a
+  static Go client, with the same results as the shim. Chains were not run supervised.
 - Configurations and full results: [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) §12,
   and §13 for chains.
   `make interop` repeats the runs (needs Docker). Proxies are tested as black boxes; do not read
   GPL source while working on udpchains ([`CONTRIBUTING.md`](CONTRIBUTING.md)).
 
 ## Name resolution
+
+This section is about the shim. In supervisor mode the program's own resolver runs; see
+[Name lookups when supervised](#name-lookups-when-supervised).
 
 glibc's resolver cannot be intercepted, so the shim answers `getaddrinfo`, `gethostbyname`,
 `getnameinfo` and `res_query` itself, in this order:
@@ -273,6 +281,90 @@ glibc's resolver cannot be intercepted, so the shim answers `getaddrinfo`, `geth
   `systemd-resolved` host that nameserver is `127.0.0.53`, which is resolved at the proxy host;
   give such tools a resolver explicitly (`dig @9.9.9.9`).
 
+## Supervisor mode: static and Go programs
+
+A shim cannot see a statically linked program, a Go program, or one making system calls without
+libc. `--supervise` (or `supervise = yes`, or `UDPCHAINS_SUPERVISE=1`) runs such a program, or any
+other, under a supervisor instead:
+
+```sh
+UDPCHAINS_DNS=9.9.9.9 udpchains --supervise -p 127.0.0.1:1080 ./static-client
+```
+
+- **It is never chosen automatically.** The same configuration, chains and credentials apply, and
+  the program is not given the shim.
+- **Requirements:** Linux 5.14 or later, x86-64, Yama `ptrace_scope` of 1 or less (the default),
+  a container runtime that allows a seccomp filter and `ptrace`, and a program not already being
+  traced. Otherwise `udpchains` refuses to run the program; it never runs it unsupervised.
+- **Fail-closed:** if `udpchains` is killed, the program is killed with it. A test captures the
+  wire while that happens, and sees nothing sent.
+- **How it works:** the program runs under a seccomp filter that selects its socket calls.
+  `udpchains`, attached as its tracer, handles each one while the calling thread is stopped, so a
+  signal cannot come between what is done for a call and what it returns: no datagram is lost to
+  a signal, no send is repeated, no `close` left undone. The supervisor makes each UDP socket
+  itself, at descriptor 768 and up, and wraps and unwraps its datagrams as the shim does. A
+  receive with nothing queued waits in the program's own kernel, so `SO_RCVTIMEO`, `EINTR` and
+  `SA_RESTART` behave exactly as on an unproxied socket. Threads, `fork`, `vfork`, `clone` and
+  `exec` are followed.
+
+### Name lookups when supervised
+
+The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/resolv.conf`.
+
+- **A query to the system resolver** — port 53 of a loopback address, or of a nameserver listed in
+  `/etc/resolv.conf`, which is read again when it changes — goes through the proxy to `dns`
+  instead. Its reply is reported as coming from the address the program asked, so the resolver
+  accepts it.
+- **Without `dns`,** such a query fails with `ENETUNREACH`, so lookups fail; nothing goes
+  anywhere directly.
+- **Port 53 anywhere else** (`dig @9.9.9.9`) is proxied as addressed.
+- **TCP to the system resolver's port 53 is refused** with `ECONNREFUSED`, so a truncated answer
+  fails rather than reaching the local resolver, which would send the query upstream around the
+  proxy.
+- A resolver configured elsewhere than `/etc/resolv.conf` on a non-loopback address is proxied as
+  addressed. A local DNS server's own entries (dnsmasq) are not used; `/etc/hosts` is.
+- **Lookups made through an NSS module that asks a local daemon** — `nss-resolve` (systemd-resolved
+  over its Unix socket), `nscd`, `mdns` (avahi) — are not seen: the daemon resolves the name
+  itself, outside the proxy. Ubuntu's default `nsswitch.conf` uses `dns` for everything but
+  `.local`.
+
+### How supervisor mode differs from the shim
+
+| | Shim | Supervisor mode |
+|---|---|---|
+| Programs | dynamically linked | any, static and Go ones included |
+| `io_uring` | bypasses the shim | refused with `ENOSYS`, for files too |
+| System calls made without libc | bypass the shim | carried |
+| Name lookups | answered by the shim, through `dns` | the program's own; queries to the system resolver go to `dns` |
+| Cost of a UDP call | about 1 µs | tens of µs: a round trip to the supervisor |
+| Debuggers, `strace` | work | cannot attach; `strace -f udpchains` refuses to start |
+
+### What supervisor mode cannot do
+
+- **It is not a sandbox.** A call let through after a check can be changed in between, from
+  another thread. Like the shim, it keeps a program from leaking by accident; it does not contain
+  one trying to escape.
+- **A UDP socket received already connected from an unsupervised process, then written with
+  `write`, `writev` or `pwritev2`, is sent directly.** Sends and connects on such a socket are
+  refused with `EPERM`; those writes cannot be told apart from file writes without trapping every
+  write.
+- **An inherited UDP socket stops the program from starting,** so a service handed one by its
+  service manager cannot be supervised.
+- **A process that makes itself non-dumpable** (`ssh-agent`, `gpg-agent`) cannot be inspected: its
+  connects and sends fail with `EPERM`, TCP included, with a diagnostic naming the cause.
+- **No `gdb` or `strace` inside the supervision,** and a program that uses `ptrace` itself gets
+  `EPERM`. A program built with LeakSanitizer cannot run its leak check.
+- **Every send and connect, UDP or not,** and every call on a UDP socket, costs a round trip to the
+  supervisor. While an association is set up, the program's other supervised calls wait.
+- **A blocking `recvmmsg`** returns the datagrams already queued, at least one, rather than waiting
+  for as many as asked.
+- **Before Linux 6.9,** a thread with a descriptor table of its own (`unshare(CLONE_FILES)`) is
+  refused its UDP calls.
+- **x86-64 only** so far.
+- Everything the shim refuses is refused here too: raw, packet, ICMP and UDP-Lite sockets,
+  multicast and broadcast, `MSG_MORE` and GSO, `sendfile` and `splice` onto a UDP socket, and
+  setuid and setgid programs.
+
 ## Security considerations
 
 `udpchains` keeps UDP from bypassing the proxy. It does not protect the path to the proxy.
@@ -297,9 +389,9 @@ To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 | Program | Reason |
 |---|---|
-| Statically linked binaries | No libc to interpose on. Planned as a supervisor mode, designed in D-48 to D-53 ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)). |
-| Go binaries | Go makes system calls directly, not through libc. Planned with static binaries. |
-| Programs making system calls without libc (inline assembly) | Same reason. Planned with static binaries. Calls through libc's `syscall()` are proxied. |
+| Statically linked binaries | No libc to interpose on. Use [supervisor mode](#supervisor-mode-static-and-go-programs). |
+| Go binaries | Go makes system calls directly, not through libc. Use supervisor mode. |
+| Programs making system calls without libc (inline assembly) | Same reason. Use supervisor mode. Calls through libc's `syscall()` are proxied by the shim. |
 | setuid, setgid and file-capability binaries | The loader ignores `LD_PRELOAD` for them. `udpchains` refuses to run them. |
 | `ping` (ICMP datagram sockets), UDP-Lite | SOCKS5 cannot carry them. Socket creation fails with `EPROTONOSUPPORT`. |
 | Raw and packet sockets (`nmap`, `traceroute`) | SOCKS5 cannot carry them. Socket creation fails with `EPERM`, as it does without `CAP_NET_RAW`. |
@@ -312,6 +404,8 @@ intercepted:
 - **`io_uring`.** Sends submitted through a ring go straight to the kernel. glibc has no wrapper to
   interpose on.
 - **System calls made without libc** (inline assembly, Go, static binaries).
+
+Supervisor mode sees both: it refuses `io_uring` and carries system calls made without libc.
 
 Calls that move data without a send or receive call are handled instead:
 
@@ -401,7 +495,8 @@ Some protocols reply from a different port than the one addressed: TFTP, SIP/RTP
 
 The automated suite uses an in-repo fixture proxy. 0.1.0 was also tested on the same host against
 the reference proxy (`nc -u`, TFTP, `dig`, `iperf`, `ntpdate`) and against the seven
-[compatible proxies](#compatible-proxies), which have since been tested as the hops of chains too.
+[compatible proxies](#compatible-proxies), which have since been tested as the hops of chains,
+and with supervisor mode.
 **Untested:** a proxy on another host, a chain across hosts, and an IPv6 destination beyond this
 host's loopback.
 
@@ -411,8 +506,7 @@ host's loopback.
   including GSSAPI (`0x01`). A proxy selecting one is refused with a diagnostic.
 - Chains that skip a dead hop or pick hops at random (proxychains' `dynamic_chain` and
   `random_chain`). Chains are strict ([`DECISIONS.md`](DECISIONS.md) D-37).
-- Static and Go binaries, and system calls made without libc. Planned as a supervisor mode
-  ([`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md)).
+- Supervisor mode on architectures other than x86-64 (aarch64 is planned).
 - Loopback and multicast bypass. Deferred ([`DECISIONS.md`](DECISIONS.md) D-05).
 
 ## Comparison with similar tools
@@ -424,25 +518,28 @@ host's loopback.
 | [Proxando](https://github.com/NULLhere/Proxando) | `LD_PRELOAD` | GPL-2.0 | TCP; proxychains-style configuration |
 | [graftcp](https://github.com/hmgle/graftcp) | `ptrace` | GPL-3.0 | TCP; static and Go binaries; HTTP proxies |
 
-udpchains does UDP only, through one proxy or a strict chain, for dynamically linked programs.
+udpchains does UDP only, through one proxy or a strict chain: for dynamically linked programs
+with its shim, and for static and Go programs in supervisor mode.
 
 ### UDP behaviour, measured
 
 Measured 2026-10-19 in a Docker lab: client, SOCKS5 proxy (gost 3.3.1) and server on separate
 addresses. The server logged the source of every datagram and DNS query. A control run with no
 tool showed every datagram arriving directly. Versions: `dante-client` 1.4.3 (Ubuntu 24.04),
-PR #570 at `04f6622`, Proxando at `c7ff4ac`, graftcp v0.8.3.
+PR #570 at `04f6622`, Proxando at `c7ff4ac`, graftcp v0.8.3. udpchains' supervisor mode was added
+on 2026-10-23, in the same lab, under Docker's default seccomp filter; the others were not run
+again.
 
-| | udpchains | Dante `socksify` | PR #570 | Proxando | graftcp |
-|---|---|---|---|---|---|
-| IPv4 send × receive round trips through the proxy, of 54 | 54 | 35 | 0 | 20 | 24 |
-| The same, IPv6 | 54 | 0 | 0 | 20 | 23–24 |
-| `sendmmsg` | through the proxy | sent directly | — | sent directly | sent directly |
-| Sender address the program sees | the real sender | the real sender | — | the real sender | another address |
-| `dig` with its own resolver | through the proxy | no answer | through the proxy | no answer | through the proxy |
-| `getaddrinfo` | queried through the proxy | placeholder address | placeholder address | placeholder address | queried through the proxy |
-| Static Go binary | sent directly | sent directly | sent directly | sent directly | through the proxy |
-| Proxy stopped: datagrams that reached the server directly | none | IPv6, `sendmmsg` | none | `sendto`, `sendmmsg` | `sendmmsg` |
+| | udpchains | udpchains `--supervise` | Dante `socksify` | PR #570 | Proxando | graftcp |
+|---|---|---|---|---|---|---|
+| IPv4 send × receive round trips through the proxy, of 54 | 54 | 54 | 35 | 0 | 20 | 24 |
+| The same, IPv6 | 54 | 54 | 0 | 0 | 20 | 23–24 |
+| `sendmmsg` | through the proxy | through the proxy | sent directly | — | sent directly | sent directly |
+| Sender address the program sees | the real sender | the real sender | the real sender | — | the real sender | another address |
+| `dig` with its own resolver | through the proxy | through the proxy | no answer | through the proxy | no answer | through the proxy |
+| `getaddrinfo` | queried through the proxy | queried through the proxy | placeholder address | placeholder address | placeholder address | queried through the proxy |
+| Static Go binary | sent directly | through the proxy | sent directly | sent directly | sent directly | through the proxy |
+| Proxy stopped: datagrams that reached the server directly | none | none | IPv6, `sendmmsg` | none | `sendto`, `sendmmsg` | `sendmmsg` |
 
 - The 54 combinations: `sendto`, `sendmsg`, `sendmmsg` (each with and without `connect`),
   `send`, `write`, `writev` × `recvfrom`, `recv`, `read`, `readv`, `recvmsg`, `recvmmsg`. A cell
@@ -465,13 +562,16 @@ Per tool:
   stopped, `sendto` was sent directly.
 - **graftcp:** reports another address as the sender and does not handle `sendmmsg`, both listed in
   its README. With the proxy stopped, other sends report success without delivery. `auto` mode
-  falls back to direct DNS; `--select_proxy_mode only_socks5` prevents it. The only tool here
-  that handles a static Go binary.
+  falls back to direct DNS; `--select_proxy_mode only_socks5` prevents it. With udpchains'
+  supervisor mode, the only tools here that handle a static Go binary.
+- **udpchains `--supervise`:** the same results as the shim, and the static Go binary carried
+  too; with the proxy stopped, its sends failed and nothing arrived. Its `getaddrinfo` is glibc's
+  own resolver, its query to the lab's nameserver sent through the proxy to `dns`.
 
 Limits:
 
-- The tests come from udpchains' own requirements. TCP, chains, static binaries, HTTP proxies and
-  other platforms were not measured.
+- The tests come from udpchains' own requirements. TCP, chains, HTTP proxies and other platforms
+  were not measured, and static binaries only as the one Go client.
 - udpchains' authors wrote the tests and configured every tool from its documentation.
 - One proxy, one host, one run per tool. graftcp ran with Docker's seccomp filter disabled; with
   it, graftcp failed intermittently with ptrace errors.
@@ -481,6 +581,8 @@ Limits:
 Python 3). Tool configurations are in `tests/compare/conf/`.
 
 ## How it works
+
+The shim; supervisor mode is described [above](#supervisor-mode-static-and-go-programs).
 
 - The shim interposes on libc's socket calls, for `SOCK_DGRAM` sockets in `AF_INET` and `AF_INET6`
   only, and points the program's own UDP socket at the proxy's relay. There is no second socket, so
@@ -508,7 +610,7 @@ Python 3). Tool configurations are in `tests/compare/conf/`.
 | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) | requirements mapped to design and tests |
 | [`docs/INTEROP-CHECKLIST.md`](docs/INTEROP-CHECKLIST.md) | tests against real proxies |
 | [`docs/FUTURE-UDP-CHAINS.md`](docs/FUTURE-UDP-CHAINS.md) | background to multi-hop chains |
-| [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md) | planned: static and Go binaries |
+| [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md) | background to supervisor mode |
 | [`CHANGELOG.md`](CHANGELOG.md) | changes and known limitations |
 | [`SECURITY.md`](SECURITY.md) | reporting a vulnerability |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | contributing, and the clean-room rule |

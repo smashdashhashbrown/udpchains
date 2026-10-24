@@ -73,7 +73,7 @@ TESTDIR := tests
 # Everything except the wrapper's own main() and the supervisor belongs to the
 # shim.
 SV_SRCS      := $(SRCDIR)/supervise.c $(SRCDIR)/svcall.c $(SRCDIR)/svsock.c \
-                $(SRCDIR)/svtrace.c
+                $(SRCDIR)/svtrace.c $(SRCDIR)/svdns.c
 SHIM_SRCS    := $(filter-out $(SRCDIR)/wrapper.c $(SV_SRCS),\
                              $(wildcard $(SRCDIR)/*.c))
 SHIM_OBJS    := $(SHIM_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)

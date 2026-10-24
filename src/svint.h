@@ -39,6 +39,9 @@ struct sv_sock {
 	struct udpc_socks_chain chain;
 	long last_used;      /* CLOCK_MONOTONIC seconds, for FR-P-08 */
 
+	bool dns_redirected; /* its last query to the system resolver went to dns */
+	struct sockaddr_storage dns_asked; /* that query's address, its reply's sender */
+
 	bool seen;           /* by the sweep in progress */
 	struct sv_sock *next;
 };
@@ -169,5 +172,18 @@ bool sv_uncarriable(int fd);
 void sv_sweep_soon(struct sv *sv);
 
 long long sv_now_ms(void);
+
+/* --- DNS (D-52) ------------------------------------------------------------*/
+
+/* True if dst is port 53 of the system resolver: a loopback address, or a
+ * nameserver in /etc/resolv.conf, read again whenever it changes. */
+bool svdns_system_resolver(const struct sockaddr *dst);
+
+/* Whether a and b are the same address and port, in whichever family's form:
+ * an IPv4 address and its IPv4-mapped IPv6 form are the same. */
+bool svdns_same(const struct sockaddr *a, const struct sockaddr *b);
+
+/* Reads the nameservers from path instead of /etc/resolv.conf: for tests. */
+void svdns_set_path(const char *path);
 
 #endif /* UDPCHAINS_SVINT_H */

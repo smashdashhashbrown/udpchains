@@ -2224,7 +2224,7 @@ replaced it (D-54).*
 ## D-52
 ### Queries to the system resolver are redirected to `dns`, through the proxy
 
-**Date:** 2026-10-22 · **Status:** Accepted, not yet built · FR-SV-12. Revisits D-22, whose
+**Date:** 2026-10-22 · **Status:** Accepted; built (step 6) · FR-SV-12. Revisits D-22, whose
 libc-level resolver does not apply in this mode. Chosen by the maintainer over proxying port 53 as
 addressed.
 
@@ -2273,6 +2273,35 @@ address, not this host's.
   resolver that knows them and that the proxy can reach.
 - **DNS over TCP to other servers, DNS over TLS and DNS over HTTPS** are TCP, which udpchains does
   not proxy (§8), in either mode.
+
+**Built in step 6** (2026-10-23), as decided:
+
+- **The redirect.** A send on a carried socket to the system resolver has its destination
+  replaced by `dns` in the SOCKS header, and the address it was sent to is kept with the socket.
+  A socket connected to the system resolver accepts datagrams from `dns`, as the kernel's peer
+  check would from the address it connected to. A reply from `dns` on such a socket is reported as
+  from the address the program asked, in the socket's family. The loopback guard (D-05 R2)
+  considers `dns`, where the datagrams go, not `127.0.0.53`.
+- **The system resolver** is port 53 of any loopback address, `127.0.0.0/8`, `::1` and their
+  IPv4-mapped forms, or of a `nameserver` in `/etc/resolv.conf`, its zone index ignored. The
+  file is read again when its device, inode, size or modification time changes, which catches a
+  file replaced by rename, as DHCP and VPN clients write it.
+- **TCP to the system resolver's port 53** is refused with `ECONNREFUSED` and a diagnostic, by
+  `connect()` or by a `sendto()` or `sendmsg()` that names it (TCP Fast Open). Carrying it by
+  SOCKS5 `CONNECT` is not built.
+- Tested with a static probe through the fixture proxy to `dnsd`: `sendto()` to `127.0.0.53` and
+  `::1`, a `connect()`ed socket as glibc's resolver uses one, a static program's `getaddrinfo()`,
+  a static Go program's own resolver, port 53 elsewhere not reaching `dns`, the TCP refusals, and
+  `dns` unset. Through each of the seven proxies of the interop suite as well.
+
+It adds one limitation, found while building it:
+
+- **Lookups through an NSS module that asks a local daemon are not seen.** `nss-resolve` asks
+  systemd-resolved over its Unix socket (`/run/systemd/resolve/io.systemd.Resolve`), `nscd` and
+  `mdns` (avahi) theirs, and the daemon resolves the name itself, outside the proxy. A static
+  glibc program loads these modules too. Ubuntu's default `hosts:` line (`files mdns4_minimal
+  [NOTFOUND=return] dns`) sends everything but `.local` names by DNS; distributions that list
+  `resolve` before `dns` do not.
 
 ---
 
@@ -2499,7 +2528,9 @@ one thread.
 - **Cost.** A traced receive that waits costs two stops, and a send or an answered receive one.
   Each stop is a switch to the supervisor and back, with the registers read and written. In the
   prototype, without signals, a send and receive round trip took about 49 µs, against 54–86 µs
-  through user notification and 9 µs natively. It will be measured in udpchains (FR-SV-15).
+  through user notification and 9 µs natively. Measured in udpchains (FR-SV-15), a round trip
+  through the fixture proxy takes 67–85 µs at the median supervised, against 44–68 µs under the
+  shim and 7.5 µs directly; at the 99th percentile, up to about 700 µs.
 - **Non-dumpable processes** (D-48) are unchanged. Being a process's tracer does not keep the
   supervisor's access once it makes itself non-dumpable: checked, its sends and receives on a
   socket placed before then fail with `EPERM`, with D-48's diagnostic.

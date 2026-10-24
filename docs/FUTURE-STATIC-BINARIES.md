@@ -221,6 +221,19 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
    was amended: every call is now traced, and notification is kept only to install a descriptor,
    with the thread's signals blocked meanwhile. None fails with `EINTR` now.
 6. DNS. Then aarch64, interop, `make compare`, and documentation.
+   *Done 2026-10-23, except aarch64:*
+   - **DNS:** queries to the system resolver are redirected to `dns` (D-52).
+   - **Go:** a static Go client is tested when Go is installed (FR-SV-T5).
+   - **Interop:** each of the seven proxies carried the static matrix, fidelity, DNS and Go
+     programs supervised.
+   - **`make compare`:** gained a supervisor-mode column. 54 of 54 combinations went through the
+     proxy over IPv4 and IPv6, and so did the static Go binary; with the proxy stopped, nothing
+     was sent directly.
+   - **Documentation:** the README, the man page and `-h` describe the mode, with its limits per
+     mode (FR-SV-19).
+
+   Found: lookups through an NSS module that asks a local daemon (`nss-resolve`, `nscd`, `mdns`)
+   are not seen (D-52).
 
 ## 8. Risks and open questions
 

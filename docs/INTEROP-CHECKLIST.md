@@ -594,6 +594,30 @@ It is now fixed: the shim reads `SO_ERROR` once the connect's poll reports an er
   loopback. This host has no global IPv6 address.
 - **Throughput.** No rate sweep (§2) was run against these proxies.
 
+### Supervisor mode (2026-10-23)
+
+The same seven proxies, with static programs run under `udpchains --supervise` (D-48):
+
+- `test_matrix-static` (the 108 cells, built `-static`);
+- `test_fidelity-static`, with its `supervised` checks;
+- `test_supervise dns` against `dnsd`: queries to `127.0.0.53` and `::1` redirected to `dns`, a
+  `connect()`ed resolver socket, a static `getaddrinfo()`, port 53 elsewhere not redirected, and
+  TCP to the system resolver refused (D-52);
+- a static Go client (`tests/goclient`), its own resolver included (FR-SV-T5).
+
+| Proxy | matrix | fidelity | DNS | Go |
+|---|---|---|---|---|
+| Dante | pass | pass | pass | pass |
+| 3proxy | pass | expected: drops zero-length datagrams | pass | pass |
+| gost | pass | pass | pass | pass |
+| Xray | pass | expected: drops zero-length datagrams | pass | pass |
+| sing-box | pass | pass | pass | pass |
+| hev-socks5-server | pass | expected: drops zero-length datagrams | pass | pass |
+| shadowsocks-rust | pass | expected: drops zero-length datagrams | pass | pass |
+
+Each proxy did to a supervised program's datagrams exactly what it did to the shim's: the
+zero-length results are the proxies' own, as above. Chains were not run supervised.
+
 ### Configurations used
 
 Dante, `sockd.conf`. For the authenticated instance, `socksmethod: username`, with a system user

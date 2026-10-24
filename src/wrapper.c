@@ -40,8 +40,10 @@ static void usage(FILE *out)
 	fprintf(out,
 	        "usage: udpchains [options] <program> [args...]\n"
 	        "\n"
-	        "Routes a dynamically-linked program's UDP traffic through a\n"
-	        "SOCKS5 proxy that supports UDP ASSOCIATE, or a chain of them.\n"
+	        "Routes a program's UDP traffic through a SOCKS5 proxy that\n"
+	        "supports UDP ASSOCIATE, or a chain of them: a dynamically-linked\n"
+	        "one with a preloaded shim, or with --supervise any program,\n"
+	        "static and Go ones included, from outside it.\n"
 	        "\n"
 	        "options:\n"
 	        "  -f <file>    config file, or a proxychains.conf (default:\n"
@@ -49,6 +51,8 @@ static void usage(FILE *out)
 	        "               /etc/udpchains.conf)\n"
 	        "  -p <addr>    proxy address as host:port or [v6]:port; repeat\n"
 	        "               it for a chain, hop 1 first\n"
+	        "  --supervise  supervisor mode, for static and Go programs\n"
+	        "               (Linux 5.14+, x86-64; see udpchains(1))\n"
 	        "  -q           quiet: errors only\n"
 	        "  -v           verbose: log protocol steps (never payload)\n"
 	        "  -V           print version and exit\n"
@@ -61,19 +65,20 @@ static void usage(FILE *out)
 	        "  UDPCHAINS_USERNAME, UDPCHAINS_PASSWORD_FILE, and for hop n\n"
 	        "  of a chain UDPCHAINS_USERNAME_<n>, UDPCHAINS_PASSWORD_FILE_<n>,\n"
 	        "  UDPCHAINS_DNS, UDPCHAINS_DNS_TIMEOUT, UDPCHAINS_DNS_SEARCH,\n"
-	        "  UDPCHAINS_HOSTS_FILE\n"
+	        "  UDPCHAINS_HOSTS_FILE, UDPCHAINS_SUPERVISE\n"
 	        "\n"
 	        "Name lookups are answered through the proxy, never by this host's\n"
 	        "resolver.  Set UDPCHAINS_DNS (or 'dns =' in the config file) to a\n"
 	        "numeric resolver address; without one, lookups needing DNS fail.\n"
+	        "Supervised, queries to the system resolver go to it instead.\n"
 	        "\n"
 	        "Credentials are never accepted on the command line, because argv\n"
 	        "is visible in ps(1).  Use a file or the environment.\n"
 	        "\n"
-	        "Does not work for: statically-linked binaries, Go binaries,\n"
-	        "setuid/setgid binaries, or programs issuing raw syscalls.\n"
-	        "Local UDP services and service discovery do not work under the\n"
-	        "shim -- see the README.\n");
+	        "The shim does not work for statically-linked binaries, Go\n"
+	        "binaries or programs issuing raw syscalls: use --supervise.\n"
+	        "Neither mode runs setuid/setgid binaries.  Local UDP services\n"
+	        "and service discovery do not work -- see the README.\n");
 }
 
 /* Resolves what execvp() would actually run, so the SEC-06 check inspects the

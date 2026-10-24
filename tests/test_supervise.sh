@@ -56,6 +56,7 @@ start ECHO echo "$B/udpecho" --port 0
 start DELAYED delayed "$B/udpecho" --port 0 --delay 10
 # A proxy that accepts the connection and never answers (D-54).
 start SILENT silent "$P" silent
+start DNSD dnsd "$B/dnsd" --port 0
 # A proxy that is not there: a fixture started and stopped, so its port is
 # free.
 "$B/socks5d" --port 0 --quiet > "$TMP/dead.out" 2>&1 &
@@ -294,6 +295,49 @@ for ((i = 0; i < 20; i++)); do
 	timeout -k 2 10 "${SV[@]}" "$P" threadexit > /dev/null 2>&1 || bad=$((bad + 1))
 done
 check "20 runs of a program whose threads exit first: none hung or failed" "$bad" 0
+
+echo "# DNS: queries to the system resolver go to dns, through the proxy (FR-SV-12, D-52)"
+UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 60 "${SV[@]}" "$P" dns "$DNSD" \
+	> "$TMP/dns.tap" 2> "$TMP/dns.err"
+rc=$?
+sed 's/^/#   /' "$TMP/dns.tap"
+check "test_supervise dns passes, -static" "$rc" 0
+[ "$(grep -c 'QUERY udp 1 a.test' "$TMP/dnsd.err")" -ge 2 ] &&
+	ok "dns received the queries sent to 127.0.0.53 and ::1" ||
+	notok "dns did not receive the redirected queries"
+check "and never the query sent to port 53 elsewhere" \
+	"$(grep -c 'elsewhere.test' "$TMP/dnsd.err")" 0
+grep -q "TCP connection to the system resolver's port 53" "$TMP/dns.err" &&
+	ok "the refused TCP connection says why" || notok "no diagnostic for the refused TCP"
+# Without a config file of the user's own, which might set dns.
+env -u UDPCHAINS_DNS -u UDPCHAINS_CONFIG HOME="$TMP" timeout 60 "${SV[@]}" "$P" nodns \
+	> "$TMP/nodns.tap" 2> "$TMP/nodns.err"
+rc=$?
+sed 's/^/#   /' "$TMP/nodns.tap"
+check "test_supervise nodns passes, -static" "$rc" 0
+grep -q "with no dns configured" "$TMP/nodns.err" &&
+	ok "the refused query says to set dns" || notok "no diagnostic for the refused query"
+
+echo "# a static Go program (FR-SV-T5)"
+# Built here, only when a Go toolchain is installed: make itself needs only a
+# C compiler (acceptance criterion 5).  CGO_ENABLED=0 makes it static, and the
+# standard library alone needs no download.
+if command -v go > /dev/null; then
+	if (cd "$(dirname "$0")/goclient" &&
+	    CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS= go build -o "$TMP/goclient" main.go) \
+		> "$TMP/gobuild.err" 2>&1; then
+		UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 120 "${SV[@]}" "$TMP/goclient" "$ECHO" \
+			> "$TMP/go.tap" 2> /dev/null
+		rc=$?
+		sed 's/^/#   /' "$TMP/go.tap"
+		check "the Go client passes, carried by the supervisor" "$rc" 0
+	else
+		sed 's/^/#   /' "$TMP/gobuild.err"
+		notok "the Go client did not build"
+	fi
+else
+	skip "the Go client (no Go toolchain)"
+fi
 
 echo "# fail-closed: with the proxy down, nothing is sent (SEC-01)"
 before=$(echoed)

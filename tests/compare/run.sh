@@ -29,8 +29,9 @@
 # usage: make compare [COMPARE_ARGS="tool ..."]
 #        tests/compare/run.sh [tool ...]
 #
-#   tool  any of: udpchains socksify pc570 proxando graftcp-auto
-#         graftcp-strict (default: all).  The control always runs.
+#   tool  any of: udpchains udpchains-sv (supervisor mode) socksify pc570
+#         proxando graftcp-auto graftcp-strict (default: all).  The control
+#         always runs.
 #
 # Logs and the summary go to build/compare/.
 
@@ -45,7 +46,7 @@ CLIENT_IMG=udpchains-compare/client
 SERVER_IMG=udpchains-compare/server
 GOST=gogost/gost@sha256:2344854f44e79ad2f19568fe4dc5f2ace88eebf259575347e08a887cee188ec5
 
-ALL="udpchains socksify pc570 proxando graftcp-auto graftcp-strict"
+ALL="udpchains udpchains-sv socksify pc570 proxando graftcp-auto graftcp-strict"
 TOOLS=""
 for a in "$@"; do
 	case " $ALL " in

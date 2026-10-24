@@ -706,12 +706,12 @@ once a second, with no vaguer line after it (D-43). A dropped datagram names its
 
 ## 13. Supervisor mode (FR-SV-*), in progress
 
-**Status:** step 5 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
+**Status:** step 6 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
 D-48 to D-54, the requirements §2b. The supervisor carries a static program's UDP through the
 proxy or chain, from sockets it makes in a reserved range. Calls on those sockets are carried
 while their thread is stopped by `ptrace`, so a signal can never part what was done for a call
-from what it returns (D-54). Threads, `fork`, `vfork`, `clone` and `exec` are followed (step 5).
-Not yet: DNS redirection and aarch64 (step 6).
+from what it returns (D-54). Threads, `fork`, `vfork`, `clone` and `exec` are followed (step 5), and
+queries to the system resolver are redirected to `dns` (step 6, D-52). Not yet: aarch64.
 
 ### 13.1 Where it lives
 
@@ -723,6 +723,7 @@ Linked into the wrapper only, never into the shim:
 | `svtrace.c` | the program's threads under `ptrace`: each stop, the native wait of a receive, signals handed back, group-stops (D-54) |
 | `svcall.c` | answering each call, notified or traced: `socket()`, sends, receives, names, the `dup` family, refusals |
 | `svsock.c` | the sockets the supervisor carries, their associations, and the sweep for closed ones |
+| `svdns.c` | which addresses are the system resolver: loopback, and `/etc/resolv.conf`'s nameservers (D-52) |
 | `svint.h` | what the four share |
 
 The supervisor reuses the SOCKS5 client and chain codec (`socks5.c`), and the datagram rules both
@@ -886,6 +887,21 @@ again, so the signal is handled at once and nothing has been sent.
 Each refusal is reported once a second for each reason (D-33). Each association is reported as in
 shim mode, naming the process and descriptor (FR-C-06).
 
+### 13.5a Name lookups (D-52)
+
+The program's own resolver runs. In a send on a carried socket (`send_one`), a destination that
+`svdns_system_resolver()` says is the system resolver is replaced by `dns`. It is the system
+resolver if it is port 53 of a loopback address, or of a `nameserver` in `/etc/resolv.conf`,
+re-read when its device, inode, size or time changes. The address the program sent to is kept
+with the socket. With `dns` unset the send fails with `ENETUNREACH`.
+
+- `peer_of()` gives a socket connected to the system resolver `dns` as its peer, so the
+  connected-peer check accepts `dns`'s replies (`udpc_dgram_unwrap`).
+- `deliver()` reports a reply from `dns` as from the address the program asked.
+- The loopback guard checks `dns`, where such a socket's datagrams go.
+- In `decide_other`, a `connect()` of an inet stream socket to the system resolver's port 53, or a
+  `sendto()`/`sendmsg()` naming it (TCP Fast Open), is refused with `ECONNREFUSED`.
+
 ### 13.6 Exit and signals
 
 - **Signals** sent to `udpchains` by another process — `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGTERM`,
@@ -942,6 +958,11 @@ shim mode, naming the process and descriptor (FR-C-06).
   socket is carried.
 - Under ASan and UBSan in `run_sanitizers.sh`: the script, and the static matrix and fidelity
   tests, with the supervisor instrumented.
+- The DNS probe (`test_supervise dns`, under `dnsd` as `dns`, and `nodns`), with `dnsd`'s log
+  showing the redirected queries arrived and the one to port 53 elsewhere did not; and a static Go
+  client (`tests/goclient`, built when Go is installed), its own resolver included.
+- `make interop`: the static matrix, fidelity, DNS and Go programs supervised, through each of the
+  seven proxies.
 - By hand, as root, `tests/test_failclosed_capture.sh` (FR-SV-T2): the static probe unsupervised
   as a positive control, then supervised with the proxy unreachable, refusing `ASSOCIATE`, and
   each hop of three dead, and `udpchains` killed while the program sends through a proxy that
