@@ -397,10 +397,13 @@ Without
 such a query fails with
 .BR ENETUNREACH .
 Port 53 anywhere else is proxied as addressed.
-A TCP connection to the system resolver's port 53 is refused with
-.BR ECONNREFUSED ,
-so a truncated answer fails rather than reaching the resolver around the
-proxy.
+A TCP connection to the system resolver's port 53, made after a truncated
+answer, goes to
+.B dns
+too, by SOCKS5 CONNECT through the proxy, on the program's own socket;
+.BR getpeername (2)
+on it names the proxy.
+If the proxy refuses CONNECT, the connection fails.
 .PP
 .B Refused:
 .BR io_uring_setup (2)

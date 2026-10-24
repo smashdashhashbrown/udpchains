@@ -31,10 +31,19 @@
  *                                        runs itself again as "execed"
  *   test_supervise dns <dnsd port>       under the supervisor, with dns set to
  *                                        dnsd: queries to the system resolver
- *                                        reach it, and port 53 elsewhere and TCP
- *                                        to the resolver do not (D-52)
+ *                                        reach it, by UDP and by TCP, and port 53
+ *                                        elsewhere does not (D-52)
  *   test_supervise nodns                 under the supervisor, no dns: queries
  *                                        to the system resolver fail
+ *   test_supervise dnsrefused <dnsd port>
+ *                                        under the supervisor, with a proxy that
+ *                                        refuses CONNECT: TCP to the system
+ *                                        resolver fails, its socket left as a
+ *                                        failed connect leaves it (D-52)
+ *   test_supervise tcpabandon            under the supervisor, with the silent
+ *                                        proxy: a signal while a TCP query's
+ *                                        tunnel is set up is handled at once,
+ *                                        and the connect made again (D-52, D-54)
  *   test_supervise threadexit            under the supervisor: two threads make
  *                                        and close sockets, and exit before
  *                                        the program does
@@ -76,6 +85,7 @@
 #include <linux/close_range.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/epoll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -1227,8 +1237,73 @@ static int ask(const char *ip, uint16_t id, const char *name, const char *want)
 	return ok;
 }
 
+/* Reads exactly n bytes, waiting on a non-blocking socket, for up to 3 s. */
+static int read_exactly(int fd, uint8_t *buf, size_t n)
+{
+	size_t off = 0;
+
+	while (off < n) {
+		struct pollfd p = { fd, POLLIN, 0 };
+		ssize_t k = read(fd, buf + off, n - off);
+
+		if (k > 0) {
+			off += (size_t)k;
+			continue;
+		}
+		if (k < 0 && errno == EAGAIN && poll(&p, 1, 3000) == 1)
+			continue;
+		return -1;
+	}
+	return 0;
+}
+
+/* A query for name with id, framed for TCP: its length first, two bytes. */
+static size_t dns_query_tcp(uint8_t *q, uint16_t id, const char *name)
+{
+	size_t n = dns_query(q + 2, id, name);
+
+	q[0] = (uint8_t)(n >> 8);
+	q[1] = (uint8_t)n;
+	return n + 2;
+}
+
+/* The answer to a query already sent on a TCP connection: its length, or -1. */
+static ssize_t tcp_answer(int fd, uint8_t *r, size_t cap)
+{
+	struct timeval tv = { 3, 0 };
+	uint8_t len[2];
+	size_t n;
+
+	/* A blocking socket waits no longer than a non-blocking one. */
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	if (read_exactly(fd, len, 2) != 0)
+		return -1;
+	n = (size_t)len[0] << 8 | len[1];
+	if (n > cap || read_exactly(fd, r, n) != 0)
+		return -1;
+	return (ssize_t)n;
+}
+
+/* A query for name over a connected TCP socket, and its answer's length. */
+static ssize_t tcp_ask(int fd, uint16_t id, const char *name, uint8_t *r, size_t cap)
+{
+	uint8_t q[514];
+	size_t qn = dns_query_tcp(q, id, name);
+
+	if (write(fd, q, qn) != (ssize_t)qn)
+		return -1;
+	return tcp_answer(fd, r, cap);
+}
+
+/* An answer's ANCOUNT. */
+static unsigned ancount(const uint8_t *r, ssize_t n)
+{
+	return n >= 12 ? (unsigned)r[6] << 8 | r[7] : 0;
+}
+
 /* Under the supervisor with dns set to dnsd's port: queries to the system
- * resolver reach dnsd, through the proxy, and port 53 elsewhere does not. */
+ * resolver reach dnsd, through the proxy, by UDP and by TCP, and port 53
+ * elsewhere does not. */
 static int dns(int dnsd_port)
 {
 	struct sockaddr_storage to = addr_of("127.0.0.53", 53), peer;
@@ -1296,18 +1371,112 @@ static int dns(int dnsd_port)
 		close(fd);
 	}
 
-	TAP_GROUP("TCP to the system resolver's port 53 is refused (D-52)");
-	fd = socket(AF_INET, SOCK_STREAM, 0);
-	TAP_OK(fails_with(connect(fd, (struct sockaddr *)&to, len_of(&to)), ECONNREFUSED),
-	       "connect() to 127.0.0.53:53: ECONNREFUSED, so the resolver's query cannot go "
-	       "upstream around the proxy");
-	close(fd);
-	fd = socket(AF_INET, SOCK_STREAM, 0);
-	qn = dns_query(q, 0x1205, "a.test");
-	TAP_OK(fails_with(sendto(fd, q, qn, MSG_FASTOPEN, (struct sockaddr *)&to, len_of(&to)),
-	                  ECONNREFUSED),
-	       "and by TCP Fast Open: ECONNREFUSED");
-	close(fd);
+	TAP_GROUP("TCP to the system resolver's port 53 goes to dns, by CONNECT through the "
+	          "proxy (D-52)");
+	{
+		static uint8_t big[65535];
+		struct sockaddr_storage to6 = addr_of("::1", 53);
+		struct epoll_event ev;
+		int ep, flags, got = 0;
+
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		TAP_EQ_INT(connect(fd, (struct sockaddr *)&to, len_of(&to)), 0,
+		           "connect() to 127.0.0.53:53, as a resolver does after a truncated "
+		           "answer");
+		n = tcp_ask(fd, 0x1206, "big.test", big, sizeof(big));
+		TAP_EQ_INT((int)ancount(big, n), 100, "big.test's 100 addresses come back over it, "
+		                                      "from dns");
+		TAP_OK(!(fcntl(fd, F_GETFL) & O_NONBLOCK), "the socket is still blocking");
+		TAP_OK(fails_with(connect(fd, (struct sockaddr *)&to, len_of(&to)), EISCONN),
+		       "connect() again: EISCONN, as on any connected socket");
+		plen = sizeof(peer);
+		TAP_OK(getpeername(fd, (struct sockaddr *)&peer, &plen) == 0 &&
+		               memcmp(&peer, &to, len_of(&to)) != 0,
+		       "getpeername() names the proxy, the connection's real peer");
+		close(fd);
+
+		/* Registered before it connects, as an event loop may: the
+		 * socket stays the program's own, so epoll still sees it. */
+		fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+		ep = epoll_create1(EPOLL_CLOEXEC);
+		memset(&ev, 0, sizeof(ev));
+		ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+		ev.data.fd = fd;
+		epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
+		TAP_EQ_INT(connect(fd, (struct sockaddr *)&to6, len_of(&to6)), 0,
+		           "a non-blocking AF_INET6 socket, in epoll already: connect() to "
+		           "[::1]:53 returns 0 at once");
+		TAP_OK(epoll_wait(ep, &ev, 1, 3000) == 1 && (ev.events & EPOLLOUT),
+		       "epoll reports it writable");
+		qn = dns_query_tcp(q, 0x1207, "a.test");
+		if (write(fd, q, qn) == (ssize_t)qn)
+			while (!got && epoll_wait(ep, &ev, 1, 3000) == 1)
+				got = (ev.events & EPOLLIN) != 0;
+		TAP_OK(got, "and readable once dns has answered");
+		n = tcp_answer(fd, r, sizeof(r));
+		TAP_OK(dns_answers(r, n, 0x1207, "192.0.2.1"), "the answer: 192.0.2.1");
+		flags = fcntl(fd, F_GETFL);
+		TAP_OK(flags >= 0 && (flags & O_NONBLOCK), "the socket is still non-blocking");
+		close(fd);
+		close(ep);
+
+		/* TCP Fast Open's sendmsg(), naming the server, with the length
+		 * and the query in two pieces. */
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		qn = dns_query_tcp(q, 0x1208, "multi.test");
+		{
+			struct iovec iov[2] = { { q, 2 }, { q + 2, qn - 2 } };
+			struct msghdr m;
+
+			memset(&m, 0, sizeof(m));
+			m.msg_name = &to;
+			m.msg_namelen = len_of(&to);
+			m.msg_iov = iov;
+			m.msg_iovlen = 2;
+			TAP_EQ_INT((int)sendmsg(fd, &m, MSG_FASTOPEN | MSG_NOSIGNAL), (int)qn,
+			           "TCP Fast Open's sendmsg() to 127.0.0.53:53 connects, and sends "
+			           "the query");
+		}
+		n = tcp_answer(fd, r, sizeof(r));
+		TAP_OK(dns_answers(r, n, 0x1208, "192.0.2.10"), "and dns answers it");
+		close(fd);
+
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		qn = dns_query_tcp(q, 0x1209, "a.test");
+		TAP_EQ_INT((int)sendto(fd, q, qn, MSG_FASTOPEN, (struct sockaddr *)&to, len_of(&to)),
+		           (int)qn, "and by sendto() with MSG_FASTOPEN");
+		n = tcp_answer(fd, r, sizeof(r));
+		TAP_OK(dns_answers(r, n, 0x1209, "192.0.2.1"), "answered too");
+		close(fd);
+
+		/* Connected already: the kernel has the call, whatever it makes
+		 * of the address, and the connection is left alone. */
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		qn = dns_query_tcp(q, 0x120a, "a.test");
+		n = -1;
+		if (connect(fd, (struct sockaddr *)&direct, sizeof(direct)) == 0 &&
+		    (sendto(fd, q, qn, MSG_FASTOPEN, (struct sockaddr *)&to, len_of(&to)) ==
+		             (ssize_t)qn ||
+		     write(fd, q, qn) == (ssize_t)qn))
+			n = tcp_answer(fd, r, sizeof(r));
+		TAP_OK(dns_answers(r, n, 0x120a, "192.0.2.1"),
+		       "on a socket connected to dnsd already, the same sendto() leaves its "
+		       "connection as it was");
+		close(fd);
+
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		res = NULL;
+		got = 0;
+		if (getaddrinfo("big.test", NULL, &hints, &res) == 0)
+			for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next)
+				got++;
+		TAP_EQ_INT(got, 100, "getaddrinfo(big.test), truncated over UDP, finds all 100 "
+		                     "addresses over TCP");
+		if (res != NULL)
+			freeaddrinfo(res);
+	}
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	TAP_EQ_INT(connect(fd, (struct sockaddr *)&direct, sizeof(direct)), 0,
 	           "TCP to another port of loopback is not refused");
@@ -1336,6 +1505,66 @@ static int nodns(void)
 	TAP_OK(getaddrinfo("a.test", NULL, &hints, &res) != 0, "getaddrinfo() fails");
 	if (res != NULL)
 		freeaddrinfo(res);
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	TAP_OK(fails_with(connect(fd, (struct sockaddr *)&to, len_of(&to)), ENETUNREACH),
+	       "connect() a TCP socket to 127.0.0.53:53: ENETUNREACH");
+	close(fd);
+	TAP_DONE();
+}
+
+/* Under the supervisor, through a proxy that refuses CONNECT: TCP to the system
+ * resolver fails, and leaves its socket able to connect again, as a failed
+ * connect does. */
+static int dnsrefused(int dnsd_port)
+{
+	struct sockaddr_storage to = addr_of("127.0.0.53", 53);
+	struct sockaddr_in direct = loopback(dnsd_port);
+	int fd = socket(AF_INET, SOCK_STREAM, 0), rc, err;
+
+	TAP_GROUP("a proxy that refuses CONNECT: TCP to the system resolver fails (D-52)");
+	rc = connect(fd, (struct sockaddr *)&to, len_of(&to));
+	err = errno;
+	TAP_OK(rc < 0, "connect() to 127.0.0.53:53 fails (%s)", rc < 0 ? strerror(err) : "0");
+	TAP_EQ_INT(connect(fd, (struct sockaddr *)&direct, sizeof(direct)), 0,
+	           "the socket is left unconnected: it connects to another port of loopback");
+	close(fd);
+	TAP_DONE();
+}
+
+/* Under the supervisor, with the silent proxy and a connect timeout of 1 s: a
+ * signal during the tunnel's setup is handled at once, and the connect made
+ * again on a socket left as it was. */
+static int tcpabandon(void)
+{
+	struct sockaddr_storage to = addr_of("127.0.0.53", 53);
+	struct itimerval it = { { 0, 0 }, { 0, 300000 } };
+	struct timespec t0;
+	struct sigaction sa;
+	long handled_ms;
+	int fd, rc, err;
+
+	TAP_GROUP("a signal while a TCP query's tunnel is set up is handled at once (D-52, "
+	          "D-54)");
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = note_signal;
+	sigaction(SIGALRM, &sa, NULL); /* no SA_RESTART */
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	setitimer(ITIMER_REAL, &it, NULL);
+	rc = connect(fd, (struct sockaddr *)&to, len_of(&to));
+	err = errno;
+	handled_ms = (g_handled.tv_sec - t0.tv_sec) * 1000 +
+	             (g_handled.tv_nsec - t0.tv_nsec) / 1000000;
+	TAP_EQ_INT((int)g_signals, 1, "the signal was handled");
+	TAP_OK(handled_ms >= 250 && handled_ms < 1000,
+	       "when it arrived, not when the setup gave up (%ld ms)", handled_ms);
+	TAP_OK(rc < 0 && err == ETIMEDOUT, "the connect was made again, and timed out, not "
+	                                   "EINTR or EISCONN (%s)",
+	       rc < 0 ? strerror(err) : "connected");
+	TAP_OK(elapsed_ms(&t0) >= 1200, "after a second setup had waited its own timeout "
+	                                "(%ld ms)",
+	       elapsed_ms(&t0));
+	close(fd);
 	TAP_DONE();
 }
 
@@ -1540,6 +1769,10 @@ int main(int argc, char **argv)
 		return dns(atoi(argv[2]));
 	if (argc == 2 && strcmp(argv[1], "nodns") == 0)
 		return nodns();
+	if (argc == 3 && strcmp(argv[1], "dnsrefused") == 0)
+		return dnsrefused(atoi(argv[2]));
+	if (argc == 2 && strcmp(argv[1], "tcpabandon") == 0)
+		return tcpabandon();
 	if (argc == 2 && strcmp(argv[1], "threadexit") == 0)
 		return threadexit();
 	if (argc == 5 && strcmp(argv[1], "spray") == 0)
@@ -1565,6 +1798,7 @@ int main(int argc, char **argv)
 	                "signals <delayed echo port> <echo port> | silent | "
 	                "abandon <echo port> | lifecycle <echo port> | "
 	                "spray <ip> <port> <secs> | threadexit | dns <dnsd port> | nodns | "
+	                "dnsrefused <dnsd port> | tcpabandon | "
 	                "nodump <tcp port> | "
 	                "churn <echo port> <n> <secs> | "
 	                "pass <path> <port> | "

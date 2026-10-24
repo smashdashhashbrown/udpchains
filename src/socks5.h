@@ -112,6 +112,19 @@ int udpc_socks_associate(const struct udpc_config *cfg,
 int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst,
                        int *out_errno);
 
+/* udpc_socks_connect on fd, a caller's TCP socket not yet connected, rather
+ * than a new one: fd is connected to hop 1 in its own address family (an
+ * AF_INET6 socket reaches an IPv4 proxy v4-mapped), and the tunnel built over
+ * it.  Its file status flags are as they were afterwards.  Returns 0, or -1
+ * with *out_errno set; fd stays open either way, and after a failure may be
+ * connected to the proxy, for the caller to disconnect.
+ *
+ * For supervisor mode, which carries a program's own TCP query to the system
+ * resolver this way, so the program then reads and writes it natively
+ * (D-52). */
+int udpc_socks_connect_on(const struct udpc_config *cfg, int fd,
+                          const struct sockaddr *dst, int *out_errno);
+
 /* Closes the control connection, which is what tells the proxy to release the
  * association (baseline §0.5). */
 /* Rewrites a BND.ADDR that cannot be taken literally.

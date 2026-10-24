@@ -57,6 +57,9 @@ start DELAYED delayed "$B/udpecho" --port 0 --delay 10
 # A proxy that accepts the connection and never answers (D-54).
 start SILENT silent "$P" silent
 start DNSD dnsd "$B/dnsd" --port 0
+# A proxy that refuses CONNECT, and a second hop that logs each one (D-52).
+start NOCONN noconn "$B/socks5d" --port 0 --quiet --no-connect
+start HOP2 hop2 "$B/socks5d" --port 0
 # A proxy that is not there: a fixture started and stopped, so its port is
 # free.
 "$B/socks5d" --port 0 --quiet > "$TMP/dead.out" 2>&1 &
@@ -307,8 +310,33 @@ check "test_supervise dns passes, -static" "$rc" 0
 	notok "dns did not receive the redirected queries"
 check "and never the query sent to port 53 elsewhere" \
 	"$(grep -c 'elsewhere.test' "$TMP/dnsd.err")" 0
-grep -q "TCP connection to the system resolver's port 53" "$TMP/dns.err" &&
-	ok "the refused TCP connection says why" || notok "no diagnostic for the refused TCP"
+[ "$(grep -c 'QUERY tcp 1 big.test' "$TMP/dnsd.err")" -ge 2 ] &&
+	ok "dns received big.test over TCP, from the query and from getaddrinfo()" ||
+	notok "dns did not receive the TCP queries"
+before=$(grep -c 'QUERY tcp' "$TMP/dnsd.err")
+UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 60 "$W" --supervise -p "127.0.0.1:$NOCONN" \
+	"$P" dnsrefused "$DNSD" > "$TMP/dnsrefused.tap" 2> "$TMP/dnsrefused.err"
+rc=$?
+sed 's/^/#   /' "$TMP/dnsrefused.tap"
+check "test_supervise dnsrefused passes, -static" "$rc" 0
+check "a proxy that refuses CONNECT: no TCP query reaches dns" \
+	"$(($(grep -c 'QUERY tcp' "$TMP/dnsd.err") - before))" 0
+grep -q "could not be carried to dns" "$TMP/dnsrefused.err" &&
+	ok "the failed TCP query says why" || notok "no diagnostic for the failed TCP query"
+UDPCHAINS_CONNECT_TIMEOUT=1000 UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 30 "$W" --supervise \
+	-p "127.0.0.1:$SILENT" "$P" tcpabandon > "$TMP/tcpabandon.tap" 2> /dev/null
+rc=$?
+sed 's/^/#   /' "$TMP/tcpabandon.tap"
+check "test_supervise tcpabandon passes, -static" "$rc" 0
+# Through a chain, the last hop makes the CONNECT to dns.
+UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 60 "$W" --supervise -p "127.0.0.1:$PROXY" \
+	-p "127.0.0.1:$HOP2" "$P" dns "$DNSD" > "$TMP/dnschain.tap" 2> /dev/null
+rc=$?
+grep -v '^ok' "$TMP/dnschain.tap" | sed 's/^/#   /'
+check "test_supervise dns passes through a chain of two, -static" "$rc" 0
+[ "$(grep -c "CONNECT 127.0.0.1:$DNSD" "$TMP/hop2.err")" -ge 5 ] &&
+	ok "the chain's second hop made the TCP queries' CONNECTs to dns" ||
+	notok "the second hop made no CONNECT to dns"
 # Without a config file of the user's own, which might set dns.
 env -u UDPCHAINS_DNS -u UDPCHAINS_CONFIG HOME="$TMP" timeout 60 "${SV[@]}" "$P" nodns \
 	> "$TMP/nodns.tap" 2> "$TMP/nodns.err"

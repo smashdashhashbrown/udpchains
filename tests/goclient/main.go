@@ -11,7 +11,7 @@
 //
 // usage: goclient <echo port>
 //
-// Prints TAP.  With UDPCHAINS_DNS set to dnsd, the lookup checks D-52.
+// Prints TAP.  With UDPCHAINS_DNS set to dnsd, the lookups check D-52.
 package main
 
 import (
@@ -111,6 +111,14 @@ func main() {
 			found = found || a == "192.0.2.1"
 		}
 		check(err == nil && found, "LookupHost(a.test) finds 192.0.2.1 (%v, %v)", addrs, err)
+
+		// Truncated over UDP, so asked again over TCP: connected to dns
+		// through the proxy by CONNECT.
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		addrs, err = r.LookupHost(ctx, "big.test")
+		cancel()
+		check(err == nil && len(addrs) == 100, "LookupHost(big.test) finds 100 addresses, "+
+			"over TCP (%d, %v)", len(addrs), err)
 	}
 
 	fmt.Printf("1..%d\n", n)

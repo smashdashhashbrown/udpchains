@@ -769,17 +769,46 @@ void udpc_socks_fixup_hop_relay(struct udpc_socks_addr *relay,
 
 /* --- negotiation ----------------------------------------------------------- */
 
-/* Opens the TCP connection to hop 1.  Returns the connected descriptor, or -1
- * with errno set and nothing left open. */
-static int open_tcp(const struct udpc_config *cfg, const struct budget *b)
+/* Opens the TCP connection to hop 1, on a new descriptor or, given one, on
+ * that: a caller's TCP socket not yet connected, which reaches hop 1 in its own
+ * address family.  Returns the connected descriptor, or -1 with errno set and
+ * nothing left open but the caller's. */
+static int open_tcp(const struct udpc_config *cfg, const struct budget *b, int given)
 {
-	socklen_t plen;
-	int fd, saved;
+	struct sockaddr_storage proxy;
+	socklen_t plen, len;
+	int fd, saved, family;
 
 	plen = udpc_sa_len((const struct sockaddr *)&cfg->proxy);
 	if (plen == 0) {
 		errno = EAFNOSUPPORT;
 		return -1;
+	}
+	memcpy(&proxy, &cfg->proxy, plen);
+
+	if (given >= 0) {
+		len = sizeof(family);
+		if (getsockopt(given, SOL_SOCKET, SO_DOMAIN, &family, &len) != 0)
+			return -1;
+		if (udpc_addr_for_family((const struct sockaddr *)&cfg->proxy, family,
+		                         &proxy) != 0) {
+			/* An AF_INET socket cannot reach an IPv6 proxy. */
+			errno = ENETUNREACH;
+			return -1;
+		}
+		plen = udpc_sa_len((const struct sockaddr *)&proxy);
+		if (connect_with_timeout(given, (const struct sockaddr *)&proxy, plen,
+		                         b) != 0)
+			return -1;
+		/* A connect that returned EINPROGRESS is complete, but the socket
+		 * is marked connected only by connect() again, which returns 0 or
+		 * EISCONN.  Without it the program's own connect() would later
+		 * succeed, where on a connected socket it fails with EISCONN
+		 * (found by test). */
+		(void)connect(given, (const struct sockaddr *)&proxy, plen);
+		/* TCP_NODELAY is left as the program had it: its socket keeps
+		 * the options it chose. */
+		return given;
 	}
 
 	/* SOCK_CLOEXEC at creation, not fcntl afterwards: there is no window in
@@ -789,8 +818,7 @@ static int open_tcp(const struct udpc_config *cfg, const struct budget *b)
 	if (fd < 0)
 		return -1;
 
-	if (connect_with_timeout(fd, (const struct sockaddr *)&cfg->proxy, plen,
-	                         b) != 0) {
+	if (connect_with_timeout(fd, (const struct sockaddr *)&proxy, plen, b) != 0) {
 		saved = errno;
 		close(fd);
 		errno = saved ? saved : ECONNREFUSED;
@@ -1079,10 +1107,11 @@ static int negotiate_hop(int fd, const struct budget *b, const struct hop *h)
 /* Returns a descriptor whose stream is negotiated with hop index k, from 0: a
  * connection to hop 1, extended by CONNECT through each hop before k, each hop
  * negotiated with its own credentials inside the tunnel (FR-CH-03).  *h is left
- * describing hop k, and *family is the family to declare to it (D-44).
- * Returns -1 with errno set and nothing left open. */
+ * describing hop k, and *family is the family to declare to it (D-44).  given
+ * is a caller's socket to build it on, or -1 for a new one.  Returns -1 with
+ * errno set and nothing left open but the caller's. */
 static int open_tunnel(const struct udpc_config *cfg, const struct budget *b,
-                       unsigned k, struct hop *h, int *family)
+                       unsigned k, struct hop *h, int *family, int given)
 {
 	uint8_t dst[UDPC_SOCKS_HDR_MAX];
 	struct udpc_socks_hdr bnd;
@@ -1093,7 +1122,7 @@ static int open_tunnel(const struct udpc_config *cfg, const struct budget *b,
 
 	(void)hop_view(cfg, 0, h);
 	*family = udpc_socks_declared_family(&h->addr, NULL);
-	fd = open_tcp(cfg, b);
+	fd = open_tcp(cfg, b, given);
 	if (fd < 0) {
 		hop_failed(h, "cannot connect", errno);
 		return -1;
@@ -1128,7 +1157,8 @@ static int open_tunnel(const struct udpc_config *cfg, const struct budget *b,
 
 fail:
 	saved = errno;
-	close(fd);
+	if (fd != given)
+		close(fd);
 	errno = saved ? saved : ECONNREFUSED;
 	return -1;
 }
@@ -1147,7 +1177,7 @@ static int associate_hop(const struct udpc_config *cfg, const struct budget *b,
 	ssize_t dlen;
 	int fd, saved, family;
 
-	fd = open_tunnel(cfg, b, k, &h, &family);
+	fd = open_tunnel(cfg, b, k, &h, &family, -1);
 	if (fd < 0)
 		return -1;
 
@@ -1249,8 +1279,11 @@ int udpc_socks_associate_chain(const struct udpc_config *cfg,
 	return 0;
 }
 
-int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst,
-                       int *out_errno)
+/* CONNECT to dst through cfg's chain, on given or on a new descriptor.  Returns
+ * the descriptor, or -1 with *out_errno set and nothing left open but the
+ * caller's. */
+static int connect_through(const struct udpc_config *cfg, const struct sockaddr *dst,
+                           int given, int *out_errno)
 {
 	uint8_t req[UDPC_SOCKS_HDR_MAX];
 	struct udpc_socks_hdr hdr;
@@ -1269,7 +1302,7 @@ int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst
 	}
 
 	b = budget_for(cfg);
-	fd = open_tunnel(cfg, &b, cfg->nextra, &h, &family);
+	fd = open_tunnel(cfg, &b, cfg->nextra, &h, &family, given);
 	if (fd < 0) {
 		*out_errno = errno;
 		return -1;
@@ -1282,11 +1315,39 @@ int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst
 	    request(fd, &b, CMD_CONNECT, req, (size_t)dlen, &hdr) != 0) {
 		saved = errno;
 		hop_failed(&h, "CONNECT failed", saved);
-		close(fd);
+		if (fd != given)
+			close(fd);
 		*out_errno = saved ? saved : ECONNREFUSED;
 		return -1;
 	}
 	return fd;
+}
+
+int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst,
+                       int *out_errno)
+{
+	return connect_through(cfg, dst, -1, out_errno);
+}
+
+int udpc_socks_connect_on(const struct udpc_config *cfg, int fd,
+                          const struct sockaddr *dst, int *out_errno)
+{
+	int flags = fcntl(fd, F_GETFL), rc;
+
+	if (flags < 0) {
+		*out_errno = errno;
+		return -1;
+	}
+	/* The waits poll: the handshake needs a non-blocking socket, and the
+	 * program gets its own flags back. */
+	if (!(flags & O_NONBLOCK) && fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+		*out_errno = errno;
+		return -1;
+	}
+	rc = connect_through(cfg, dst, fd, out_errno) < 0 ? -1 : 0;
+	if (!(flags & O_NONBLOCK))
+		(void)fcntl(fd, F_SETFL, flags);
+	return rc;
 }
 
 void udpc_socks_disconnect(struct udpc_socks_conn *conn)

@@ -235,6 +235,10 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
    Found: lookups through an NSS module that asks a local daemon (`nss-resolve`, `nscd`, `mdns`)
    are not seen (D-52).
 
+   *Added 2026-10-24:* TCP to the system resolver's port 53, refused until then, is carried to
+   `dns` by SOCKS5 `CONNECT` on the program's own socket (D-52). aarch64 (FR-SV-16) is deferred by
+   the maintainer.
+
 ## 8. Risks and open questions
 
 - **Kernel features.** User notification needs Linux 5.0, `pidfd_getfd` 5.6,
@@ -300,8 +304,8 @@ the mode is built (FR-SV-19). Each is explained in its record.
     configured elsewhere is reached on the proxy's network, and fails;
   - a local DNS server's own entries are not used; `/etc/hosts` is;
   - split DNS works only if `dns` knows the internal names and the proxy can reach it;
-  - DNS over TCP to other servers, over TLS and over HTTPS is TCP, which is not proxied; and until
-    TCP to the system resolver is carried by `CONNECT`, a truncated answer fails.
+  - DNS over TCP to other servers, over TLS and over HTTPS is TCP, which is not proxied. TCP to
+    the system resolver is carried to `dns` by `CONNECT` (2026-10-24).
 - **`io_uring` is refused for everything,** files included (D-53). Go does not use it; software
   that does mostly falls back, but a framework that requires it fails to start under supervision.
 - **Linux 5.14 or later,** a reachable program memory (Yama `ptrace_scope` 1 or less), and a

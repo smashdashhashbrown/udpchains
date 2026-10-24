@@ -2246,8 +2246,7 @@ comes from the address they asked.
 - **Port 53 elsewhere** (`dig @9.9.9.9`) is proxied as addressed, exactly as the shim does, so a
   user's explicit choice of server is kept.
 - **TCP to the system resolver's port 53** is never made directly. It is carried by SOCKS5
-  `CONNECT` to `dns`, as the shim's fallback is; until that is built, the connect is refused with
-  `ECONNREFUSED`, so a truncated answer fails rather than leaks.
+  `CONNECT` to `dns`, as the shim's fallback is (built 2026-10-24, below).
 
 **Rejected.**
 
@@ -2286,9 +2285,9 @@ address, not this host's.
   IPv4-mapped forms, or of a `nameserver` in `/etc/resolv.conf`, its zone index ignored. The
   file is read again when its device, inode, size or modification time changes, which catches a
   file replaced by rename, as DHCP and VPN clients write it.
-- **TCP to the system resolver's port 53** is refused with `ECONNREFUSED` and a diagnostic, by
-  `connect()` or by a `sendto()` or `sendmsg()` that names it (TCP Fast Open). Carrying it by
-  SOCKS5 `CONNECT` is not built.
+- **TCP to the system resolver's port 53** was refused with `ECONNREFUSED` and a diagnostic, by
+  `connect()` or by a `sendto()` or `sendmsg()` that names it (TCP Fast Open). Carried since
+  2026-10-24 (below).
 - Tested with a static probe through the fixture proxy to `dnsd`: `sendto()` to `127.0.0.53` and
   `::1`, a `connect()`ed socket as glibc's resolver uses one, a static program's `getaddrinfo()`,
   a static Go program's own resolver, port 53 elsewhere not reaching `dns`, the TCP refusals, and
@@ -2302,6 +2301,46 @@ It adds one limitation, found while building it:
   glibc program loads these modules too. Ubuntu's default `hosts:` line (`files mdns4_minimal
   [NOTFOUND=return] dns`) sends everything but `.local` names by DNS; distributions that list
   `resolve` before `dns` do not.
+
+**TCP carried, 2026-10-24.** A truncated answer is asked again over TCP, and with `options
+use-vc` every query is; refused, those lookups failed. Now a TCP connection to the system
+resolver's port 53 goes to `dns`:
+
+- **On the program's own socket.** At the traced `connect()`, the supervisor connects its copy of
+  the socket to hop 1 (an `AF_INET6` socket reaches an IPv4 proxy v4-mapped) and makes the SOCKS5
+  `CONNECT` to `dns` through every hop, then answers the call with 0. The program then reads and
+  writes the socket natively, through the proxy; nothing below the range is trapped, so this
+  costs nothing per byte. Its descriptor, file status flags, options and epoll registrations stay
+  as they were. Swapping in a socket of the supervisor's was rejected: an epoll registration made
+  before the swap would watch the closed file, and options set before it would be lost.
+- **`connect()` returns 0 once the tunnel is up,** even on a non-blocking socket, where it would
+  natively return `EINPROGRESS`; callers accept either. The socket is made non-blocking for the
+  handshake and its flags restored.
+- **TCP Fast Open:** a `sendto()` or `sendmsg()` with `MSG_FASTOPEN` naming the system resolver,
+  on a socket not yet connected, connects so, then sends its data on the socket.
+- **Only a socket not yet connected (`TCP_CLOSE`) connects;** on any other the call goes to the
+  kernel, which fails it or sends on the connection the socket has. A stream socket that is not
+  TCP (SCTP, MPTCP) is still refused with `ECONNREFUSED`.
+- **A failure** (the proxy refuses `CONNECT`, or cannot be reached) returns its error, with a
+  diagnostic, and dissolves the connection with `connect(AF_UNSPEC)`, so the socket can connect
+  again, as after a failed connect. With `dns` unset, it fails with `ENETUNREACH`, as a datagram
+  does.
+- **A signal abandons the setup** (D-54): the connection is dissolved, the signal handled, and
+  the `connect()` made again.
+- **What the program sees differently:** `getpeername()` names the proxy, not `127.0.0.53`.
+  Other supervised calls wait while the tunnel is set up, as they do for an association.
+- **No new path around the proxy:** TCP goes only to hop 1, as the supervisor's own control
+  connections do.
+- Tested with the static probe: `big.test` (100 addresses, truncated over UDP) over a blocking
+  `AF_INET` socket and a static `getaddrinfo()`; a non-blocking `AF_INET6` socket registered with
+  epoll before it connects; Fast Open by `sendmsg()` in two pieces and by `sendto()`; through a
+  chain of two, whose second hop made the `CONNECT`s; a proxy that refuses `CONNECT` (no query
+  reaches `dns`, and the socket connects elsewhere afterwards); a signal during the handshake with
+  a silent proxy; and `dns` unset. A static Go program's own resolver finds `big.test`'s 100
+  addresses over TCP.
+- **Found by test:** a non-blocking connect that has completed marks the socket connected only
+  once `connect()` is called again; without that call, a second `connect()` by the program
+  succeeded instead of failing with `EISCONN`. `udpc_socks_connect_on` makes it.
 
 ---
 

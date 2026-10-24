@@ -602,7 +602,9 @@ The same seven proxies, with static programs run under `udpchains --supervise` (
 - `test_fidelity-static`, with its `supervised` checks;
 - `test_supervise dns` against `dnsd`: queries to `127.0.0.53` and `::1` redirected to `dns`, a
   `connect()`ed resolver socket, a static `getaddrinfo()`, port 53 elsewhere not redirected, and
-  TCP to the system resolver refused (D-52);
+  TCP to the system resolver refused (D-52). Rerun on 2026-10-24 with TCP carried by `CONNECT`
+  instead: all 26 checks passed through each of the seven proxies, `big.test` over TCP included;
+  the Go client found `big.test`'s 100 addresses through each;
 - a static Go client (`tests/goclient`), its own resolver included (FR-SV-T5).
 
 | Proxy | matrix | fidelity | DNS | Go |

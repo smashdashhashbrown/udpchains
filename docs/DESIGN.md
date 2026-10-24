@@ -900,7 +900,15 @@ with the socket. With `dns` unset the send fails with `ENETUNREACH`.
 - `deliver()` reports a reply from `dns` as from the address the program asked.
 - The loopback guard checks `dns`, where such a socket's datagrams go.
 - In `decide_other`, a `connect()` of an inet stream socket to the system resolver's port 53, or a
-  `sendto()`/`sendmsg()` naming it (TCP Fast Open), is refused with `ECONNREFUSED`.
+  `sendto()`/`sendmsg()` naming it with `MSG_FASTOPEN`, goes to `dns_over_tcp()`. On a TCP socket
+  in `TCP_CLOSE` (`TCP_INFO`), it connects the supervisor's copy of the program's socket to hop 1
+  and makes the SOCKS5 `CONNECT` to `dns` through the chain (`udpc_socks_connect_on`, which makes
+  the socket non-blocking for the handshake and restores its flags), then answers 0, or, for Fast
+  Open, sends the call's data on it and answers the count. The program then uses the socket
+  natively. A failure dissolves the connection (`connect(AF_UNSPEC)`) and returns its error; a
+  signal does the same, and the call is made again (D-54). A socket in any other state goes to the
+  kernel. A stream socket that is not TCP is refused with `ECONNREFUSED`; with `dns` unset,
+  `ENETUNREACH`.
 
 ### 13.6 Exit and signals
 
@@ -959,8 +967,11 @@ with the socket. With `dns` unset the send fails with `ENETUNREACH`.
 - Under ASan and UBSan in `run_sanitizers.sh`: the script, and the static matrix and fidelity
   tests, with the supervisor instrumented.
 - The DNS probe (`test_supervise dns`, under `dnsd` as `dns`, and `nodns`), with `dnsd`'s log
-  showing the redirected queries arrived and the one to port 53 elsewhere did not; and a static Go
-  client (`tests/goclient`, built when Go is installed), its own resolver included.
+  showing the redirected queries arrived, by UDP and by TCP, and the one to port 53 elsewhere did
+  not. The same probe through a chain of two, whose second hop logs the `CONNECT`s;
+  `dnsrefused`, through a proxy that refuses `CONNECT`, with no TCP query reaching `dnsd`; and
+  `tcpabandon`, a signal during the tunnel's setup with the silent proxy. A static Go client
+  (`tests/goclient`, built when Go is installed), its own resolver included, by UDP and by TCP.
 - `make interop`: the static matrix, fidelity, DNS and Go programs supervised, through each of the
   seven proxies.
 - By hand, as root, `tests/test_failclosed_capture.sh` (FR-SV-T2): the static probe unsupervised

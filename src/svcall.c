@@ -31,6 +31,7 @@
 #include <limits.h>
 #include <linux/kcmp.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -1343,9 +1344,9 @@ static enum sv_outcome decide_dup2(struct call *c)
 /* A call on a descriptor that is not a socket the supervisor carries: through
  * to the kernel, unless it is a UDP, raw or packet socket it did not make
  * (D-50) and the call would send, connect or move data on it. */
-/* D-52: whether a call connects a TCP socket to the system resolver's port 53,
- * by connect(), or by a sendto() or sendmsg() naming it (TCP Fast Open). */
-static bool tcp_to_system_resolver(struct call *c, int copy)
+/* D-52: whether a call connects a stream socket to the system resolver's port
+ * 53, by connect(), or by a sendto() or sendmsg() naming it (TCP Fast Open). */
+static bool stream_to_system_resolver(struct call *c, int copy)
 {
 	const __u64 *a = c->req->data.args;
 	struct sockaddr_storage dst;
@@ -1386,6 +1387,115 @@ static bool tcp_to_system_resolver(struct call *c, int copy)
 	return svdns_system_resolver((const struct sockaddr *)&dst);
 }
 
+/* TCP Fast Open's data, after its connection has been made: sent on the
+ * program's socket as the call would have sent it.  Returns the count sent, or
+ * -errno. */
+static long long fastopen_data(struct call *c, int copy)
+{
+	const __u64 *a = c->req->data.args;
+	unsigned long iovcnt = 1;
+	size_t total;
+	ssize_t n;
+	int flags, err;
+
+	if (c->req->data.nr == SYS_sendto) {
+		g_riov[0].iov_base = (void *)(uintptr_t)a[1];
+		g_riov[0].iov_len = (size_t)a[2];
+		total = (size_t)a[2];
+		flags = (int)a[3];
+	} else {
+		struct msghdr m;
+
+		if (mem_read(c, a[1], &m, sizeof(m)) != 0)
+			return -EFAULT;
+		err = read_iovecs(c, (uint64_t)(uintptr_t)m.msg_iov, m.msg_iovlen, EMSGSIZE,
+		                  &total);
+		if (err != 0)
+			return -err;
+		iovcnt = (unsigned long)m.msg_iovlen;
+		flags = (int)a[2];
+	}
+	/* A stream may send less than asked; the program sends the rest. */
+	if (total > c->sv->buflen)
+		total = c->sv->buflen;
+	if (total > 0 &&
+	    process_vm_readv((pid_t)c->req->pid, &(struct iovec){ c->sv->buf, total }, 1,
+	                     g_riov, iovcnt, 0) != (ssize_t)total)
+		return -EFAULT;
+	n = send(copy, c->sv->buf, total,
+	         (flags & ~MSG_FASTOPEN) | MSG_DONTWAIT | MSG_NOSIGNAL);
+	return n < 0 ? -(long long)errno : (long long)n;
+}
+
+/* D-52: a TCP connection to the system resolver's port 53 is made to dns
+ * instead, by SOCKS5 CONNECT through the proxy, on the program's own socket.
+ * The program then reads and writes it natively, its epoll registrations and
+ * options as they were.  connect() returns 0 once the tunnel is up, even on a
+ * non-blocking socket; a send with MSG_FASTOPEN connects so, then sends its
+ * data.  A failure leaves the socket unconnected, as a failed connect does,
+ * and a signal abandons the setup, the call made again once it is handled. */
+static enum sv_outcome dns_over_tcp(struct call *c, int copy)
+{
+	const struct udpc_config *cfg = c->sv->cfg;
+	const __u64 *a = c->req->data.args;
+	int nr = c->req->data.nr, proto = 0, flags, err;
+	struct tcp_info ti;
+	socklen_t len;
+	long long sent = 0;
+
+	len = sizeof(proto);
+	memset(&ti, 0, sizeof(ti));
+	if (getsockopt(copy, SOL_SOCKET, SO_PROTOCOL, &proto, &len) != 0 ||
+	    proto != IPPROTO_TCP ||
+	    getsockopt(copy, IPPROTO_TCP, TCP_INFO, &ti, &(socklen_t){ sizeof(ti) }) != 0) {
+		close(copy);
+		refused(c, WHY_DNS_TCP, "a stream connection other than TCP to the system "
+		                        "resolver's port 53, which would send queries "
+		                        "around the proxy (D-52)");
+		return answer(c, 0, ECONNREFUSED);
+	}
+
+	/* Only a socket not connected yet connects.  On any other the kernel
+	 * fails the connect, or sends on the connection the socket has; and a
+	 * send without MSG_FASTOPEN never connects. */
+	flags = nr == SYS_sendto ? (int)a[3] : nr == SYS_sendmsg ? (int)a[2] : 0;
+	if (ti.tcpi_state != TCP_CLOSE || (nr != SYS_connect && !(flags & MSG_FASTOPEN))) {
+		close(copy);
+		return let_through(c);
+	}
+	if (!cfg->dns_set) {
+		close(copy);
+		refused(c, WHY_NO_DNS, "a TCP query to the system resolver, with no dns "
+		                       "configured; set dns, or UDPCHAINS_DNS (D-52)");
+		return answer(c, 0, ENETUNREACH);
+	}
+
+	udpc_debug("process %u fd %d: a TCP query to the system resolver, carried to dns "
+	           "by CONNECT through the proxy",
+	           c->req->pid, (int)a[0]);
+	if (udpc_socks_connect_on(cfg, copy, (const struct sockaddr *)&cfg->dns, &err) != 0) {
+		struct sockaddr unspec = { .sa_family = AF_UNSPEC };
+
+		/* connect(2): AF_UNSPEC dissolves the association, so the socket
+		 * can connect again. */
+		(void)connect(copy, &unspec, sizeof(unspec));
+		close(copy);
+		if (err != EINTR) {
+			char why[160];
+
+			snprintf(why, sizeof(why), "a TCP query to the system resolver, which "
+			                           "could not be carried to dns: %s (D-52)",
+			         strerror(err));
+			refused(c, WHY_DNS_TCP, why);
+		}
+		return answer(c, 0, err);
+	}
+	if (nr != SYS_connect)
+		sent = fastopen_data(c, copy);
+	close(copy);
+	return sent < 0 ? answer(c, 0, (int)-sent) : answer(c, sent, 0);
+}
+
 static enum sv_outcome decide_other(struct call *c, int copy)
 {
 	int nr = c->req->data.nr;
@@ -1393,16 +1503,10 @@ static enum sv_outcome decide_other(struct call *c, int copy)
 	                  nr != SYS_getpeername && nr != SYS_dup && nr != SYS_fcntl;
 
 	/* D-52: the local resolver would send the queries upstream itself,
-	 * around the proxy.  Refused until such a connection can be carried by
-	 * SOCKS5 CONNECT to dns, so a truncated answer fails rather than
-	 * leaks. */
+	 * around the proxy; the connection goes to dns instead. */
 	if ((nr == SYS_connect || nr == SYS_sendto || nr == SYS_sendmsg) &&
-	    tcp_to_system_resolver(c, copy)) {
-		close(copy);
-		refused(c, WHY_DNS_TCP, "a TCP connection to the system resolver's port 53, "
-		                        "which would send queries around the proxy (D-52)");
-		return answer(c, 0, ECONNREFUSED);
-	}
+	    stream_to_system_resolver(c, copy))
+		return dns_over_tcp(c, copy);
 	if (moves_data && sv_uncarriable(copy)) {
 		close(copy);
 		refused(c, WHY_RECEIVED_FD, "a UDP, raw or packet socket the supervisor did "

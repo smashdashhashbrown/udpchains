@@ -318,9 +318,11 @@ The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/res
 - **Without `dns`,** such a query fails with `ENETUNREACH`, so lookups fail; nothing goes
   anywhere directly.
 - **Port 53 anywhere else** (`dig @9.9.9.9`) is proxied as addressed.
-- **TCP to the system resolver's port 53 is refused** with `ECONNREFUSED`, so a truncated answer
-  fails rather than reaching the local resolver, which would send the query upstream around the
-  proxy.
+- **TCP to the system resolver's port 53** — how resolvers ask again after a truncated answer,
+  and how they always ask with `options use-vc` — goes to `dns` too, by SOCKS5 `CONNECT` through
+  the proxy. The program's own socket is connected through the proxy and then used natively;
+  `getpeername()` on it names the proxy. If the proxy refuses `CONNECT`, the connection fails, and
+  the query goes nowhere.
 - A resolver configured elsewhere than `/etc/resolv.conf` on a non-loopback address is proxied as
   addressed. A local DNS server's own entries (dnsmasq) are not used; `/etc/hosts` is.
 - **Lookups made through an NSS module that asks a local daemon** — `nss-resolve` (systemd-resolved
