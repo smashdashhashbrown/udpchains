@@ -4,8 +4,11 @@
  * including zero-length datagrams, which FR-F-06 requires round-trip as
  * zero-length and distinct from "no datagram".
  *
- * usage: udpecho [--port N] [-6] [--quiet] [--switch-port]
+ * usage: udpecho [--port N] [-6] [--quiet] [--switch-port] [--delay MS]
  * Prints "PORT <n>" on stdout once bound.
+ *
+ * --delay holds each reply back by MS milliseconds, so that a client's receive
+ * is still waiting when something interrupts it (FR-SV-T4).
  *
  * --switch-port reproduces TFTP's defining behaviour: the first datagram is
  * answered from a DIFFERENT, freshly bound port, and the conversation continues
@@ -31,6 +34,7 @@ int main(int argc, char **argv)
 {
 	int port = 0;
 	bool v6 = false, quiet = false, switch_port = false;
+	int delay_ms = 0;
 	int fd, reply_fd = -1;
 	struct sockaddr_storage addr;
 	socklen_t alen;
@@ -45,6 +49,8 @@ int main(int argc, char **argv)
 			quiet = true;
 		else if (strcmp(argv[i], "--switch-port") == 0)
 			switch_port = true;
+		else if (strcmp(argv[i], "--delay") == 0 && i + 1 < argc)
+			delay_ms = atoi(argv[++i]);
 		else {
 			fprintf(stderr, "udpecho: unknown option %s\n", argv[i]);
 			return 1;
@@ -171,6 +177,9 @@ int main(int argc, char **argv)
 			fprintf(stderr, "udpecho: %zd bytes\n", n);
 			fflush(stderr);
 		}
+
+		if (delay_ms > 0)
+			usleep((useconds_t)delay_ms * 1000);
 
 		/* n may be 0; sendto with length 0 is correct and required. */
 		(void)sendto(switch_port && reply_fd >= 0 ? reply_fd : src, buf,

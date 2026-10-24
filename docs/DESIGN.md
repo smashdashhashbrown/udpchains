@@ -706,10 +706,12 @@ once a second, with no vaguer line after it (D-43). A dropped datagram names its
 
 ## 13. Supervisor mode (FR-SV-*), in progress
 
-**Status:** step 3 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
-D-48 to D-53, the requirements §2b. The supervisor carries a static program's UDP through the
-proxy or chain, from sockets it makes in a reserved range. Not yet: the signal tests (step 4),
-threads and the supervisor-killed test (step 5), DNS redirection and aarch64 (step 6).
+**Status:** step 4 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
+D-48 to D-54, the requirements §2b. The supervisor carries a static program's UDP through the
+proxy or chain, from sockets it makes in a reserved range. Calls on those sockets are carried
+while their thread is stopped by `ptrace`, so a signal can never part what was done for a call
+from what it returns (D-54). Not yet: the thread tests and the wire capture (step 5), DNS
+redirection and aarch64 (step 6).
 
 ### 13.1 Where it lives
 
@@ -718,9 +720,10 @@ Linked into the wrapper only, never into the shim:
 | File | Holds |
 |---|---|
 | `supervise.c` | the filter, start-up, the loop, exit status and signals |
-| `svcall.c` | answering each call: `socket()`, sends, receives, names, the `dup` family, refusals |
+| `svtrace.c` | the program's threads under `ptrace`: each stop, the native wait of a receive, signals handed back, group-stops (D-54) |
+| `svcall.c` | answering each call, notified or traced: `socket()`, sends, receives, names, the `dup` family, refusals |
 | `svsock.c` | the sockets the supervisor carries, their associations, and the sweep for closed ones |
-| `svint.h` | what the three share |
+| `svint.h` | what the four share |
 
 The supervisor reuses the SOCKS5 client and chain codec (`socks5.c`), and the datagram rules both
 front ends apply (`dgram.c`): the multicast and broadcast refusal, `MSG_MORE` and GSO, the loopback
@@ -744,31 +747,39 @@ wrapper: kernel ≥ 5.14? inherited UDP/raw/packet socket?        → refuse (D-
          tell the parent the listener's number; wait for its ack
          close the listener; exec the program
  parent: pidfd_open(child); pidfd_getfd(listener) → its own copy
-         ack; read until the exec closes the pipe (or its errno)
+         PTRACE_SEIZE(child): seccomp stops, syscall-exit stops, threads,
+           forks and execs followed, EXITKILL                    (D-54)
+         ack
          raise its own RLIMIT_NOFILE to the hard limit, for control connections
-         serve until no supervised process is left
+         serve until no supervised process is left; the exec's errno, if it
+           fails, arrives on the pipe meanwhile
 ```
 
 Every failure before the `exec` refuses to run the program (FR-SV-02): no seccomp, a filter the
-kernel or a container refuses, a listener the parent cannot copy (Yama `ptrace_scope` above 1).
-The program never holds the listener: it is closed before the `exec`, and close-on-exec besides.
+kernel or a container refuses, a listener the parent cannot copy (Yama `ptrace_scope` above 1), or
+a child it cannot trace (already traced, as under `strace -f`, or `ptrace` forbidden). The program
+never holds the listener: it is closed before the `exec`, and close-on-exec besides. The pipe is
+read inside the loop rather than waited on, since a signal reaching the traced child before its
+`exec` stops it until the loop hands the signal on.
 
 ### 13.3 The filter
 
 Built at run time, x86-64 only so far, by a small assembler that resolves forward jumps to labels.
 A call from another ABI, or with `__X32_SYSCALL_BIT`, fails with `ENOSYS` in the kernel. Sent to
-the supervisor:
+the supervisor, by one of two routes (D-54):
 
-- `socket()` for `AF_INET`, `AF_INET6` and `AF_PACKET`;
-- always: `connect`, `sendto`, `sendmsg`, `sendmmsg`, `sendfile`, `splice`, `io_uring_setup`,
-  `pidfd_getfd`;
-- when the descriptor is in the range: `read`, `write`, `readv`, `writev`, `preadv2`, `pwritev2`,
-  `recvfrom`, `recvmsg`, `recvmmsg`, `bind`, `getsockname`, `getpeername`, `close`, `dup`;
-- `dup2` and `dup3` from or to the range; `close_range` reaching it; `fcntl` on it, and any
-  `F_DUPFD` or `F_DUPFD_CLOEXEC`.
+- **traced** (`SECCOMP_RET_TRACE`), when the descriptor is in the range: `read`, `write`, `readv`,
+  `writev`, `preadv2`, `pwritev2`, `recvfrom`, `recvmsg`, `recvmmsg`, `connect`, `sendto`,
+  `sendmsg`, `sendmmsg`, `bind`, `getsockname`, `getpeername`, `close`;
+- **notified** (`SECCOMP_RET_USER_NOTIF`): `socket()` for `AF_INET`, `AF_INET6` and `AF_PACKET`;
+  `connect`, `sendto`, `sendmsg` and `sendmmsg` below the range; always `sendfile`, `splice`,
+  `io_uring_setup` and `pidfd_getfd`; `dup` of a descriptor in the range; `dup2` and `dup3` from or
+  to it; `close_range` reaching it; and `fcntl`'s `F_DUPFD` and `F_DUPFD_CLOEXEC`, on any
+  descriptor. Only notification can place a descriptor at a chosen number.
 
 Everything else runs in the kernel, so file and TCP I/O below the range never reaches the
-supervisor. `pread64`, `pwrite64`, `preadv` and `pwritev` are not sent: the kernel refuses them on
+supervisor, nor does any other `fcntl`. With no tracer attached, a traced call fails with `ENOSYS`
+and never runs (`seccomp(2)`). `pread64`, `pwrite64`, `preadv` and `pwritev` are not sent: the kernel refuses them on
 a socket itself. A descriptor is compared unsigned, so a negative one counts as in the range and
 gets the kernel's own `EBADF`.
 
@@ -800,9 +811,35 @@ forgotten that time.
 
 ### 13.5 Answering
 
-One notification at a time, in one thread. Before using anything read from the program's memory
-or descriptors, the supervisor checks the notification is still pending, so a call the program
-abandoned, or a thread number reused, is never acted on.
+One call at a time, in one thread, through the same code whichever way it came (`decide()` in
+`svcall.c`). Before using anything read from a notified call's memory or descriptors, the
+supervisor checks the notification is still pending, so a call the program abandoned, or a thread
+number reused, is never acted on. A traced call's thread is stopped until the supervisor resumes
+it, so it cannot be abandoned.
+
+**A traced call** (`svtrace.c`) stops its thread at its entry. The supervisor reads its registers,
+decides it, and then:
+
+- **skips it, returning a result:** the call number set to -1 and the result where a result goes;
+- **lets it run** as the program made it: `close`, and calls on a descriptor in the range that the
+  supervisor does not carry;
+- **makes it again,** after any signal waiting has been handled, by stepping back over the
+  two-byte `syscall` instruction: when an association's setup was abandoned for a signal;
+- **lets a receive wait natively,** when nothing is queued and the call may block. The call is
+  rewritten as a zero-length `recvfrom(fd, NULL, 0, MSG_PEEK | MSG_TRUNC)` on the same
+  descriptor, and the thread resumed until the call returns (`PTRACE_SYSCALL`). The peek blocks
+  until a datagram is queued, takes nothing, and has the receive's own `SO_RCVTIMEO`, `EINTR` and
+  `SA_RESTART`. Linux checks the rewritten call against the filter again; on the same descriptor
+  it is traced again, and runs. When it returns, the program's registers are put back, call number
+  included. The datagram is then taken and delivered while the thread is stopped; if another
+  reader took it, the call is made again. Otherwise the peek's own result stands, and a restart is
+  the kernel's, of the program's own call.
+
+**Abandoning a setup.** While a traced call sets up an association, the SOCKS client's waits are
+cut into 50 ms slices (`udpc_socks_set_cancel`). Between slices the supervisor reads the thread's
+`/proc/<tid>/status`. A signal pending for the thread or its process, not blocked, and not
+ignored either explicitly or by default, abandons the setup with `EINTR`. The call is then made
+again, so the signal is handled at once and nothing has been sent.
 
 - **`socket()`:** raw and packet sockets `EPERM`, ICMP and UDP-Lite `EPROTONOSUPPORT`; UDP as
   above; anything else continues. Its arguments are values, so continuing cannot be raced.
@@ -810,11 +847,11 @@ abandoned, or a thread number reused, is never acted on.
   with `process_vm_readv`, checked as in shim mode (`EMSGSIZE`, `EDESTADDRREQ`, multicast,
   `MSG_MORE`, GSO), wrapped, and sent on the supervisor's copy to the relay, never blocking the
   supervisor for long. `sendmmsg` reports partial success as the kernel does.
-- **Receives** on a carried socket (D-51): peek, check and strip every layer, write the payload,
-  sender and message fields into the program, answer, and consume only if the answer was
-  accepted. `recvmmsg` returns one datagram. With nothing queued, a non-blocking receive gets
-  `EAGAIN`; a blocking one is **parked**, and its socket joins the loop's `poll` set until a
-  datagram arrives, its `SO_RCVTIMEO` passes, or the call is gone.
+- **Receives** on a carried socket (D-54), while the thread is stopped: peek, check and strip
+  every layer, write the payload, sender and message fields into the program, and consume.
+  `recvmmsg` takes as many as are queued, up to its `vlen`. With nothing queued, a non-blocking
+  receive gets `EAGAIN`; a blocking one waits natively, as above. A buffer that cannot be written
+  loses the datagram, as natively.
 - **`connect`, `bind`, `getsockname`, `getpeername`** on a carried socket: as the shim answers
   them (FR-F-08, FR-P-05, FR-I-05). `bind` is performed on the supervisor's copy, so the address
   checked is the one bound.
@@ -834,6 +871,13 @@ shim mode, naming the process and descriptor (FR-C-06).
 - **Signals** sent to `udpchains` by another process — `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGTERM`,
   `SIGUSR1`, `SIGUSR2`, `SIGALRM`, `SIGWINCH` — are forwarded to the program. One from the
   terminal (`si_code` `SI_KERNEL`) is not: the terminal has sent it to the program already.
+- **The program's signals** stop it, as its tracer's, before they are delivered. Each is handed
+  back unchanged. A group-stop (`SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`) is held with
+  `PTRACE_LISTEN`, so the program stays stopped until `SIGCONT`, as unsupervised. A stop reported
+  for a new thread or process, or at the end of a group-stop, is simply continued.
+- **Stops and exits** both arrive as `SIGCHLD`, on the signalfd. `svtrace_reap()` takes each with
+  `waitpid(-1, WNOHANG | __WALL)`. A stop is handled, and an exit asks for a sweep.
+- **If the supervisor dies,** `PTRACE_O_EXITKILL` kills every traced process with it.
 - **Descendants.** The supervisor is a child subreaper, so a descendant the program leaves running
   becomes its child, and stays supervised. It serves until the listener reports end of file, or
   no child is left.
@@ -852,12 +896,20 @@ shim mode, naming the process and descriptor (FR-C-06).
   the `dup` family, names, refused sends, receives that wait, time out and are interrupted,
   `poll`, and a socket inherited across `fork`, including by a child that outlives the parent's
   descriptor; 40 sockets used and closed, after which the supervisor holds no control
-  connection; the leak client, static and dynamic, against a dead proxy sending nothing; a UDP
+  connection; the signal tests (`test_supervise signals`, FR-SV-T4): receives under storms of
+  signals with and without `SA_RESTART` losing nothing and sends never failing with `EINTR` or
+  repeated, `SO_RCVTIMEO` and `SIGSTOP`/`SIGCONT` as signal(7) describes them, 2,000 `close`s
+  under a storm none left open, `fcntl(F_GETFD)` never interrupted, and the program traced by
+  `udpchains` and refused `PTRACE_TRACEME`; a signal during a hung handshake handled at once and
+  the send made again (`test_supervise abandon`, against `test_supervise silent`), and `SIGTERM`
+  then ending the program at once; the program killed with the supervisor; a refusal to start
+  under `strace -f`; the leak client, static and dynamic, against a dead proxy sending nothing; a UDP
   socket received from an unsupervised process refused on every send route but D-50's `write()`
   gap, which delivers its one byte; and an inherited UDP socket refusing the run.
 - `FR-SV-T1-matrix`: the hook matrix, built `-static`, under the supervisor, directly and through
   two hops.
 - `FR-SV-fidelity`: TST-05 built `-static`, checking the two documented differences as such:
-  `recvmmsg` returns one datagram per call, and stdio on a UDP socket is carried.
+  `recvmmsg` returns the datagrams already queued without waiting for more, and stdio on a UDP
+  socket is carried.
 - Under ASan and UBSan in `run_sanitizers.sh`: the script, and the static matrix and fidelity
   tests, with the supervisor instrumented.

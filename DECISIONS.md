@@ -61,12 +61,13 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-45](#d-45) | Setup has an overall deadline, `chain_timeout`: by default `connect_timeout` per hop of a chain | FR-CH-02; settles a FUTURE-UDP-CHAINS §8 question |
 | [D-46](#d-46) | When the shim's descriptor range is full, its connection stays where it is, protected, and that is reported | FR-CH-10; extends D-26 |
 | [D-47](#d-47) | A proxychains.conf is read as it is, for the strict chain of `socks5` hops it shares | FR-CH-14, FR-C-04 |
-| [D-48](#d-48) | Supervisor mode intercepts system calls with seccomp user notification | FR-SV-02, FR-SV-03, FR-SV-13; revisits FR-I-01 |
+| [D-48](#d-48) | Supervisor mode intercepts system calls with seccomp user notification (revised by D-54) | FR-SV-02, FR-SV-03, FR-SV-13; revisits FR-I-01 |
 | [D-49](#d-49) | Supervisor mode is chosen explicitly, and never combined with the shim | FR-SV-01, FR-SV-17 |
 | [D-50](#d-50) | UDP sockets live in a reserved range; outside it, UDP sends and connects are refused | FR-SV-04, FR-SV-18 |
-| [D-51](#d-51) | A supervised receive peeks, delivers, and consumes only once the program has the datagram | FR-SV-07, FR-SV-08 |
+| [D-51](#d-51) | A supervised receive peeks, delivers, and consumes only once the program has the datagram (superseded by D-54) | FR-SV-07, FR-SV-08 |
 | [D-52](#d-52) | Queries to the system resolver are redirected to `dns`, through the proxy | FR-SV-12; revisits D-22 |
 | [D-53](#d-53) | What supervisor mode refuses, and Linux 5.14 as its floor | FR-SV-02, FR-SV-09; revisits D-29, D-36, NFR-01a |
+| [D-54](#d-54) | A supervised program's calls on its UDP sockets are carried while it is stopped, through `ptrace` | FR-SV-06, FR-SV-07, FR-SV-08, FR-SV-13; revises D-48, D-51 |
 
 ---
 
@@ -1913,7 +1914,9 @@ file, three directives are warned about once each, and a `dynamic_chain` file ru
 ## D-48
 ### Supervisor mode intercepts system calls with seccomp user notification
 
-**Date:** 2026-10-22 · **Status:** Accepted; built for x86-64 (steps 2 and 3) · FR-SV-02, FR-SV-03, FR-SV-13.
+**Date:** 2026-10-22 · **Status:** Accepted; built for x86-64 (steps 2 and 3); revised by
+[D-54](#d-54), which carries calls on the reserved range through `ptrace` · FR-SV-02, FR-SV-03,
+FR-SV-13.
 Revisits FR-I-01 (`LD_PRELOAD` as the only mechanism). Background:
 [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md).
 
@@ -1979,7 +1982,8 @@ shim (`dgram.c` holds the checks both front ends apply). It adds three limitatio
   inherits. Chosen by the maintainer over letting such a process's connects and sends below the
   range through unchecked, which would widen the received-socket gap (D-50) for it.
 - **A send interrupted after its datagram has left is sent again** if the call restarts
-  (`SA_RESTART`). UDP permits duplicates, but a native send is never repeated.
+  (`SA_RESTART`). UDP permits duplicates, but a native send is never repeated. *Removed by D-54:*
+  a send is now performed while its thread is stopped.
 
 **Revisit if:** a kernel interface appears that lets a supervisor see a descriptor's type in the
 filter, which would remove the reserved range (D-50).
@@ -2139,7 +2143,9 @@ Unix sockets.
 ## D-51
 ### A supervised receive peeks, delivers, and consumes only once the program has the datagram
 
-**Date:** 2026-10-22 · **Status:** Accepted; built in part (step 3) · FR-SV-07, FR-SV-08. Chosen by the
+**Date:** 2026-10-22 · **Status:** Superseded by [D-54](#d-54), which found that a reply the
+kernel accepted can still be discarded, losing the datagram; built in part (step 3) · FR-SV-07,
+FR-SV-08. Chosen by the
 maintainer over letting signals wait, and over accepting an occasional lost datagram.
 
 **Context.** While the supervisor performs a receive, the program's call can be interrupted by a
@@ -2191,7 +2197,8 @@ datagram arrives. At the socket's `SO_RCVTIMEO` it answers `EAGAIN`, as a native
 call that has gone is forgotten: the same thread's next call shows it was interrupted, and parked
 calls are asked once a second whether they are still pending. A signal interrupting a waiting
 receive gives `EINTR` (tested). Left for step 4: the signal tests of FR-SV-T4, including
-`SA_RESTART` and that no datagram is lost.
+`SA_RESTART` and that no datagram is lost. *Step 4 found the loss this design cannot prevent, and
+replaced it (D-54).*
 
 ---
 
@@ -2275,7 +2282,8 @@ this mode only).
   (Ubuntu 22.04, RHEL 9). The shim's floor is unchanged.
 - **Refusing to start** (FR-SV-02): on an older kernel, when the filter cannot be installed (a
   container's seccomp profile, say), when the program's memory cannot be reached (Yama
-  `ptrace_scope` above 1), or with an inherited UDP socket (D-50). The program is never run
+  `ptrace_scope` above 1), when the program cannot be traced (D-54: it is already traced, or
+  `ptrace` is forbidden), or with an inherited UDP socket (D-50). The program is never run
   unsupervised.
 
 **Why refusing `io_uring` is acceptable.** A filter sees only `io_uring_setup`, never what a ring
@@ -2297,3 +2305,195 @@ software that uses it generally handles `ENOSYS` and falls back to ordinary call
 **Revisit if:** a program is found that needs `io_uring` and cannot fall back; refusing only rings
 that touch sockets would need inspecting each submission, which a seccomp filter cannot do.
 
+---
+
+## D-54
+### A supervised program's calls on its UDP sockets are carried while it is stopped, through `ptrace`
+
+**Date:** 2026-10-23 · **Status:** Accepted; built for x86-64 (step 4) ·
+FR-SV-06, FR-SV-07, FR-SV-08, FR-SV-13, FR-SV-T4. Revises D-48 (which rejected `ptrace`) and D-51
+(peek, deliver, commit), for the calls below. Chosen by the maintainer over accepting a rare lost
+datagram, over checking for a pending signal before each reply, and over making waiting receives
+uninterruptible.
+
+**Context.** Step 4's signal tests found that D-51 cannot keep its promise that no datagram is
+lost. With seccomp user notification, the supervisor's reply and the program's view of its call are
+not settled at the same moment: the thread waits interruptibly until the reply is collected. When
+a signal lands in that instant, `SECCOMP_IOCTL_NOTIF_SEND` succeeds, yet the call returns `EINTR`
+or restarts, and the reply is discarded. A successful reply is therefore no proof that the program
+has the datagram, and nothing the supervisor can see afterwards tells the two cases apart. Traced
+twice: the payload had been written into the program's buffer and the reply accepted, but `recv`
+returned -1. Measured under a signal every 100 µs, 1,000 datagrams per run:
+
+| Under a signal every 100 µs | Runs | Lost | Duplicates | Sends failing `EINTR` | Interrupted receives |
+|---|---|---|---|---|---|
+| udpchains, step 4 (D-51 as built) | 25 | 2, in 2 runs | — | — | — |
+| prototype, user notification (D-51's order) | 200 | 6, in 6 runs | 12,839 | 22,042 | 114,762 |
+| prototype, `ptrace` (this decision) | 200 | **0** | **0** | **0** | 4,180 |
+
+Further `ptrace` runs (`SA_RESTART`, a 1 ms and a 10 ms echo, a signal every 50 µs, 320 runs in
+all, about 170,000 interrupted receives) lost nothing and sent nothing twice. A prototype that
+dropped every 100th datagram on purpose was caught (10 lost per run). The same race reaches sends:
+an interrupted send whose datagram has left returns `EINTR`, which a native UDP send never does,
+and is then sent again. It reaches `bind` and `connect` too, which the supervisor performs itself:
+a bind that succeeded can report `EINTR`, and the program's retry then fails with `EINVAL`.
+
+It reaches `close`, which the supervisor lets continue in the kernel: when the reply is
+discarded, the call reports `EINTR` without having run. Linux closes a descriptor even when
+`close` reports `EINTR`, so programs do not close it again, and it stays open, with its socket and
+association. Measured with 200,000 `close` calls on UDP sockets under a signal every 100 µs,
+without `SA_RESTART`:
+
+| `close` on a UDP socket | Failed with `EINTR` | Descriptor still open after it |
+|---|---|---|
+| native | 0 | 0 |
+| udpchains, step 3 (user notification) | 7,122 | **7,122** |
+| prototype, `ptrace` (this decision) | 0 | 0 |
+
+With `SA_RESTART`, all three closed every descriptor: the interrupted call restarts and runs.
+
+**Decision.** One filter, two mechanisms, chosen per call by the filter.
+
+- **Calls on a descriptor in the reserved range** (D-50) return `SECCOMP_RET_TRACE`. The thread
+  then stops, and the supervisor, attached as its tracer, handles the call while it cannot run. A
+  signal sent meanwhile is only queued: the call returns what the supervisor set, and the signal
+  is delivered after it (`ptrace(2)`). These are:
+  - the sends: `sendto`, `sendmsg`, `sendmmsg`, `write`, `writev`, `pwritev2`;
+  - the receives: `recvfrom`, `recvmsg`, `recvmmsg`, `read`, `readv`, `preadv2`;
+  - `bind`, `connect`, `getsockname`, `getpeername` and `close`.
+- **Every other trapped call stays on user notification** (D-48), as built in steps 2 and 3:
+  - `socket` and the `dup` family (`dup`, `dup2`, `dup3`, `fcntl(F_DUPFD*)`), which must place a
+    descriptor at a chosen number in the range. Only `SECCOMP_IOCTL_NOTIF_ADDFD` can; `ptrace` could
+    only by injecting system calls into the program. `ADDFD` with `SEND` installs the descriptor and
+    answers in one step, and was measured to leak none: 400,000 `socket()` calls under the same
+    storm, 8,766 of them interrupted.
+  - `close_range`.
+  - Calls outside the range, which are only checked and then let through or refused (D-50, D-53).
+- **`fcntl` is trapped only for `F_DUPFD` and `F_DUPFD_CLOEXEC`.** Step 3's filter traps every
+  `fcntl` on a descriptor in the range and lets the other commands through unchanged, which only
+  adds the chance of an `EINTR` that `F_GETFD` and its like never give natively. Measured: 1,530
+  under the same storm.
+- **A send** is performed at its stop, from the supervisor's copy of the socket. The call is then
+  skipped, and returns what the send returned. If the association must first be set up and a
+  signal becomes pending during the proxy handshake, the setup is abandoned and nothing is sent.
+  The call is made again once the signal has been handled, as under `SA_RESTART`, so the signal
+  takes effect at once rather than after `connect_timeout`. The same holds for a receive that
+  sets up its association.
+- **A receive** with a datagram queued, or that must not wait (`O_NONBLOCK`, `MSG_DONTWAIT`), is
+  answered at its stop and skipped. Otherwise the program waits in its own kernel, natively:
+  - The supervisor rewrites the call as a zero-length `recvfrom` with `MSG_PEEK | MSG_TRUNC`, on
+    the same descriptor. That blocks until a datagram is queued, honours `SO_RCVTIMEO`, `EINTR`
+    and `SA_RESTART` as a receive does, and consumes nothing. Linux checks a rewritten call against
+    the filter again (since 4.8, `seccomp(2)`). This one, on the same descriptor in the range, is
+    traced again, and then runs.
+  - When it returns, the thread stops again. The supervisor first puts back the program's
+    registers, call number included, since the program keeps its arguments across a call.
+  - If a datagram was queued, the supervisor takes it from its copy, checks and strips its
+    headers (D-41), writes the payload and real sender into the program, and sets the return
+    value, all while the thread is stopped. `recvmmsg` gets as many as are queued, up to its
+    `vlen`, without waiting for more. A program's own `MSG_PEEK` is delivered without
+    consuming.
+  - If another reader took the datagram first, the call is made again, to wait for the next one.
+  - Otherwise the peek's own result stands: `EAGAIN` at `SO_RCVTIMEO`, `EINTR`, or a restart the
+    kernel makes of the program's own call.
+- **`bind` and `connect`** are performed at the stop, on the supervisor's copy, as now, and skipped.
+  **`getsockname` and `getpeername`** are answered at the stop (FR-I-05). **`close`** is noted for a
+  sweep (D-50) and runs natively.
+- **Attaching.** The child waits until the supervisor has attached with `PTRACE_SEIZE`, before it
+  installs the filter and runs the program. The options are:
+  - `PTRACE_O_TRACESECCOMP` and `PTRACE_O_TRACESYSGOOD`, to see trapped calls and their returns;
+  - `PTRACE_O_TRACECLONE`, `_TRACEFORK`, `_TRACEVFORK` and `_TRACEEXEC`, so every new thread and
+    process is attached before it runs;
+  - `PTRACE_O_EXITKILL`.
+
+  The program's own signals are handed back to it at each signal stop. A group stop is held with
+  `PTRACE_LISTEN`, so `SIGSTOP`, Ctrl-Z and `SIGCONT` behave as they do unsupervised.
+- **Fail-closed, twice over** (FR-SV-13), which answers D-48's reason for rejecting `ptrace`. A
+  traced call with no tracer attached is not executed and fails with `ENOSYS` (`seccomp(2)`;
+  checked on this host). And with `PTRACE_O_EXITKILL`, every traced process is killed if the
+  supervisor dies (checked: killing the prototype's tracer mid-run took the program with it).
+  The program never continues untraced.
+- **The floor stays Linux 5.14** (D-53): `PTRACE_SEIZE` and `PTRACE_LISTEN` date from 3.4,
+  `PTRACE_O_EXITKILL` from 3.8, and the re-check of a rewritten call from 4.8. No new refusal is
+  added for Yama: D-53 already refuses to start above `ptrace_scope` 1. A container whose seccomp
+  profile denies `ptrace` makes the mode refuse to start (FR-SV-02).
+
+**What this changes in D-51.** Peek, deliver, commit and parked receives are no longer needed, and
+neither is carrying an `SO_RCVTIMEO` deadline across restarts (step 4's fix): the kernel waits,
+times out and restarts the program's own call. D-51's limitations are lifted:
+
+- `recvmmsg` is no longer limited to one datagram per call (FR-SV-07's "MAY").
+- An interrupted receive no longer leaves a payload in the program's buffer.
+- A socket also read by an unsupervised process loses nothing.
+
+Receives are interrupted about as often as natively: in the prototype, 20 per run under `ptrace`,
+against about 570 when every receive waited on the supervisor.
+
+**What this changes in D-48.** User notification remains the mechanism for creating and placing
+descriptors and for refusals. D-48's step-3 limitation of repeated sends is removed. Its
+limitation of association setup holding up other trapped calls remains: the supervisor is still
+one thread.
+
+**Rejected.**
+
+- **Keeping D-51 and accepting the loss,** documented as a kernel race. Rare (about 1 in 10,000
+  to 20,000 interrupted receives here), but the maintainer requires that none be lost.
+- **Checking for a pending signal before each reply** (`/proc/<tid>/status`). It narrows the
+  window, does not close it, and costs a read per receive.
+- **`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` for every call** (Linux 5.19). A call already taken by
+  the supervisor could no longer be interrupted. A receive waiting there for a datagram would then
+  wait through every signal but `SIGKILL`: the `alarm()` case D-51 rejected.
+- **`ptrace` for every call.** Placing a descriptor at a chosen number would need system calls
+  injected into the program, and `ADDFD` already does it without loss.
+- **The supervisor waiting while the thread is stopped,** instead of letting the program wait
+  natively. Signals would wait with it: the `alarm()` case again.
+
+**Known limitations.**
+
+- **One tracer per process.** A supervised program cannot be debugged with `gdb` or traced with
+  `strace` from inside the supervision. A supervised program that attaches to its children with
+  `ptrace` (a debugger, `strace` itself, some crash reporters) gets `EPERM`. Running `udpchains`
+  itself under `strace -f` makes the mode refuse to start, since its child is already traced.
+  Accepted by the maintainer.
+- **Calls left on user notification can still fail with `EINTR`** when a signal arrives while the
+  supervisor holds them. It is a difference from a native socket, but never loses or repeats
+  anything. Measured for `socket()`: 8,766 of 200,000 calls, without `SA_RESTART`. `dup2` and
+  `dup3` may fail with `EINTR` natively; `socket` may not. On Linux 5.19,
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` on these calls alone would remove it once the supervisor
+  has taken the call, since none of them waits long. It is left for later.
+- **Cost.** A traced receive that waits costs two stops, and a send or an answered receive one.
+  Each stop is a switch to the supervisor and back, with the registers read and written. In the
+  prototype, without signals, a send and receive round trip took about 49 µs, against 54–86 µs
+  through user notification and 9 µs natively. It will be measured in udpchains (FR-SV-15).
+- **Non-dumpable processes** (D-48) are unchanged. Being a process's tracer does not keep the
+  supervisor's access once it makes itself non-dumpable: checked, its sends and receives on a
+  socket placed before then fail with `EPERM`, with D-48's diagnostic.
+- **An abandoned setup is made again, never reported.** A program that relies on a signal to get
+  `EINTR` out of a send, while the proxy hangs in the handshake, has the send made again instead.
+  A native UDP send never waits for a proxy, so programs have no reason to do this.
+- **A blocking `recvmmsg` without `MSG_WAITFORONE`** returns the datagrams already queued, at least
+  one, where a native socket waits until `vlen` have arrived. `recvmmsg` may always return fewer
+  than asked.
+- **A program built with LeakSanitizer** cannot run its leak check under supervision: it stops its
+  own threads with `ptrace`, and it reports a fatal error at exit. AddressSanitizer itself works.
+- **aarch64** (FR-SV-16) reads and rewrites registers differently (`PTRACE_GETREGSET`, with
+  `NT_ARM_SYSTEM_CALL` to change or skip a call). It is to be done in step 6.
+
+**Built in step 4** (2026-10-23), as decided, in `svtrace.c`. The parked receives, and step 4's
+carrying of `SO_RCVTIMEO` deadlines across restarts, were removed. Measured in udpchains, under a
+signal every 100 µs:
+
+- **Receives:** 20 runs of the signal tests, 5,293 interrupted receives in the dense storm, none
+  lost, and no send failed with `EINTR` or was repeated.
+- **`close`:** 200,000 calls on UDP sockets, none failed with `EINTR`, and none left open (7,122
+  under step 3).
+- **`fcntl(F_GETFD)`:** never interrupted.
+- **Abandoning:** a signal during a hung handshake was handled after 302 ms, against a 1,000 ms
+  `connect_timeout`, and `SIGTERM` then ended the program at once.
+
+`SO_RCVTIMEO` now behaves exactly as signal(7) describes for a native socket:
+- an interrupted receive on a socket with a timeout fails with `EINTR` even under `SA_RESTART`;
+- it also does after `SIGSTOP` and `SIGCONT`, where a socket without one restarts.
+
+**Revisit if:** Linux gains a way for a notification's reply to be committed to the program before
+a signal can take effect. Every call could then return to user notification.

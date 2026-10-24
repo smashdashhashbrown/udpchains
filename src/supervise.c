@@ -1,13 +1,15 @@
-/* supervise.c -- supervisor mode: the filter, start-up, the notification
- * loop, and the program's exit status and signals (D-48 to D-53).
+/* supervise.c -- supervisor mode: the filter, start-up, the loop, and the
+ * program's exit status and signals (D-48 to D-54).
  *
  * The wrapper forks.  The child sets no_new_privs, installs a seccomp filter
  * with a user-notification listener, and execs the program.  The parent takes a
- * copy of the listener and becomes the supervisor: the kernel stops the
- * program at each call the filter selects, and svcall.c answers it -- performs
- * it, lets it continue, or fails it with an errno and a diagnostic.
+ * copy of the listener, attaches to the child with ptrace, and becomes the
+ * supervisor: the kernel stops the program at each call the filter selects,
+ * and svcall.c answers it -- performs it, lets it continue, or fails it with an
+ * errno and a diagnostic.  A call on a descriptor in the range stops its
+ * thread through ptrace (svtrace.c); the rest are notified (D-54).
  *
- * Written from the man pages only: seccomp(2), seccomp_unotify(2),
+ * Written from the man pages only: seccomp(2), seccomp_unotify(2), ptrace(2),
  * pidfd_open(2), pidfd_getfd(2) (D-01).
  */
 #include "supervise.h"
@@ -28,6 +30,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
@@ -69,20 +72,25 @@ bool udpc_kernel_at_least(const char *release, int major, int minor)
 	return maj > major || (maj == major && min >= minor);
 }
 
-/* --- the filter (D-48, D-50, D-53) -----------------------------------------
+/* --- the filter (D-48, D-50, D-53, D-54) ----------------------------------
  *
  * One ABI: x86-64, without x32's call numbers (seccomp(2): x32 shares x86-64's
  * arch value, and is told apart by __X32_SYSCALL_BIT).  A call from any other
  * ABI fails with ENOSYS, never runs.  Then the calls the supervisor answers:
  *
- *   - socket() for the families it must see;
- *   - on every descriptor, the calls that could send on, or connect, a socket
- *     it did not make, and the routes around it (D-50, D-53);
  *   - on a descriptor in the reserved range, where every UDP socket lives,
- *     the calls that move data or change what the number refers to.  Below
- *     the range, file and TCP I/O never leaves the kernel (D-50);
- *   - dup2 and dup3 to or from the range, close_range reaching it, and fcntl
- *     on it or duplicating anything.
+ *     the calls that move data, connect, bind, name or close: traced (D-54).
+ *     Below the range, file and TCP I/O never leaves the kernel (D-50);
+ *   - below the range, the calls that could send on, or connect, a socket the
+ *     supervisor did not make, and on every descriptor the routes around it:
+ *     notified (D-50, D-53);
+ *   - socket() for the families it must see, dup of a descriptor in the
+ *     range, dup2 and dup3 to or from it, close_range reaching it, and fcntl
+ *     duplicating anything: notified, since only notification can place a
+ *     descriptor at a chosen number (D-54).
+ *
+ * With no tracer attached, a traced call fails with ENOSYS and never runs
+ * (seccomp(2)); with the supervisor gone, so does a notified one.
  */
 
 #if defined(__x86_64__)
@@ -93,19 +101,24 @@ bool udpc_kernel_at_least(const char *release, int major, int minor)
 #define X32_BIT 0u
 #endif
 
-/* Sent to the supervisor whatever their arguments. */
+/* Notified whatever their arguments. */
 static const int g_always[] = {
-	SYS_connect, SYS_sendto, SYS_sendmsg, SYS_sendmmsg, SYS_sendfile,
-	SYS_splice, SYS_io_uring_setup, SYS_pidfd_getfd,
+	SYS_sendfile, SYS_splice, SYS_io_uring_setup, SYS_pidfd_getfd,
 };
 
-/* Sent to the supervisor when their first argument, a descriptor, is in the
- * range.  pread64, pwrite64, preadv and pwritev are not: the kernel refuses
- * them on a socket itself. */
+/* Traced on a descriptor in the range; notified on any other, which must not
+ * be a UDP socket (D-50). */
+static const int g_sends[] = {
+	SYS_connect, SYS_sendto, SYS_sendmsg, SYS_sendmmsg,
+};
+
+/* Traced when their first argument, a descriptor, is in the range.  pread64,
+ * pwrite64, preadv and pwritev are not: the kernel refuses them on a socket
+ * itself. */
 static const int g_in_range[] = {
 	SYS_read, SYS_write, SYS_readv, SYS_writev, SYS_preadv2, SYS_pwritev2,
 	SYS_recvfrom, SYS_recvmsg, SYS_recvmmsg, SYS_bind, SYS_getsockname,
-	SYS_getpeername, SYS_close, SYS_dup,
+	SYS_getpeername, SYS_close,
 };
 
 /* socket() families sent to the supervisor; any other family runs. */
@@ -114,7 +127,10 @@ static const unsigned g_families[] = { AF_INET, AF_INET6, AF_PACKET };
 #define COUNT(a) (sizeof(a) / sizeof((a)[0]))
 #define FILTER_MAX 96
 
-enum { L_NOTIFY, L_SOCKET, L_FD0, L_DUP, L_CLOSE_RANGE, L_FCNTL, L_COUNT };
+enum {
+	L_NOTIFY, L_TRACE, L_SOCKET, L_FD0, L_SEND, L_DUP1, L_DUP, L_CLOSE_RANGE, L_FCNTL,
+	L_COUNT
+};
 
 /* A small assembler: BPF jumps only forward, by at most 255, so every jump
  * names a label placed later, and is resolved once all are placed. */
@@ -171,8 +187,11 @@ static unsigned build_filter(struct bpf *b, unsigned range)
 	jump_if(b, BPF_JEQ, SYS_socket, L_SOCKET);
 	for (k = 0; k < COUNT(g_always); k++)
 		jump_if(b, BPF_JEQ, (unsigned)g_always[k], L_NOTIFY);
+	for (k = 0; k < COUNT(g_sends); k++)
+		jump_if(b, BPF_JEQ, (unsigned)g_sends[k], L_SEND);
 	for (k = 0; k < COUNT(g_in_range); k++)
 		jump_if(b, BPF_JEQ, (unsigned)g_in_range[k], L_FD0);
+	jump_if(b, BPF_JEQ, SYS_dup, L_DUP1);
 	jump_if(b, BPF_JEQ, SYS_dup2, L_DUP);
 	jump_if(b, BPF_JEQ, SYS_dup3, L_DUP);
 	jump_if(b, BPF_JEQ, SYS_close_range, L_CLOSE_RANGE);
@@ -189,6 +208,16 @@ static unsigned build_filter(struct bpf *b, unsigned range)
 	 * answered with the kernel's own EBADF. */
 	place(b, L_FD0);
 	load_word(b, ARG(0));
+	jump_if(b, BPF_JGE, range, L_TRACE);
+	stmt(b, BPF_RET | BPF_K, allow);
+
+	place(b, L_SEND);
+	load_word(b, ARG(0));
+	jump_if(b, BPF_JGE, range, L_TRACE);
+	stmt(b, BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
+
+	place(b, L_DUP1);
+	load_word(b, ARG(0));
 	jump_if(b, BPF_JGE, range, L_NOTIFY);
 	stmt(b, BPF_RET | BPF_K, allow);
 
@@ -204,9 +233,9 @@ static unsigned build_filter(struct bpf *b, unsigned range)
 	jump_if(b, BPF_JGE, range, L_NOTIFY);
 	stmt(b, BPF_RET | BPF_K, allow);
 
+	/* Only duplicating: every other command leaves a descriptor as it is,
+	 * and runs in the kernel (D-54). */
 	place(b, L_FCNTL);
-	load_word(b, ARG(0));
-	jump_if(b, BPF_JGE, range, L_NOTIFY);
 	load_word(b, ARG(1));
 	jump_if(b, BPF_JEQ, F_DUPFD, L_NOTIFY);
 	jump_if(b, BPF_JEQ, F_DUPFD_CLOEXEC, L_NOTIFY);
@@ -214,6 +243,9 @@ static unsigned build_filter(struct bpf *b, unsigned range)
 
 	place(b, L_NOTIFY);
 	stmt(b, BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
+
+	place(b, L_TRACE);
+	stmt(b, BPF_RET | BPF_K, SECCOMP_RET_TRACE);
 
 	for (k = 0; k < b->nfix; k++)
 		b->f[b->fix_at[k]].jt =
@@ -272,9 +304,6 @@ static int refuse_inherited(void)
  * that went with a process or an exec. */
 #define SWEEP_SOON_MS 200
 #define SWEEP_EVERY_MS 5000
-/* How often parked receives are asked whether their calls are still pending,
- * when nothing else wakes the loop. */
-#define PRUNE_EVERY_MS 1000
 
 long long sv_now_ms(void)
 {
@@ -303,39 +332,6 @@ static void serve_one(struct sv *sv)
 		(void)ioctl(sv->listener, SECCOMP_IOCTL_NOTIF_SEND, sv->resp);
 }
 
-/* Whether the poll set says fd is readable, or has an error to report. */
-static bool ready(const struct pollfd *p, size_t np, int fd)
-{
-	size_t i;
-
-	for (i = 0; i < np; i++)
-		if (p[i].fd == fd)
-			return (p[i].revents & (POLLIN | POLLERR | POLLHUP)) != 0;
-	return false;
-}
-
-/* Retries every parked receive whose socket is readable or whose deadline has
- * passed, and forgets those answered or gone.  Matched by descriptor, since
- * answering a call may have parked or pruned others since the poll. */
-static void serve_parked(struct sv *sv, const struct pollfd *p, size_t np, long long now)
-{
-	struct sv_parked **pp = &sv->parked;
-
-	while (*pp != NULL) {
-		struct sv_parked *q = *pp;
-		bool due = ready(p, np, q->copy) ||
-		           (q->deadline_ms != 0 && now >= q->deadline_ms);
-
-		if (due && svcall_retry_parked(sv, q, now)) {
-			*pp = q->next;
-			close(q->copy);
-			free(q);
-			continue;
-		}
-		pp = &q->next;
-	}
-}
-
 /* --- signals and exit ------------------------------------------------------*/
 
 /* Signals the supervisor forwards to the program when another process sends
@@ -347,29 +343,15 @@ static const int g_forwarded[] = {
 	SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGALRM, SIGWINCH,
 };
 
-static void reap(struct sv *sv, bool *none_left)
-{
-	int st;
-	pid_t p;
-
-	while ((p = waitpid(-1, &st, WNOHANG)) > 0) {
-		if (p == sv->child) {
-			sv->child_status = st;
-			sv->child_done = true;
-		}
-	}
-	if (p < 0 && errno == ECHILD)
-		*none_left = true;
-}
-
+/* SIGCHLD comes for each stop of a traced thread as well as for each exit:
+ * svtrace.c handles both. */
 static void on_signal(struct sv *sv, bool *none_left)
 {
 	struct signalfd_siginfo si;
 
 	while (read(sv->sigfd, &si, sizeof(si)) == (ssize_t)sizeof(si)) {
 		if (si.ssi_signo == SIGCHLD) {
-			reap(sv, none_left);
-			sv_sweep_soon(sv);
+			svtrace_reap(sv, none_left);
 			continue;
 		}
 		if (si.ssi_code <= 0 && !sv->child_done)
@@ -495,48 +477,28 @@ static unsigned range_start(void)
 	return 768;
 }
 
-/* The loop's poll set: the listener, the signals, and each parked receive's
- * socket.  Returns how many, or 0 if out of memory. */
-static size_t poll_set(struct sv *sv, struct pollfd **p, size_t *cap)
-{
-	struct sv_parked *q;
-	size_t n = 2;
-
-	for (q = sv->parked; q != NULL; q = q->next)
-		n++;
-	if (n > *cap) {
-		struct pollfd *more = realloc(*p, n * sizeof(**p));
-
-		if (more == NULL)
-			return 0;
-		*p = more;
-		*cap = n;
-	}
-	(*p)[0] = (struct pollfd){ sv->listener, POLLIN, 0 };
-	(*p)[1] = (struct pollfd){ sv->sigfd, POLLIN, 0 };
-	n = 2;
-	for (q = sv->parked; q != NULL; q = q->next)
-		(*p)[n++] = (struct pollfd){ q->copy, POLLIN, 0 };
-	return n;
-}
-
-/* How long the loop may sleep: until the next sweep, parked deadline or
- * prune, or for ever. */
+/* How long the loop may sleep: until the next sweep, or for ever. */
 static int poll_timeout(const struct sv *sv, long long now)
 {
-	const struct sv_parked *q;
-	long long until = -1;
-
-	if (sv->sweep_at_ms != 0)
-		until = sv->sweep_at_ms;
-	for (q = sv->parked; q != NULL; q = q->next)
-		if (q->deadline_ms != 0 && (until < 0 || q->deadline_ms < until))
-			until = q->deadline_ms;
-	if (sv->parked != NULL && (until < 0 || until > now + PRUNE_EVERY_MS))
-		until = now + PRUNE_EVERY_MS;
-	if (until < 0)
+	if (sv->sweep_at_ms == 0)
 		return -1;
-	return until <= now ? 0 : (int)(until - now);
+	return sv->sweep_at_ms <= now ? 0 : (int)(sv->sweep_at_ms - now);
+}
+
+/* The program's status once it has gone.  Traced, it may still report stops
+ * before its exit; each is let go. */
+static void wait_for_child(struct sv *sv)
+{
+	int st;
+
+	while (!sv->child_done && waitpid(sv->child, &st, __WALL) == sv->child) {
+		if (WIFSTOPPED(st)) {
+			(void)ptrace(PTRACE_CONT, sv->child, 0, 0);
+			continue;
+		}
+		sv->child_status = st;
+		sv->child_done = true;
+	}
 }
 
 int udpc_supervise(const struct udpc_config *cfg, const char *program, char **argv)
@@ -546,10 +508,9 @@ int udpc_supervise(const struct udpc_config *cfg, const char *program, char **ar
 	sigset_t fwd, orig;
 	int up[2], down[2];
 	struct child_msg m = { 0, 0 };
-	struct pollfd *p = NULL;
-	size_t k, pcap = 0;
+	size_t k;
 	bool none_left = false;
-	long long last_prune = 0;
+	int exec_err = 0, trace_err;
 
 	memset(&sv, 0, sizeof(sv));
 	sv.cfg = cfg;
@@ -637,18 +598,24 @@ int udpc_supervise(const struct udpc_config *cfg, const char *program, char **ar
 			close(pidfd);
 		fcntl(sv.listener, F_SETFD, FD_CLOEXEC);
 	}
-	if (write(down[1], "", 1) != 1) {
+	/* D-54: attached before the program runs, so that no call it makes on
+	 * the range finds no tracer -- which would fail it with ENOSYS. */
+	trace_err = svtrace_attach(sv.child);
+	if (trace_err != 0) {
 		kill(sv.child, SIGKILL);
 		waitpid(sv.child, NULL, 0);
+		udpc_err("cannot trace the program: %s; refusing to run it (FR-SV-02, "
+		         "D-54).  It may already be traced, by strace or a debugger, "
+		         "or a container's seccomp profile may forbid ptrace",
+		         strerror(trace_err));
+		return 1;
+	}
+	if (write(down[1], "", 1) != 1) {
+		kill(sv.child, SIGKILL);
+		wait_for_child(&sv);
 		return 1;
 	}
 	close(down[1]);
-	if (hear(up[0], &m) && m.kind == MSG_EXEC_FAILED) {
-		waitpid(sv.child, NULL, 0);
-		udpc_err("cannot exec %s: %s", argv[0], strerror(m.value));
-		return m.value == ENOENT ? 127 : 126;
-	}
-	close(up[0]);
 
 	sv.req = calloc(1, sv.sizes.seccomp_notif);
 	sv.resp = calloc(1, sv.sizes.seccomp_notif_resp);
@@ -656,7 +623,7 @@ int udpc_supervise(const struct udpc_config *cfg, const char *program, char **ar
 	sv.buf = malloc(sv.buflen);
 	if (sv.req == NULL || sv.resp == NULL || sv.buf == NULL) {
 		kill(sv.child, SIGKILL);
-		waitpid(sv.child, NULL, 0);
+		wait_for_child(&sv);
 		udpc_err("out of memory");
 		return 1;
 	}
@@ -676,17 +643,22 @@ int udpc_supervise(const struct udpc_config *cfg, const char *program, char **ar
 
 	/* Until no supervised process is left: the listener reports end of file
 	 * once the last one has gone and been reaped (seccomp_unotify(2)), and
-	 * waitpid() reports no children once every descendant has been. */
+	 * waitpid() reports no children once every descendant has been.
+	 *
+	 * The child reports a failed exec on up; its end closes when the exec
+	 * succeeds.  It is read here, in the loop, rather than waited for: the
+	 * child is traced, and a signal reaching it before the exec stops it
+	 * until the loop hands the signal on. */
 	while (!none_left) {
-		size_t np = poll_set(&sv, &p, &pcap);
+		struct pollfd p[3] = {
+			{ sv.listener, POLLIN, 0 },
+			{ sv.sigfd, POLLIN, 0 },
+			{ up[0], POLLIN, 0 },
+		};
 		long long now = sv_now_ms();
 		int rc;
 
-		if (np == 0) {
-			udpc_err("out of memory");
-			break;
-		}
-		rc = poll(p, (nfds_t)np, poll_timeout(&sv, now));
+		rc = poll(p, 3, poll_timeout(&sv, now));
 		if (rc < 0 && errno != EINTR) {
 			udpc_err("poll: %s", strerror(errno));
 			break;
@@ -696,15 +668,14 @@ int udpc_supervise(const struct udpc_config *cfg, const char *program, char **ar
 			on_signal(&sv, &none_left);
 		if (rc > 0 && (p[0].revents & POLLIN))
 			serve_one(&sv);
+		if (rc > 0 && (p[2].revents & (POLLIN | POLLHUP))) {
+			if (hear(up[0], &m) && m.kind == MSG_EXEC_FAILED)
+				exec_err = m.value;
+			close(up[0]);
+			up[0] = -1;
+		}
 		if (rc > 0 && (p[0].revents & (POLLHUP | POLLERR)))
 			break;
-		if (sv.parked != NULL) {
-			serve_parked(&sv, rc > 0 ? p + 2 : NULL, rc > 0 ? np - 2 : 0, now);
-			if (now - last_prune >= PRUNE_EVERY_MS) {
-				svcall_prune_parked(&sv, 0);
-				last_prune = now;
-			}
-		}
 		if (sv.sweep_at_ms != 0 && now >= sv.sweep_at_ms) {
 			sv.sweep_at_ms = 0;
 			svsock_sweep(sv.range);
@@ -712,14 +683,16 @@ int udpc_supervise(const struct udpc_config *cfg, const char *program, char **ar
 		if (sv.sweep_at_ms == 0 && svsock_count() > 0)
 			sv.sweep_at_ms = now + SWEEP_EVERY_MS;
 	}
-	free(p);
 	free(sv.req);
 	free(sv.resp);
 	free(sv.buf);
 	close(sv.listener);
-	if (!sv.child_done) {
-		waitpid(sv.child, &sv.child_status, 0);
-		sv.child_done = true;
+	if (up[0] >= 0)
+		close(up[0]);
+	wait_for_child(&sv);
+	if (exec_err != 0) {
+		udpc_err("cannot exec %s: %s", argv[0], strerror(exec_err));
+		return exec_err == ENOENT ? 127 : 126;
 	}
 	return pass_on_status(sv.child_status);
 }

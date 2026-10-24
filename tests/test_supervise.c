@@ -1,4 +1,4 @@
-/* test_supervise.c -- supervisor mode (D-48 to D-53).
+/* test_supervise.c -- supervisor mode (D-48 to D-54).
  *
  * Built -static, so it is the kind of program supervisor mode exists for: the
  * shim could not see a single call it makes.  Each mode is run by
@@ -9,6 +9,20 @@
  *   test_supervise range <echo port>     under the supervisor: UDP sockets in
  *                                        the reserved range, the dup family,
  *                                        names, and receives that wait
+ *   test_supervise signals <delayed echo port> <echo port>
+ *                                        under the supervisor: receives
+ *                                        interrupted by a storm of signals,
+ *                                        with and without SA_RESTART, lose no
+ *                                        datagram, sends are never repeated,
+ *                                        and closes never left undone
+ *                                        (FR-SV-T4, D-54)
+ *   test_supervise silent                NOT supervised: a TCP listener that
+ *                                        never answers, as a proxy that hangs
+ *                                        in the handshake
+ *   test_supervise abandon <echo port>   under the supervisor, with the silent
+ *                                        proxy: a signal arriving while the
+ *                                        association is set up is handled at
+ *                                        once, and the send made again (D-54)
  *   test_supervise nodump <tcp port>     under the supervisor: a process that
  *                                        makes itself non-dumpable fails
  *                                        closed, and files still work
@@ -38,6 +52,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -347,6 +362,324 @@ static int range(int echo_port)
 	TAP_DONE();
 }
 
+/* --- signals ---------------------------------------------------------------*/
+
+static volatile sig_atomic_t g_signals;
+
+static void count_signal(int sig)
+{
+	(void)sig;
+	g_signals++;
+}
+
+/* SIGALRM every us microseconds, handled with or without SA_RESTART; 0 stops
+ * it. */
+static void storm(int us, int restart)
+{
+	struct itimerval it = { { 0, us }, { 0, us } };
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = count_signal;
+	sa.sa_flags = restart ? SA_RESTART : 0;
+	sigaction(SIGALRM, &sa, NULL);
+	setitimer(ITIMER_REAL, &it, NULL);
+}
+
+struct tally {
+	int lost, dups, recv_eintr, send_eintr;
+};
+
+/* Waits, up to two seconds, until pid sleeps in a call: a child's receive
+ * waiting for its datagram, rather than one still being set up, which its
+ * thread spends stopped for the supervisor. */
+static void wait_sleeping(pid_t pid)
+{
+	char path[64], buf[256], *close_paren;
+	int i;
+
+	snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+	for (i = 0; i < 2000; i++) {
+		FILE *f = fopen(path, "re");
+		size_t n = f != NULL ? fread(buf, 1, sizeof(buf) - 1, f) : 0;
+
+		if (f != NULL)
+			fclose(f);
+		buf[n] = '\0';
+		close_paren = strrchr(buf, ')');
+		if (close_paren != NULL && close_paren[1] == ' ' && close_paren[2] == 'S')
+			return;
+		usleep(1000);
+	}
+}
+
+/* n numbered datagrams through the delayed echo, one at a time, each waited
+ * for in a blocking receive while the signals arrive.  A datagram that never
+ * comes back is lost: the receive times out (SO_RCVTIMEO) or, with no
+ * timeout, the test hangs and its caller's timeout fails it. */
+static struct tally ping_pong(int fd, int n)
+{
+	struct tally t = { 0, 0, 0, 0 };
+	uint32_t i, got;
+
+	for (i = 0; i < (uint32_t)n; i++) {
+		ssize_t r;
+
+		/* An interrupted send may have gone already; sent again, it
+		 * comes back twice, counted as a duplicate (D-48). */
+		while ((r = sendto(fd, &i, sizeof(i), 0, (struct sockaddr *)&g_echo,
+		                   sizeof(g_echo))) < 0 &&
+		       errno == EINTR)
+			t.send_eintr++;
+		if (r != (ssize_t)sizeof(i)) {
+			t.lost++;
+			continue;
+		}
+		for (;;) {
+			r = recv(fd, &got, sizeof(got), 0);
+			if (r < 0 && errno == EINTR) {
+				t.recv_eintr++;
+				continue;
+			}
+			if (r != (ssize_t)sizeof(got) || got > i) {
+				t.lost++;
+				break;
+			}
+			if (got == i)
+				break;
+			t.dups++; /* an earlier one, again */
+		}
+	}
+	return t;
+}
+
+static int signals(int delayed_port, int echo_port)
+{
+	struct timespec t0;
+	struct tally t;
+	char buf[16];
+	int fd, st;
+	pid_t pid;
+
+	g_echo = loopback(delayed_port);
+
+	TAP_GROUP("FR-SV-T4: receives interrupted without SA_RESTART lose nothing");
+	fd = udp_timed(3000);
+	g_signals = 0;
+	storm(2000, 0);
+	t = ping_pong(fd, 100);
+	storm(0, 0);
+	TAP_EQ_INT(t.lost, 0, "100 datagrams, each waited for 10 ms under a signal every 2 ms: "
+	                      "none lost");
+	TAP_OK(t.recv_eintr > 0, "the waiting receives were interrupted: %d EINTR, %d signals",
+	       t.recv_eintr, (int)g_signals);
+	/* D-54: a send is performed while its thread is stopped, so it
+	 * cannot report EINTR after its datagram has gone, and be sent
+	 * again. */
+	TAP_EQ_INT(t.send_eintr, 0, "no send failed with EINTR, which a UDP send never does");
+	TAP_EQ_INT(t.dups, 0, "and none came back twice");
+	close(fd);
+
+	TAP_GROUP("FR-SV-T4: receives restarted by SA_RESTART lose nothing");
+	fd = udp_timed(0);
+	g_signals = 0;
+	storm(2000, 1);
+	t = ping_pong(fd, 100);
+	storm(0, 0);
+	TAP_EQ_INT(t.lost, 0, "100 datagrams, none lost, after %d signals", (int)g_signals);
+	TAP_EQ_INT(t.recv_eintr, 0, "and no receive saw EINTR: each was restarted");
+	TAP_EQ_INT(t.dups + t.send_eintr, 0, "and no send was interrupted or repeated");
+	close(fd);
+
+	TAP_GROUP("FR-SV-T4: a datagram delivered just as a signal interrupts its receive");
+	/* D-54: under user notification, a reply the kernel accepted could
+	 * still be discarded by a call a signal had just interrupted, and its
+	 * datagram was lost (about 1 in 10,000 interrupted receives).  Replies
+	 * at once and a signal every 100 us put many deliveries in that
+	 * instant; traced, none can be lost. */
+	g_echo = loopback(echo_port);
+	fd = udp_timed(500);
+	g_signals = 0;
+	storm(100, 0);
+	t = ping_pong(fd, 1000);
+	storm(0, 0);
+	TAP_EQ_INT(t.lost, 0, "1000 datagrams under a signal every 100 us: none lost (%d EINTR, "
+	                      "%d signals)",
+	           t.recv_eintr, (int)g_signals);
+	TAP_EQ_INT(t.dups + t.send_eintr, 0, "no send interrupted or repeated");
+	close(fd);
+	g_echo = loopback(delayed_port);
+
+	TAP_GROUP("SO_RCVTIMEO, as on a native socket (D-54)");
+	/* The receive waits in the program's own kernel, so its timeout is
+	 * the kernel's. */
+	fd = udp_timed(300);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	TAP_OK(fails_with(recv(fd, buf, sizeof(buf), 0), EAGAIN),
+	       "a receive with nothing coming times out: EAGAIN");
+	TAP_OK(elapsed_ms(&t0) >= 250 && elapsed_ms(&t0) < 1500, "after its 300 ms (%ld ms)",
+	       elapsed_ms(&t0));
+	/* signal(7): a receive on a socket with SO_RCVTIMEO is never
+	 * restarted after a handler, whatever SA_RESTART says. */
+	storm(2000, 1);
+	TAP_OK(fails_with(recv(fd, buf, sizeof(buf), 0), EINTR),
+	       "interrupted under SA_RESTART, it fails with EINTR, as signal(7) says");
+	storm(0, 0);
+	close(fd);
+
+	TAP_GROUP("a receive waiting through SIGSTOP and SIGCONT");
+	/* With no SO_RCVTIMEO, as signal(7) has it, the stopped receive is
+	 * restarted when the process continues; with one, it fails with EINTR
+	 * instead.  An alarm ends a child whose datagram never comes. */
+	fd = udp_timed(0);
+	pid = fork();
+	if (pid == 0) {
+		uint32_t v = 7, got = 0;
+
+		alarm(5);
+		sendto(fd, &v, sizeof(v), 0, (struct sockaddr *)&g_echo, sizeof(g_echo));
+		_exit(recv(fd, &got, sizeof(got), 0) == sizeof(got) && got == 7 ? 0 : 1);
+	}
+	wait_sleeping(pid);
+	kill(pid, SIGSTOP);
+	usleep(30000);
+	kill(pid, SIGCONT);
+	TAP_OK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+	       "is restarted, and gets its datagram (status %#x)", st);
+	close(fd);
+	fd = udp_timed(3000);
+	pid = fork();
+	if (pid == 0) {
+		uint32_t v = 8, got = 0;
+		ssize_t r;
+
+		alarm(5);
+		sendto(fd, &v, sizeof(v), 0, (struct sockaddr *)&g_echo, sizeof(g_echo));
+		r = recv(fd, &got, sizeof(got), 0);
+		if (r < 0 && errno == EINTR)
+			_exit(2);
+		_exit(r == sizeof(got) && got == 8 ? 0 : 1);
+	}
+	wait_sleeping(pid);
+	kill(pid, SIGSTOP);
+	usleep(30000);
+	kill(pid, SIGCONT);
+	TAP_OK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 2,
+	       "with SO_RCVTIMEO, it fails with EINTR, as signal(7) says (status %#x)", st);
+	close(fd);
+
+	TAP_GROUP("an interrupted close never leaves the descriptor open (D-54)");
+	{
+		int i, close_eintr = 0, left_open = 0, fcntl_eintr = 0;
+
+		/* Linux closes a descriptor even when close() reports EINTR,
+		 * so a program never closes it again.  Under user
+		 * notification, a close interrupted while the supervisor held
+		 * it reported EINTR without having run. */
+		g_signals = 0;
+		storm(100, 0);
+		for (i = 0; i < 2000; i++) {
+			int s, f;
+
+			while ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0 && errno == EINTR)
+				;
+			if (close(s) != 0 && errno == EINTR)
+				close_eintr++;
+			while ((f = fcntl(s, F_GETFD)) == -1 && errno == EINTR)
+				fcntl_eintr++;
+			if (f != -1) {
+				left_open++;
+				close(s);
+			}
+		}
+		storm(0, 0);
+		TAP_EQ_INT(left_open, 0, "2000 UDP sockets closed under a signal every 100 us "
+		                         "(%d signals): none left open",
+		           (int)g_signals);
+		TAP_EQ_INT(close_eintr, 0, "no close failed with EINTR");
+		TAP_EQ_INT(fcntl_eintr, 0, "and fcntl(F_GETFD), no longer trapped, never did");
+	}
+
+	TAP_GROUP("the program is traced by the supervisor (D-54)");
+	{
+		char line[128];
+		int tracer = -1;
+		FILE *f = fopen("/proc/self/status", "re");
+
+		while (f != NULL && fgets(line, sizeof(line), f) != NULL)
+			if (sscanf(line, "TracerPid: %d", &tracer) == 1)
+				break;
+		if (f != NULL)
+			fclose(f);
+		TAP_EQ_INT(tracer, (int)getppid(), "its tracer is udpchains, its parent");
+		TAP_OK(fails_with(ptrace(PTRACE_TRACEME, 0, NULL, NULL), EPERM),
+		       "so it cannot be traced by another: PTRACE_TRACEME fails with EPERM");
+	}
+	TAP_DONE();
+}
+
+/* A proxy that accepts the connection and never answers. */
+static int silent(void)
+{
+	struct sockaddr_in a = loopback(0);
+	socklen_t len = sizeof(a);
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+	if (fd < 0 || bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(fd, 64) != 0 ||
+	    getsockname(fd, (struct sockaddr *)&a, &len) != 0)
+		return 1;
+	printf("PORT %d\n", ntohs(a.sin_port));
+	fflush(stdout);
+	for (;;)
+		pause();
+}
+
+static struct timespec g_handled;
+
+static void note_signal(int sig)
+{
+	(void)sig;
+	clock_gettime(CLOCK_MONOTONIC, &g_handled);
+	g_signals++;
+}
+
+/* D-54: a signal arriving while the association is set up -- the proxy never
+ * answers -- abandons the setup, so it is handled at once, and the send is
+ * made again: it never fails with EINTR, having sent nothing. */
+static int abandon(int echo_port)
+{
+	struct sockaddr_in e = loopback(echo_port);
+	struct itimerval it = { { 0, 0 }, { 0, 300000 } };
+	struct timespec t0;
+	struct sigaction sa;
+	long handled_ms;
+	int fd, err;
+	ssize_t r;
+
+	TAP_GROUP("a signal during association setup is handled at once (D-54)");
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = note_signal;
+	sigaction(SIGALRM, &sa, NULL); /* no SA_RESTART */
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	setitimer(ITIMER_REAL, &it, NULL);
+	r = sendto(fd, "x", 1, 0, (struct sockaddr *)&e, sizeof(e));
+	err = errno;
+	handled_ms = (g_handled.tv_sec - t0.tv_sec) * 1000 +
+	             (g_handled.tv_nsec - t0.tv_nsec) / 1000000;
+	TAP_EQ_INT((int)g_signals, 1, "the signal was handled");
+	TAP_OK(handled_ms >= 250 && handled_ms < 1000,
+	       "when it arrived, not when the setup gave up (%ld ms)", handled_ms);
+	TAP_OK(r < 0 && err != EINTR, "the send was made again, and failed with the proxy's "
+	                              "error, not EINTR (%s)",
+	       r < 0 ? strerror(err) : "sent");
+	TAP_OK(elapsed_ms(&t0) >= 1200, "after a second setup had waited its own timeout "
+	                                "(%ld ms)",
+	       elapsed_ms(&t0));
+	close(fd);
+	TAP_DONE();
+}
+
 /* D-48: the supervisor cannot inspect a non-dumpable process, so what needs
  * inspecting is refused rather than let through unchecked. */
 static int nodump(int tcp_port)
@@ -520,6 +853,12 @@ int main(int argc, char **argv)
 		return refusals(atoi(argv[2]));
 	if (argc == 3 && strcmp(argv[1], "range") == 0)
 		return range(atoi(argv[2]));
+	if (argc == 4 && strcmp(argv[1], "signals") == 0)
+		return signals(atoi(argv[2]), atoi(argv[3]));
+	if (argc == 2 && strcmp(argv[1], "silent") == 0)
+		return silent();
+	if (argc == 3 && strcmp(argv[1], "abandon") == 0)
+		return abandon(atoi(argv[2]));
 	if (argc == 3 && strcmp(argv[1], "nodump") == 0)
 		return nodump(atoi(argv[2]));
 	if (argc == 5 && strcmp(argv[1], "churn") == 0)
@@ -529,7 +868,9 @@ int main(int argc, char **argv)
 	if (argc == 3 && strcmp(argv[1], "received") == 0)
 		return received(argv[2]);
 	fprintf(stderr, "usage: test_supervise refusals <tcp port> | range <echo port> | "
-	                "nodump <tcp port> | churn <echo port> <n> <secs> | "
+	                "signals <delayed echo port> <echo port> | silent | "
+	                "abandon <echo port> | nodump <tcp port> | "
+	                "churn <echo port> <n> <secs> | "
 	                "pass <path> <port> | "
 	                "received <path>\n");
 	return 2;

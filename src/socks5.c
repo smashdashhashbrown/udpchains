@@ -363,16 +363,31 @@ static struct budget budget_for(const struct udpc_config *cfg)
 	return b;
 }
 
+static bool (*g_cancelled)(void *);
+static void *g_cancel_arg;
+
+void udpc_socks_set_cancel(bool (*cancelled)(void *), void *arg)
+{
+	g_cancelled = cancelled;
+	g_cancel_arg = arg;
+}
+
+/* How often a cancellable wait asks whether it should give up. */
+#define CANCEL_SLICE_MS 50
+
 static int deadline_poll(int fd, short events, const struct budget *b)
 {
 	struct pollfd pfd;
 	int r, timeout_ms;
+	long long step_end = b->step_ms >= 0 ? now_ms() + b->step_ms : 0;
 
 	pfd.fd = fd;
 	pfd.events = events;
 	pfd.revents = 0;
 
-	do {
+	for (;;) {
+		bool sliced = false;
+
 		timeout_ms = b->step_ms;
 		if (b->deadline != 0) {
 			long long left = b->deadline - now_ms();
@@ -384,8 +399,33 @@ static int deadline_poll(int fd, short events, const struct budget *b)
 			if (timeout_ms < 0 || left < timeout_ms)
 				timeout_ms = (int)left;
 		}
+		if (g_cancelled != NULL) {
+			if (g_cancelled(g_cancel_arg)) {
+				errno = EINTR;
+				return -1;
+			}
+			if (step_end != 0) {
+				long long left = step_end - now_ms();
+
+				if (left <= 0) {
+					r = 0;
+					break;
+				}
+				if (left < timeout_ms || timeout_ms < 0)
+					timeout_ms = (int)left;
+			}
+			if (timeout_ms < 0 || timeout_ms > CANCEL_SLICE_MS) {
+				timeout_ms = CANCEL_SLICE_MS;
+				sliced = true;
+			}
+		}
 		r = poll(&pfd, 1, timeout_ms);
-	} while (r < 0 && errno == EINTR);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r == 0 && sliced)
+			continue;
+		break;
+	}
 
 	if (r == 0) {
 		errno = ETIMEDOUT;
@@ -608,8 +648,11 @@ static void hop_failed(const struct hop *h, const char *what, int err)
 	char name[HOP_NAME_MAX], note[64];
 	unsigned n;
 
-	if (h->n <= 1)
+	/* EINTR: abandoned for a signal (D-54), not a failure of the hop. */
+	if (h->n <= 1 || err == EINTR) {
+		errno = err;
 		return;
+	}
 	if ((n = udpc_ratelimit(&g_rl_hop)) == 0) {
 		errno = err;
 		return;

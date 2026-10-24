@@ -8,8 +8,9 @@
  *
  * Built -static and run under the supervisor, with a fourth argument
  * "supervised", it checks the two places the modes are documented to differ:
- * recvmmsg returns one datagram per call (D-51), and stdio on a UDP socket is
- * carried, since the supervisor sees the write() it makes (D-36 is the shim's).
+ * a blocking recvmmsg returns the datagrams already queued rather than waiting
+ * for more (D-54), and stdio on a UDP socket is carried, since the supervisor
+ * sees the write() it makes (D-36 is the shim's).
  */
 #include "tap.h"
 
@@ -361,12 +362,12 @@ static void t_mmsg(void)
 		rmsgs[i].msg_hdr.msg_iovlen = 1;
 	}
 	if (g_supervised) {
-		/* D-51: one datagram per call, so the rest take two more. */
+		/* D-54: as many as are queued, without waiting for the rest,
+		 * so all three are given time to come back first. */
+		usleep(200000);
 		rc = recvmmsg(fd, rmsgs, 3, 0, NULL);
-		TAP_EQ_INT(rc, 1, "recvmmsg returns one datagram per call (D-51)");
-		for (i = 1; i < 3 && rc == 1; i++)
-			rc = recvmmsg(fd, &rmsgs[i], 3 - (unsigned)i, 0, NULL);
-		TAP_EQ_INT(rc, 1, "and the next call returns the next one");
+		TAP_EQ_INT(rc, 3, "recvmmsg returns all three queued datagrams in one call "
+		                  "(D-54)");
 	} else {
 		rc = recvmmsg(fd, rmsgs, 3, 0, NULL);
 		TAP_EQ_INT(rc, 3, "recvmmsg reports all three messages received");

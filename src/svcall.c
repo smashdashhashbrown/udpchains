@@ -1,19 +1,28 @@
-/* svcall.c -- answering the program's calls in supervisor mode (D-48 to D-53).
+/* svcall.c -- answering the program's calls in supervisor mode (D-48 to D-54).
  *
- * Each notification is one call, stopped in the kernel before it runs.  A call
- * on a UDP socket the supervisor made is performed here, on the supervisor's
- * own descriptor for the same socket: the payload read from the program's
- * memory, wrapped, and sent to the relay; a datagram peeked, checked,
- * unwrapped, written into the program, and consumed once the program has it
- * (D-51).  Every other call is let through to the kernel, or refused.
+ * Each call reaches the supervisor stopped in the kernel before it runs, in
+ * one of two ways (D-54).  A call on a descriptor in the range stops its thread
+ * through ptrace (svtrace.c): it is handled while the thread cannot run, so
+ * what is done for it and what it returns cannot be parted by a signal.  The
+ * rest -- making and placing descriptors, and checking calls below the range
+ * -- arrive by user notification, where a thread interrupted while the
+ * supervisor holds its call discards the answer.
  *
- * Every read of the program's memory is followed by a check that the call is
- * still pending before the bytes are used (seccomp_unotify(2)): a call the
- * program abandoned is never acted on, and a thread number that was reused is
- * never mistaken for the caller.
+ * A call on a UDP socket the supervisor made is performed here, on the
+ * supervisor's own descriptor for the same socket: the payload read from the
+ * program's memory, wrapped, and sent to the relay; a datagram taken, checked,
+ * unwrapped and written into the program.  A receive with nothing queued waits
+ * in the program's own kernel, natively.  Every other call is let through to
+ * the kernel, or refused.
  *
- * Written from the man pages only: seccomp_unotify(2), pidfd_getfd(2),
- * process_vm_readv(2) (D-01).
+ * For a notified call, every read of the program's memory is followed by a
+ * check that the call is still pending before the bytes are used
+ * (seccomp_unotify(2)): a call the program abandoned is never acted on, and a
+ * thread number that was reused is never mistaken for the caller.  A traced
+ * call cannot be abandoned.
+ *
+ * Written from the man pages only: seccomp_unotify(2), ptrace(2),
+ * pidfd_getfd(2), process_vm_readv(2) (D-01).
  */
 #include "svint.h"
 
@@ -60,20 +69,32 @@
 
 struct call {
 	struct sv *sv;
-	const struct seccomp_notif *req;
-	pid_t tgid; /* 0 until looked up */
-	int pidfd;  /* -1 until looked up; the cache's, never closed here */
+	const struct seccomp_notif *req; /* for a traced call, made from its registers */
+	pid_t tgid;  /* 0 until looked up */
+	int pidfd;   /* -1 until looked up; the cache's, never closed here */
+	bool traced; /* stopped by ptrace (D-54), not notified */
+	bool native; /* traced: to run in the kernel as made */
+	long long ret;     /* traced: the result, or -errno */
+	int wait_copy;     /* traced, SV_PARKED: the socket the thread waits on */
+	uint64_t wait_cookie;
 };
 
+/* A traced call cannot have gone: its thread is stopped until it is
+ * resumed. */
 static bool still_pending(const struct call *c)
 {
-	return ioctl(c->sv->listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &c->req->id) == 0;
+	return c->traced ||
+	       ioctl(c->sv->listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &c->req->id) == 0;
 }
 
 static enum sv_outcome answer(struct call *c, long long val, int err)
 {
 	struct seccomp_notif_resp *resp = c->sv->resp;
 
+	if (c->traced) {
+		c->ret = err != 0 ? -(long long)err : val;
+		return SV_ANSWER;
+	}
 	memset(resp, 0, c->sv->sizes.seccomp_notif_resp);
 	resp->id = c->req->id;
 	resp->val = err != 0 ? 0 : val;
@@ -83,18 +104,13 @@ static enum sv_outcome answer(struct call *c, long long val, int err)
 
 static enum sv_outcome let_through(struct call *c)
 {
+	if (c->traced) {
+		c->native = true;
+		return SV_ANSWER;
+	}
 	answer(c, 0, 0);
 	c->sv->resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 	return SV_ANSWER;
-}
-
-/* Answers now, rather than through the loop: for a receive, whose datagram is
- * consumed only if the answer is accepted (D-51).  False if the call has
- * gone. */
-static bool answer_now(struct call *c, long long val, int err)
-{
-	answer(c, val, err);
-	return ioctl(c->sv->listener, SECCOMP_IOCTL_NOTIF_SEND, c->sv->resp) == 0;
 }
 
 /* --- diagnostics ----------------------------------------------------------*/
@@ -687,7 +703,7 @@ static enum sv_outcome do_send(struct call *c, struct sv_sock *s, int copy, int 
 	return err != 0 ? answer(c, 0, err) : answer(c, (long long)sent, 0);
 }
 
-/* --- receives (D-51) ------------------------------------------------------*/
+/* --- receives (D-54) ------------------------------------------------------*/
 
 /* Where a receive puts what it returns. */
 struct recv_dest {
@@ -699,8 +715,9 @@ struct recv_dest {
 	uint64_t msg_len;         /* recvmmsg's msg_len, or 0 */
 };
 
-/* Decodes a receive's arguments.  0, or an errno for the call. */
-static int recv_dest_of(const struct call *c, struct recv_dest *d)
+/* Decodes a receive's arguments: for recvmmsg, those of its message i.  0, or
+ * an errno for the call. */
+static int recv_dest_of(const struct call *c, unsigned i, struct recv_dest *d)
 {
 	const __u64 *a = c->req->data.args;
 	struct msghdr m;
@@ -735,13 +752,14 @@ static int recv_dest_of(const struct call *c, struct recv_dest *d)
 		return read_iovecs(c, a[1], d->iovcnt, EINVAL, &d->capacity);
 	case SYS_recvmsg:
 	case SYS_recvmmsg:
-		/* D-51: recvmmsg receives one datagram, into its first
-		 * message. */
-		if (c->req->data.nr == SYS_recvmmsg && (unsigned)a[2] == 0)
-			return EINVAL;
-		d->msghdr = a[1];
-		if (c->req->data.nr == SYS_recvmmsg)
-			d->msg_len = a[1] + offsetof(struct mmsghdr, msg_len);
+		if (c->req->data.nr == SYS_recvmmsg) {
+			if ((unsigned)a[2] == 0)
+				return EINVAL;
+			d->msghdr = a[1] + (uint64_t)i * sizeof(struct mmsghdr);
+			d->msg_len = d->msghdr + offsetof(struct mmsghdr, msg_len);
+		} else {
+			d->msghdr = a[1];
+		}
 		d->flags = (int)a[c->req->data.nr == SYS_recvmsg ? 2 : 3];
 		if (mem_read(c, d->msghdr, &m, sizeof(m)) != 0)
 			return EFAULT;
@@ -807,38 +825,18 @@ static void consume(struct sv *sv, int copy)
 	(void)recv(copy, sv->buf, sv->buflen, MSG_DONTWAIT | MSG_TRUNC);
 }
 
-/* Performs a receive on s.  Answers it (SV_ANSWERED), or finds nothing queued
- * on a blocking socket (SV_PARKED): the caller waits for the socket. */
-static enum sv_outcome do_recv(struct call *c, struct sv_sock *s, int copy, int fd)
+/* Takes the next datagram queued on s, without waiting, and delivers it into
+ * the program as d says.  Returns what the call returns for it -- the length
+ * copied, or with MSG_TRUNC the datagram's -- or -errno: -EAGAIN with nothing
+ * queued.  The thread is stopped (D-54), so a datagram taken here is the
+ * program's: no signal can come between taking it and the call returning
+ * it. */
+static long long take(struct call *c, struct sv_sock *s, int copy, int fd,
+                      const struct recv_dest *d)
 {
-	struct recv_dest d;
 	struct udpc_socks_hdr hdr;
-	bool nonblocking, reassociated = false;
+	bool reassociated = false;
 	int err;
-
-	err = recv_dest_of(c, &d);
-	if (err == 0 && !still_pending(c))
-		return SV_ANSWERED;
-	if (err != 0) {
-		answer_now(c, 0, err);
-		return SV_ANSWERED;
-	}
-	/* Nothing ever arrives on the error queue of a proxied socket: the
-	 * relay's errors are not the program's. */
-	if (d.flags & MSG_ERRQUEUE) {
-		answer_now(c, 0, EAGAIN);
-		return SV_ANSWERED;
-	}
-	nonblocking = (d.flags & MSG_DONTWAIT) || (fcntl(copy, F_GETFL) & O_NONBLOCK);
-
-	/* A receive is a use of the socket, so it sets up the association if
-	 * there is not one yet (FR-P-01). */
-	err = svsock_hold(c->sv->cfg, s, copy, false, c->tgid ? c->tgid : (pid_t)c->req->pid,
-	                  fd);
-	if (err != 0) {
-		answer_now(c, 0, err);
-		return SV_ANSWERED;
-	}
 
 	for (;;) {
 		ssize_t n, hlen;
@@ -846,13 +844,9 @@ static enum sv_outcome do_recv(struct call *c, struct sv_sock *s, int copy, int 
 
 		n = recv(copy, c->sv->buf, c->sv->buflen, MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT);
 		if (n < 0) {
-			err = errno;
-			if (err == EAGAIN || err == EWOULDBLOCK) {
-				if (!nonblocking)
-					return SV_PARKED;
-				answer_now(c, 0, EAGAIN);
-				return SV_ANSWERED;
-			}
+			err = errno == EWOULDBLOCK ? EAGAIN : errno;
+			if (err == EAGAIN)
+				return -EAGAIN;
 			/* FR-P-08: an expired association shows up as a
 			 * pending ICMP error. */
 			if (udpc_dgram_assoc_dead(err) && !reassociated) {
@@ -863,8 +857,7 @@ static enum sv_outcome do_recv(struct call *c, struct sv_sock *s, int copy, int 
 				if (err == 0)
 					continue;
 			}
-			answer_now(c, 0, err);
-			return SV_ANSWERED;
+			return -(long long)err;
 		}
 		hlen = udpc_dgram_unwrap(c->sv->buf, n, c->sv->buflen, c->sv->cfg, &s->chain,
 		                         s->family, s->connected ? &s->app_dst : NULL, &hdr);
@@ -874,100 +867,73 @@ static enum sv_outcome do_recv(struct call *c, struct sv_sock *s, int copy, int 
 			continue;
 		}
 		paylen = (size_t)n - (size_t)hlen;
-		if (!still_pending(c))
-			return SV_ANSWERED; /* left queued for the next receive */
-		err = deliver(c, s, &d, &hdr, hlen, paylen, &copied);
-		if (err != 0) {
-			answer_now(c, 0, err);
-			return SV_ANSWERED;
-		}
-		/* D-51: consumed only once the program has it.  An answer the
-		 * kernel no longer wants -- a signal interrupted the call --
-		 * leaves the datagram queued for the next receive. */
-		if (answer_now(c,
-		               c->req->data.nr == SYS_recvmmsg ? 1
-		               : (d.flags & MSG_TRUNC)         ? (long long)paylen
-		                                               : (long long)copied,
-		               0) &&
-		    !(d.flags & MSG_PEEK))
+		err = deliver(c, s, d, &hdr, hlen, paylen, &copied);
+		/* A buffer that cannot be written loses the datagram, as it
+		 * does on a native socket, which takes it before copying. */
+		if (!(d->flags & MSG_PEEK))
 			consume(c->sv, copy);
+		if (err != 0)
+			return -(long long)err;
 		svsock_used(s);
-		return SV_ANSWERED;
+		return (d->flags & MSG_TRUNC) ? (long long)paylen : (long long)copied;
 	}
 }
 
-/* A blocking receive's deadline: SO_RCVTIMEO, which belongs to the socket and
- * so is the program's own setting.  0 for none. */
-static long long recv_deadline(int copy)
+/* A receive's datagrams, without waiting: one, or for recvmmsg as many as are
+ * queued, up to its vlen (D-54).  Returns the call's result, or -errno. */
+static long long recv_all(struct call *c, struct sv_sock *s, int copy, int fd)
 {
-	struct timeval tv;
-	socklen_t len = sizeof(tv);
+	unsigned vlen = 1, i;
+	long long r = 0;
 
-	if (getsockopt(copy, SOL_SOCKET, SO_RCVTIMEO, &tv, &len) != 0 ||
-	    (tv.tv_sec == 0 && tv.tv_usec == 0))
-		return 0;
-	return sv_now_ms() + (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+	if (c->req->data.nr == SYS_recvmmsg) {
+		vlen = (unsigned)c->req->data.args[2];
+		if (vlen > MMSG_MAX)
+			vlen = MMSG_MAX;
+	}
+	for (i = 0; i < vlen; i++) {
+		struct recv_dest d;
+		int err = recv_dest_of(c, i, &d);
+
+		r = err != 0 ? -(long long)err : take(c, s, copy, fd, &d);
+		if (r < 0)
+			break;
+	}
+	if (c->req->data.nr != SYS_recvmmsg)
+		return r;
+	/* As sendmmsg (FR-F-09): what came before a failure is returned, and
+	 * only a failure of the first is an error. */
+	return i > 0 ? (long long)i : r;
 }
 
-static enum sv_outcome park(struct call *c, struct sv_sock *s, int copy)
+/* Performs a receive on s, or finds nothing queued for a call that may wait
+ * (SV_PARKED): the thread then waits in its own kernel (D-54). */
+static enum sv_outcome do_recv(struct call *c, struct sv_sock *s, int copy, int fd)
 {
-	struct sv_parked *p = calloc(1, sizeof(*p));
+	struct recv_dest d;
+	bool nonblocking;
+	long long r;
+	int err;
 
-	if (p == NULL) {
-		close(copy);
-		answer_now(c, 0, ENOMEM);
-		return SV_ANSWERED;
-	}
-	p->req = *c->req;
-	p->cookie = s->cookie;
-	p->copy = copy;
-	p->deadline_ms = recv_deadline(copy);
-	p->next = c->sv->parked;
-	c->sv->parked = p;
-	return SV_PARKED;
-}
+	err = recv_dest_of(c, 0, &d);
+	if (err != 0)
+		return answer(c, 0, err);
+	/* Nothing ever arrives on the error queue of a proxied socket: the
+	 * relay's errors are not the program's. */
+	if (d.flags & MSG_ERRQUEUE)
+		return answer(c, 0, EAGAIN);
+	nonblocking = (d.flags & MSG_DONTWAIT) || (fcntl(copy, F_GETFL) & O_NONBLOCK);
 
-bool svcall_retry_parked(struct sv *sv, struct sv_parked *p, long long now_ms)
-{
-	struct call c = { sv, &p->req, 0, -1 };
-	struct sv_sock *s;
-
-	if (!still_pending(&c))
-		return true;
-	s = svsock_find(p->cookie);
-	if (s == NULL) {
-		answer_now(&c, 0, EBADF);
-		return true;
-	}
-	if (do_recv(&c, s, p->copy, (int)p->req.data.args[0]) != SV_PARKED)
-		return true;
-	if (p->deadline_ms != 0 && now_ms >= p->deadline_ms) {
-		/* SO_RCVTIMEO expired, as on a native socket. */
-		answer_now(&c, 0, EAGAIN);
-		return true;
-	}
-	return false;
-}
-
-void svcall_prune_parked(struct sv *sv, pid_t tid)
-{
-	struct sv_parked **pp = &sv->parked;
-
-	while (*pp != NULL) {
-		struct sv_parked *p = *pp;
-		struct call c = { sv, &p->req, 0, -1 };
-
-		/* A thread makes one call at a time: a new one from the same
-		 * thread means the parked one was interrupted.  Without a
-		 * thread, each is asked whether it is still pending. */
-		if (tid != 0 ? (pid_t)p->req.pid == tid : !still_pending(&c)) {
-			*pp = p->next;
-			close(p->copy);
-			free(p);
-			continue;
-		}
-		pp = &p->next;
-	}
+	/* A receive is a use of the socket, so it sets up the association if
+	 * there is not one yet (FR-P-01). */
+	err = svsock_hold(c->sv->cfg, s, copy, false, c->tgid ? c->tgid : (pid_t)c->req->pid,
+	                  fd);
+	if (err != 0)
+		return answer(c, 0, err);
+	r = recv_all(c, s, copy, fd);
+	if (r == -EAGAIN && !nonblocking)
+		return SV_PARKED;
+	return r < 0 ? answer(c, 0, (int)-r) : answer(c, r, 0);
 }
 
 /* --- the rest of a carried socket's calls ---------------------------------*/
@@ -1136,8 +1102,14 @@ static enum sv_outcome on_carried(struct call *c, struct sv_sock *s, int copy, i
 	case SYS_readv: {
 		enum sv_outcome o = do_recv(c, s, copy, fd);
 
-		if (o == SV_PARKED)
-			return park(c, s, copy);
+		if (o == SV_PARKED) {
+			/* Kept for when the wait ends: the descriptor the
+			 * program waits on may be closed or replaced by
+			 * then. */
+			c->wait_copy = copy;
+			c->wait_cookie = s->cookie;
+			return o;
+		}
 		close(copy);
 		return o;
 	}
@@ -1289,56 +1261,55 @@ static enum sv_outcome decide_other(struct call *c, int copy)
 	return let_through(c);
 }
 
-enum sv_outcome svcall_decide(struct sv *sv)
+/* One call, notified or traced. */
+static enum sv_outcome decide(struct call *c)
 {
-	struct call c = { sv, sv->req, 0, -1 };
-	const __u64 *a = sv->req->data.args;
-	int nr = sv->req->data.nr, fd, copy;
+	struct sv *sv = c->sv;
+	const __u64 *a = c->req->data.args;
+	int nr = c->req->data.nr, fd, copy;
 	struct sv_sock *s;
-
-	/* Any receive this thread had waiting was interrupted. */
-	if (sv->parked != NULL)
-		svcall_prune_parked(sv, (pid_t)sv->req->pid);
 
 	switch (nr) {
 	case SYS_socket:
-		return decide_socket(&c);
+		return decide_socket(c);
 	case SYS_io_uring_setup:
-		refused(&c, WHY_URING, "io_uring would send around the supervisor (D-53)");
-		return answer(&c, 0, ENOSYS);
+		refused(c, WHY_URING, "io_uring would send around the supervisor (D-53)");
+		return answer(c, 0, ENOSYS);
 	case SYS_pidfd_getfd:
-		refused(&c, WHY_PIDFD, "a descriptor copied from another process would escape "
-		                       "the supervisor (D-53)");
-		return answer(&c, 0, EPERM);
+		refused(c, WHY_PIDFD, "a descriptor copied from another process would escape "
+		                      "the supervisor (D-53)");
+		return answer(c, 0, EPERM);
 	case SYS_close:
 	case SYS_close_range:
-		/* The kernel closes; the sweep notices what went. */
+		/* The kernel closes; the sweep notices what went.  A traced
+		 * close runs only once its thread is resumed, so a signal can
+		 * no longer leave the descriptor open (D-54). */
 		sv_sweep_soon(sv);
-		return let_through(&c);
+		return let_through(c);
 	case SYS_dup2:
 	case SYS_dup3:
-		return decide_dup2(&c);
+		return decide_dup2(c);
 	case SYS_splice:
 		/* Either end on a carried socket moves bytes without a header;
 		 * the destination is checked as a send's is. */
 		if ((unsigned)a[0] >= sv->range) {
-			copy = copy_of(&c, (int)a[0]);
+			copy = copy_of(c, (int)a[0]);
 			if (copy == -ENOENT)
 				return SV_ANSWERED;
 			if (copy >= 0) {
 				s = svsock_find(cookie_of(copy));
 				close(copy);
 				if (s != NULL)
-					return answer(&c, 0, EINVAL);
+					return answer(c, 0, EINVAL);
 			}
 		}
 		fd = (int)a[2];
 		break;
 	case SYS_fcntl:
-		/* The filter sends F_DUPFD on any descriptor; below the range
-		 * none is a carried socket. */
+		/* The filter sends only F_DUPFD and F_DUPFD_CLOEXEC; below the
+		 * range none duplicates a carried socket. */
 		if ((unsigned)a[0] < sv->range)
-			return let_through(&c);
+			return let_through(c);
 		fd = (int)a[0];
 		break;
 	default:
@@ -1346,25 +1317,115 @@ enum sv_outcome svcall_decide(struct sv *sv)
 		break;
 	}
 
-	copy = copy_of(&c, fd);
+	copy = copy_of(c, fd);
 	if (copy == -ENOENT)
 		return SV_ANSWERED; /* gone: nothing to answer */
 	if (copy == -EBADF)
-		return let_through(&c); /* not open: the kernel will say so */
+		return let_through(c); /* not open: the kernel will say so */
 	if (copy < 0) {
 		/* Cannot tell what the descriptor is: refused, since a call
 		 * that might send is never let through unchecked. */
 		if (nr == SYS_close || nr == SYS_getsockname || nr == SYS_getpeername)
-			return let_through(&c);
+			return let_through(c);
 		if (copy == -EPERM)
-			refused_uninspectable(&c);
+			refused_uninspectable(c);
 		else
-			refused(&c, WHY_UNKNOWN_FD, "cannot tell what the descriptor is, so "
-			                            "cannot let it through");
-		return answer(&c, 0, (nr == SYS_sendfile || nr == SYS_splice) ? EINVAL : EPERM);
+			refused(c, WHY_UNKNOWN_FD, "cannot tell what the descriptor is, so "
+			                           "cannot let it through");
+		return answer(c, 0, (nr == SYS_sendfile || nr == SYS_splice) ? EINVAL : EPERM);
 	}
 	s = svsock_find(cookie_of(copy));
 	if (s != NULL)
-		return on_carried(&c, s, copy, fd);
-	return decide_other(&c, copy);
+		return on_carried(c, s, copy, fd);
+	return decide_other(c, copy);
+}
+
+enum sv_outcome svcall_decide(struct sv *sv)
+{
+	struct call c = { sv, sv->req, 0, -1, false, false, 0, -1, 0 };
+	enum sv_outcome o = decide(&c);
+
+	if (o == SV_PARKED) {
+		/* The filter traces every receive in the range (D-54), so none
+		 * can wait here; were one to, it would be told to try again
+		 * rather than held. */
+		close(c.wait_copy);
+		return answer(&c, 0, EAGAIN);
+	}
+	return o;
+}
+
+/* A call context for a traced call, its notification made from the stopped
+ * thread's registers. */
+static void traced_call(struct sv *sv, const struct sv_traced *t, struct seccomp_notif *req,
+                        struct call *c)
+{
+	memset(req, 0, sizeof(*req));
+	req->pid = (__u32)t->tid;
+	req->data.nr = t->nr;
+	memcpy(req->data.args, t->args, sizeof(req->data.args));
+	*c = (struct call){ sv, req, 0, -1, true, false, -ENOSYS, -1, 0 };
+}
+
+void svcall_traced(struct sv *sv, struct sv_traced *t)
+{
+	struct seccomp_notif req;
+	struct call c;
+	enum sv_outcome o;
+
+	traced_call(sv, t, &req, &c);
+	o = decide(&c);
+	t->copy = -1;
+	if (o == SV_PARKED) {
+		t->verdict = SV_WAIT;
+		t->copy = c.wait_copy;
+		t->cookie = c.wait_cookie;
+	} else if (c.native) {
+		t->verdict = SV_NATIVE;
+	} else {
+		t->verdict = SV_RETURN;
+		t->ret = c.ret;
+	}
+}
+
+void svcall_waited(struct sv *sv, struct sv_traced *t, long long peeked)
+{
+	struct seccomp_notif req;
+	struct sv_sock *s;
+	struct call c;
+	long long r;
+	int fd = (int)t->args[0];
+
+	traced_call(sv, t, &req, &c);
+	s = svsock_find(t->cookie);
+	t->verdict = SV_RETURN;
+	if (s == NULL) {
+		/* Forgotten while it waited: no supervised process holds it. */
+		t->ret = -EBADF;
+		return;
+	}
+	if (peeked < 0) {
+		int err;
+
+		/* FR-P-08: the peek found the expired association's ICMP
+		 * error.  Set up again, and the call made again. */
+		if (!udpc_dgram_assoc_dead((int)-peeked)) {
+			/* EAGAIN at SO_RCVTIMEO, EINTR, or a restart the
+			 * kernel makes of the program's own call. */
+			t->ret = peeked;
+			return;
+		}
+		svsock_drop_assoc(s);
+		err = svsock_hold(sv->cfg, s, t->copy, false, (pid_t)t->tid, fd);
+		if (err == 0)
+			t->verdict = SV_AGAIN;
+		else
+			t->ret = -(long long)err;
+		return;
+	}
+	r = recv_all(&c, s, t->copy, fd);
+	if (r == -EAGAIN)
+		t->verdict = SV_AGAIN; /* another reader took it: wait again */
+	else
+		t->ret = r;
 }

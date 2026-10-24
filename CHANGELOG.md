@@ -13,10 +13,10 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Added
 
-- **Supervisor mode** (D-48 to D-53), in progress, for static and Go binaries, which the shim
+- **Supervisor mode** (D-48 to D-54), in progress, for static and Go binaries, which the shim
   cannot see. `udpchains --supervise` (or `supervise = yes`, or `UDPCHAINS_SUPERVISE=1`) runs the
   program under a seccomp filter whose calls udpchains answers, instead of preloading the shim.
-  - **So far** (steps 2 and 3 of `docs/FUTURE-STATIC-BINARIES.md`): a static program's UDP is
+  - **So far** (steps 2 to 4 of `docs/FUTURE-STATIC-BINARIES.md`): a static program's UDP is
     carried through the proxy or chain. The supervisor makes each UDP socket in a reserved range
     of descriptors (768 and up) and performs its sends and receives there: headers added and
     checked, the true sender reported, blocking and non-blocking receives, `SO_RCVTIMEO`,
@@ -24,30 +24,41 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     is never given the shim; its exit status and the signals sent to `udpchains` are passed on;
     descendants it leaves running are waited for and stay supervised. x86-64 and Linux 5.14 or
     later only.
+  - **Signals** (step 4, D-54): calls on the program's UDP sockets are carried while its thread is
+    stopped by `ptrace`, so a signal never loses a received datagram, never makes a send fail
+    with `EINTR` or go twice, and never leaves a `close` undone. A receive with nothing queued
+    waits in the program's own kernel, so `SO_RCVTIMEO`, `EINTR` and `SA_RESTART` behave exactly
+    as natively. A signal arriving while an association is set up is handled at once. If
+    `udpchains` is killed, so is the program.
   - **Refused, as decided:** raw, packet, ICMP and UDP-Lite sockets; `io_uring_setup`;
     `pidfd_getfd`; sends, connects, `sendfile` and `splice` on a UDP socket received from another
     process; `dup2` of a carried socket below the range; and starting with an inherited UDP
     socket.
-  - **Known limitations found while building it:** a program that makes itself non-dumpable
-    (`ssh-agent`, `gpg-agent`) is refused its connects and sends, TCP included, with a diagnostic
-    naming the cause; setting up an
-    association holds up the program's other trapped calls; `recvmmsg` returns one datagram per
-    call.
-  - **Not yet:** the signal tests (`SA_RESTART`, no datagram lost), threads, DNS redirection,
-    aarch64. Not yet in the README, man page or `udpchains -h`.
+  - **Known limitations found while building it:**
+    - a program that makes itself non-dumpable (`ssh-agent`, `gpg-agent`) is refused its connects
+      and sends, TCP included, with a diagnostic naming the cause;
+    - setting up an association holds up the program's other trapped calls;
+    - a blocking `recvmmsg` returns the datagrams already queued rather than waiting for all;
+    - the program is traced, so it cannot be debugged with `gdb` or `strace` from inside, and
+      `udpchains` refuses to start under `strace -f`;
+    - a program built with LeakSanitizer cannot run its leak check.
+  - **Not yet:** threads, DNS redirection, aarch64. Not yet in the README, man page or
+    `udpchains -h`.
 
 ### Changed
 
+- **Under supervision, `fcntl` is trapped only for `F_DUPFD` and `F_DUPFD_CLOEXEC`** (D-54). Every
+  other command runs in the kernel, so `fcntl(F_GETFD)` and its like are never interrupted.
 - The checks both front ends apply to a datagram (multicast and broadcast, `MSG_MORE`, GSO, the
   loopback guard, and a received datagram's headers) moved from the shim's `core.c`, `assoc.c`
   and `hooks.c` into `dgram.c`, unchanged, so the supervisor applies the same ones.
 
 ### Verification
 
-- 2282 assertions across 26 groups. Supervisor mode adds `unit-supervise` (11), 6 to
-  unit-config, `FR-SV-supervise` (37 checks, with static probes making 18, 6 and 37 assertions), the
-  hook matrix built `-static` under the supervisor (108, and 108 more through two hops), and the
-  fidelity test built `-static` under it (173). The supervisor also runs under ASan and UBSan,
+- 2287 assertions across 26 groups. Supervisor mode adds `unit-supervise` (11), 6 to
+  unit-config, `FR-SV-supervise` (43 checks, with static probes making 18, 6, 37, 19 and 4
+  assertions), the hook matrix built `-static` under the supervisor (108, and 108 more through two
+  hops), and the fidelity test built `-static` under it (172). The supervisor also runs under ASan and UBSan,
   with the static matrix and fidelity tests.
 
 ## [0.2.0] — 2026-10-21

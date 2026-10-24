@@ -53,6 +53,9 @@ start() {
 
 start PROXY proxy "$B/socks5d" --port 0 --quiet
 start ECHO echo "$B/udpecho" --port 0
+start DELAYED delayed "$B/udpecho" --port 0 --delay 10
+# A proxy that accepts the connection and never answers (D-54).
+start SILENT silent "$P" silent
 # A proxy that is not there: a fixture started and stopped, so its port is
 # free.
 "$B/socks5d" --port 0 --quiet > "$TMP/dead.out" 2>&1 &
@@ -138,6 +141,68 @@ check "SIGTERM to udpchains ends the program, and udpchains with it" "$?" 143
 signalled USR1 sh -c 'trap "exit 7" USR1; while :; do sleep 0.1; done'
 check "a signal the program handles is delivered to it (exit 7 from its handler)" "$?" 7
 
+echo "# signals during a traced call (FR-SV-T4, D-54)"
+timeout 120 "${SV[@]}" "$P" signals "$DELAYED" "$ECHO" > "$TMP/signals.tap" 2> /dev/null
+rc=$?
+sed 's/^/#   /' "$TMP/signals.tap"
+check "test_supervise signals passes, -static" "$rc" 0
+UDPCHAINS_CONNECT_TIMEOUT=1000 timeout 30 "$W" --supervise -p "127.0.0.1:$SILENT" \
+	"$P" abandon "$ECHO" > "$TMP/abandon.tap" 2> /dev/null
+rc=$?
+sed 's/^/#   /' "$TMP/abandon.tap"
+check "test_supervise abandon passes, -static" "$rc" 0
+# SIGTERM to udpchains is passed to the program while its send waits for the
+# silent proxy; the setup is abandoned, and the program dies at once rather
+# than after connect_timeout.
+start=$(date +%s%N)
+UDPCHAINS_CONNECT_TIMEOUT=10000 "$W" --supervise -p "127.0.0.1:$SILENT" \
+	"$P" abandon "$ECHO" > /dev/null 2>&1 &
+pid=$!
+(sleep 20; kill -KILL "$pid") 2> /dev/null &
+dog=$!
+sleep 0.15
+kill -TERM "$pid"
+wait "$pid"
+rc=$?
+kill "$dog" 2> /dev/null
+elapsed=$((($(date +%s%N) - start) / 1000000))
+check "SIGTERM during a hung association setup ends the program" "$rc" 143
+[ "$elapsed" -lt 2000 ] && ok "at once (${elapsed} ms), not after connect_timeout" ||
+	notok "only after ${elapsed} ms"
+
+echo "# fail-closed: the program dies with the supervisor (FR-SV-13, D-54)"
+"${SV[@]}" "$P" churn "$ECHO" 1 30 > /dev/null 2>&1 &
+pid=$!
+for ((i = 0; i < 100; i++)); do
+	prog=$(pgrep -P "$pid" -x test_supervise)
+	[ -n "$prog" ] && break
+	sleep 0.05
+done
+kill -KILL "$pid"
+wait "$pid" 2> /dev/null
+for ((i = 0; i < 40; i++)); do
+	[ -n "$prog" ] && [ -e "/proc/$prog" ] || break
+	sleep 0.05
+done
+[ -n "$prog" ] && [ ! -e "/proc/$prog" ] &&
+	ok "udpchains killed: its program is killed with it (PTRACE_O_EXITKILL)" ||
+	notok "the program (${prog:-not found}) outlived its supervisor"
+# LeakSanitizer, in a sanitiser build of udpchains, cannot run under ptrace;
+# here udpchains is traced by strace.
+NOLEAK="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0"
+if command -v strace > /dev/null; then
+	out=$(ASAN_OPTIONS="$NOLEAK" timeout 30 strace -f -o /dev/null "${SV[@]}" \
+		/bin/echo PROGRAM-RAN 2>&1)
+	rc=$?
+	case $out in
+	*PROGRAM-RAN*) notok "the program ran under strace -f, unsupervised" ;;
+	*"cannot trace the program"*) check "under strace -f, refused to start (D-54)" "$rc" 1 ;;
+	*) notok "under strace -f: $out" ;;
+	esac
+else
+	skip "refusal under strace -f (no strace)"
+fi
+
 echo "# the supervisor stays for descendants the program leaves running (FR-SV-11)"
 start=$(date +%s%N)
 timeout 30 "${SV[@]}" sh -c \
@@ -200,9 +265,11 @@ check "and the program exits 0" "$?" 0
 
 echo "# fail-closed: with the proxy down, nothing is sent (SEC-01)"
 before=$(echoed)
+# A sanitiser build's leakclient cannot run LeakSanitizer once supervised, as
+# it traces its own threads (D-54); udpchains keeps its own.
 for client in "$B/leakclient-static" "$B/leakclient"; do
-	out=$(timeout 60 "$W" --supervise -p "127.0.0.1:$DEAD" "$client" 127.0.0.1 "$ECHO" \
-		2> /dev/null)
+	out=$(timeout 60 "$W" --supervise -p "127.0.0.1:$DEAD" \
+		env ASAN_OPTIONS="$NOLEAK" "$client" 127.0.0.1 "$ECHO" 2> /dev/null)
 	check "$(basename "$client"): every send fails" \
 		"$(echo "$out" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')" 0
 done

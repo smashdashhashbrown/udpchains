@@ -65,7 +65,7 @@ Three ways of intercepting from outside were considered.
 
 | | Verdict |
 |---|---|
-| **`ptrace`** | **Rejected.** If the tracer dies, the program continues untraced and sends directly, which breaks SEC-01. It conflicts with `gdb` and `strace`. In the comparison lab, the `ptrace`-based tool ran reliably only with Docker's seccomp filter disabled. |
+| **`ptrace`** | **Rejected** as the mechanism. If the tracer dies, the program continues untraced and sends directly, which breaks SEC-01. It conflicts with `gdb` and `strace`. In the comparison lab, the `ptrace`-based tool ran reliably only with Docker's seccomp filter disabled. *Revised in step 4 (D-54):* used alongside user notification, for calls on the reserved range, as a seccomp action (`SECCOMP_RET_TRACE`). A traced call with no tracer fails with `ENOSYS`, and `PTRACE_O_EXITKILL` kills the program with the supervisor, so SEC-01 holds. |
 | **Network namespace and TUN device** | **Rejected.** The strongest guarantee, but it needs unprivileged user namespaces, which Ubuntu 24.04 restricts by default through AppArmor. The program's TCP would have nowhere to go unless udpchains carried TCP too, which is a §8 non-goal. |
 | **seccomp user notification** (`seccomp_unotify(2)`) | **Chosen (D-48).** The kernel stops the program at the system calls the filter selects and sends a notification to the supervisor, which performs the call itself or answers with an error. If the supervisor exits, those calls fail with `ENOSYS`, so the program stays fail-closed. No conflict with debuggers. |
 
@@ -190,6 +190,17 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
    `exec` need nothing more for state; step 5 is left their tests and threads.
 4. Blocking receives and signals. The hardest part, so it gets its own step. What is left after
    step 3: the signal tests of FR-SV-T4, `SA_RESTART`, and that no datagram is lost.
+   *Done 2026-10-23, with a change of mechanism:*
+   - **What the tests found:** a reply the kernel accepted could still be discarded by a call a
+     signal had just interrupted, losing about 1 in 10,000 interrupted receives (D-51 could not
+     prevent it).
+   - **What it also explained:** sends repeated or failing with `EINTR`, and interrupted `close`s
+     leaving descriptors open.
+   - **What replaced it:** calls on the reserved range are now carried while their thread is
+     stopped by `ptrace`, and a receive with nothing queued waits natively, in a zero-length peek
+     (D-54).
+   - **The result:** no datagram lost, send repeated or `close` left undone, under storms of
+     signals.
 5. `fork`, threads and `exec`; the refused routes; the supervisor-killed test; the wire capture.
 6. DNS. Then aarch64, interop, `make compare`, and documentation.
 
@@ -207,7 +218,7 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
   which is the supervisor's position; a stricter setting does not, and FR-SV-02 must then refuse.
 - **Signals.** FR-SV-08 is the hardest requirement. Go's runtime signals its threads often for
   preemption, but uses non-blocking sockets, so it may not meet the problem; C programs blocked in
-  `recvfrom` will.
+  `recvfrom` will. *Settled in step 4 (D-54).*
 - **Speed.** Each UDP call costs two context switches and a copy. Several microseconds per call
   is expected, against about 1 µs for the shim, but that is unmeasured.
 - **Two front ends.** Every behaviour has to be tested twice and documented per mode. The
@@ -249,10 +260,8 @@ the mode is built (FR-SV-19). Each is explained in its record.
   descriptor limit does not move it.
 - **An inherited UDP socket stops the program from starting** (D-50), so a service handed a UDP
   socket by its service manager cannot be supervised.
-- **`recvmmsg` returns at most one datagram per call** (D-51).
-- **An interrupted receive may still have written to the program's buffer** (D-51); the call
-  itself fails or restarts as it should.
-- **A socket also read by an unsupervised process** can lose a datagram (D-51).
+- **A blocking `recvmmsg` without `MSG_WAITFORONE` returns the datagrams already queued,** at
+  least one, rather than waiting until `vlen` have arrived (D-54).
 - **DNS** (D-52), none of it a leak:
   - only queries to the system resolver (loopback, or `/etc/resolv.conf`, re-read when it changes)
     are redirected to `dns`; other port-53 traffic is proxied as addressed, so a private resolver
@@ -272,10 +281,19 @@ the mode is built (FR-SV-19). Each is explained in its record.
   - a process that makes itself non-dumpable (`ssh-agent`, `gpg-agent`) fails closed, with a
     diagnostic naming the cause: its connects and sends, TCP included,
     are refused, and it cannot make a UDP socket;
-  - a send interrupted after its datagram has left is sent again if the call restarts;
   - a socket is placed at a free number, but a program with the range's start of descriptors open
     could, from another thread, open one at that number in the instant before the install;
   - a carried socket passed to another supervised process below the range is carried by its
     sends, but not by `write` and `read` there;
   - stdio on a UDP socket is carried, where the shim refuses it (D-36): a difference between the
     modes, not a limitation.
+- **Found in step 4** (D-54):
+  - the program is traced by the supervisor, so it cannot be debugged with `gdb` or `strace` from
+    inside the supervision, a program that uses `ptrace` itself gets `EPERM`, and `udpchains`
+    under `strace -f` refuses to start (accepted by the maintainer);
+  - a program built with LeakSanitizer cannot run its leak check, which uses `ptrace`;
+  - a send or receive whose association setup is abandoned for a signal is made again once the
+    signal is handled, never failing with `EINTR`;
+  - `socket()` and the other calls still notified can fail with `EINTR` when a signal arrives
+    while the supervisor holds them, where `socket()` natively never does; nothing is lost or
+    repeated.

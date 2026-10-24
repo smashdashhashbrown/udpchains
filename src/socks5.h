@@ -177,6 +177,12 @@ int udpc_socks_associate_chain(const struct udpc_config *cfg,
 /* Closes every control connection.  The chain is empty afterwards. */
 void udpc_socks_disconnect_chain(struct udpc_socks_chain *chain);
 
+/* Supervisor mode (D-54): while cancelled is set, every wait of a handshake is
+ * cut into short slices, and the handshake is abandoned with EINTR as soon as
+ * cancelled(arg) is true -- a signal is waiting for the thread whose call needs
+ * it.  NULL, the default and all the shim ever has, waits as before. */
+void udpc_socks_set_cancel(bool (*cancelled)(void *), void *arg);
+
 /* True while every control connection is open: losing any hop loses the
  * association (FR-CH-09). */
 bool udpc_socks_chain_alive(const struct udpc_socks_chain *chain);

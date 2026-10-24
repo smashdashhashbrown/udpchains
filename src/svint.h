@@ -1,7 +1,7 @@
 /* svint.h -- the supervisor's internals, shared by supervise.c (the filter,
- * start-up and the notification loop), svcall.c (answering each call) and
- * svsock.c (the sockets it carries).  Wrapper-only, like the rest of the
- * supervisor.
+ * start-up and the loop), svtrace.c (the program's threads, stopped by
+ * ptrace), svcall.c (answering each call) and svsock.c (the sockets it
+ * carries).  Wrapper-only, like the rest of the supervisor.
  */
 #ifndef UDPCHAINS_SVINT_H
 #define UDPCHAINS_SVINT_H
@@ -75,17 +75,6 @@ void svsock_drop_assoc(struct sv_sock *s);
 
 /* --- the supervisor ------------------------------------------------------*/
 
-/* A blocking receive with nothing queued yet (D-51): its call waits in the
- * program while the supervisor watches the socket, and is answered when a
- * datagram arrives, its SO_RCVTIMEO expires, or the call goes away. */
-struct sv_parked {
-	struct seccomp_notif req; /* the call, as notified */
-	uint64_t cookie;          /* the socket's */
-	int copy;                 /* the supervisor's descriptor for it */
-	long long deadline_ms;    /* CLOCK_MONOTONIC; 0 for none */
-	struct sv_parked *next;
-};
-
 struct sv {
 	const struct udpc_config *cfg;
 	int listener;
@@ -101,29 +90,64 @@ struct sv {
 	uint8_t *buf;     /* one datagram, wrapped: udpc_dgram_scratch_need */
 	size_t buflen;
 
-	struct sv_parked *parked;
 	long long sweep_at_ms; /* when the next sweep is due; 0 for none */
 };
 
 /* How a call was answered. */
 enum sv_outcome {
-	SV_ANSWER,   /* resp is filled in; the loop sends it */
+	SV_ANSWER,   /* answered: resp filled in for the loop to send, or for a
+	              * traced call, its result decided */
 	SV_ANSWERED, /* already answered, or gone: nothing to send */
-	SV_PARKED    /* a receive waiting for a datagram */
+	SV_PARKED    /* a traced receive that must wait for a datagram */
 };
 
-/* Fills in sv->resp for sv->req, or answers it. */
+/* Fills in sv->resp for sv->req, or answers it: a call the filter sent by user
+ * notification (D-48). */
 enum sv_outcome svcall_decide(struct sv *sv);
 
-/* Retries a parked receive: when its socket is readable, at its deadline, or to
- * notice that it has gone.  True once it is answered or gone, and may be
- * freed. */
-bool svcall_retry_parked(struct sv *sv, struct sv_parked *p, long long now_ms);
+/* --- traced calls (D-54) --------------------------------------------------
+ *
+ * A call on a descriptor in the range stops its thread, through ptrace, and is
+ * handled while the thread cannot run: a signal sent meanwhile waits until the
+ * call has its result. */
 
-/* Forgets parked calls that are no longer pending: with tid, those of that
- * thread, which has made another call since; with 0, any the kernel no longer
- * has. */
-void svcall_prune_parked(struct sv *sv, pid_t tid);
+/* What becomes of a traced call. */
+enum sv_verdict {
+	SV_RETURN,  /* skipped, returning ret */
+	SV_NATIVE,  /* runs in the kernel as the program made it */
+	SV_WAIT,    /* a receive with nothing queued: the thread waits natively,
+	             * in a zero-length peek, holding copy */
+	SV_AGAIN    /* made again: once a waiting signal has been handled, or to
+	             * wait for the next datagram */
+};
+
+struct sv_traced {
+	pid_t tid;
+	int nr;
+	__u64 args[6];
+	/* what svcall_traced and svcall_waited decide */
+	enum sv_verdict verdict;
+	long long ret;   /* SV_RETURN: the result, or -errno */
+	int copy;        /* SV_WAIT: the supervisor's descriptor for the socket */
+	uint64_t cookie; /* SV_WAIT: the socket's */
+};
+
+/* Decides a traced call at its entry. */
+void svcall_traced(struct sv *sv, struct sv_traced *t);
+
+/* Decides a waiting receive once its peek has returned peeked: a datagram is
+ * queued (peeked >= 0), or the peek's own error.  t is as svcall_traced left
+ * it; its copy stays the caller's to close. */
+void svcall_waited(struct sv *sv, struct sv_traced *t, long long peeked);
+
+/* Attaches to the program, the child the supervisor forked, before it runs:
+ * its threads and descendants are attached as they are made.  0, or an
+ * errno. */
+int svtrace_attach(pid_t child);
+
+/* Handles every stop and exit the kernel has to report.  Sets *none_left once
+ * no child or traced thread is left, and records the program's status. */
+void svtrace_reap(struct sv *sv, bool *none_left);
 
 /* A UDP, raw or packet socket: what the supervisor carries only when it made
  * it (D-50), or never (D-36). */
