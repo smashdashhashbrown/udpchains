@@ -83,6 +83,15 @@ check "a program killed by SIGTERM: udpchains dies of it too" "$?" 143
 env -u UDPCHAINS_PROXY -u UDPCHAINS_CONFIG HOME="$TMP" timeout 20 "$W" --supervise \
 	sh -c 'exit 0' 2> "$TMP/noproxy.err"
 check "no proxy configured: refused, as in shim mode" "$?" 1
+# udpchains' own stderr is a pipe whose reader has gone: its next diagnostic,
+# the association line, must not kill it and the program with it.  The
+# program writes nothing there.
+timeout 20 "${SV[@]}" sh -c "exec > /dev/null 2>&1; sleep 0.5; \"$P\" spray 127.0.0.1 $ECHO 1;
+	exit 7" 2>&1 | true
+check "udpchains' stderr closed: no SIGPIPE kills it, the program exits 7" "${PIPESTATUS[0]}" 7
+timeout 20 "${SV[@]}" sh -c 'sleep 0.3; while :; do echo x; done' | true
+check "a program writing to a closed pipe still dies of SIGPIPE, as natively" \
+	"${PIPESTATUS[0]}" 141
 
 echo "# the program is supervised, and given no shim (D-49)"
 out=$(timeout 20 "${SV[@]}" sh -c 'grep "^Seccomp:" /proc/self/status')

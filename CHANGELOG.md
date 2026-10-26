@@ -60,6 +60,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     after a truncated answer, goes to `dns` too, by SOCKS5 `CONNECT` through the proxy or chain,
     on the program's own socket, which the program then uses natively. Large answers and `options
     use-vc` now resolve; before, the connection was refused.
+  - **`udpchains` ignores `SIGPIPE` when supervising,** so a diagnostic written to a stderr whose
+    reader has gone (`2>&1 | head`), or a write to a proxy that has reset the connection, no
+    longer kills it and the program with it. The program keeps its own disposition.
   - **Tested** with a static Go client, through the seven interop proxies, and in `make compare`,
     where supervisor mode carried every combination and the static Go binary through the proxy.
   - **Documented** in the README, the man page and `udpchains -h`, with the limits of each mode.
@@ -76,8 +79,8 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 2319 assertions across 26 groups. Supervisor mode adds `unit-supervise` (27), 6 to
-  unit-config, `FR-SV-supervise` (59 checks, with static programs making 18, 6, 37, 25, 4, 24, 26,
+- 2321 assertions across 26 groups. Supervisor mode adds `unit-supervise` (27), 6 to
+  unit-config, `FR-SV-supervise` (61 checks, with static programs making 18, 6, 37, 25, 4, 24, 26,
   2, 4, 26, 4 and 5 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
   through two hops), and the fidelity test built `-static` under it (172). The supervisor also
   runs under ASan and UBSan, with the static matrix and fidelity tests.

@@ -921,7 +921,10 @@ with the socket. With `dns` unset the send fails with `ENETUNREACH`.
   for a new thread or process, or at the end of a group-stop, is simply continued.
 - **Stops and exits** both arrive as `SIGCHLD`, on the signalfd. `svtrace_reap()` takes each with
   `waitpid(-1, WNOHANG | __WALL)`. A stop is handled, and an exit asks for a sweep.
-- **If the supervisor dies,** `PTRACE_O_EXITKILL` kills every traced process with it.
+- **If the supervisor dies,** `PTRACE_O_EXITKILL` kills every traced process with it. So it
+  ignores `SIGPIPE`, set after the fork so the program keeps its own disposition: a write to a
+  proxy that has reset the connection, or to a stderr whose reader has gone, fails with `EPIPE`
+  instead of killing both.
 - **Descendants.** The supervisor is a child subreaper, so a descendant the program leaves running
   becomes its child, and stays supervised. It serves until the listener reports end of file, or
   no child is left.

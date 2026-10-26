@@ -577,6 +577,11 @@ int udpc_supervise(const struct udpc_config *cfg, const char *program, char **ar
 		close(down[1]);
 		run_child(program, argv, &orig, sv.range, up[1], down[0]);
 	}
+	/* A write to a proxy that has reset the connection, or to a stderr
+	 * whose reader has gone, fails with EPIPE rather than killing the
+	 * supervisor, and its program with it (PTRACE_O_EXITKILL).  Set after
+	 * the fork, so the program keeps the disposition it was given. */
+	signal(SIGPIPE, SIG_IGN);
 	close(up[1]);
 	close(down[0]);
 
