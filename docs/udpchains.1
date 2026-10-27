@@ -444,9 +444,15 @@ and
 .BR splice (2)
 onto a UDP socket
 .RB ( EINVAL ),
-and a send or connect on a UDP socket the supervisor did not make, received
+a send or connect on a UDP socket the supervisor did not make, received
 from another process
-.RB ( EPERM ).
+.RB ( EPERM ),
+and a
+.BR sendmsg (2)
+passing a UDP socket the supervisor carries to another process over
+.B SCM_RIGHTS
+.RB ( EPERM ),
+since its receives could not be carried where it would arrive.
 .PP
 .B Limitations.
 It is not a sandbox: a call let through after a check can be changed by the

@@ -41,8 +41,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     `close_range` no longer leaves descriptors open.
   - **Refused, as decided:** raw, packet, ICMP and UDP-Lite sockets; `io_uring_setup`;
     `pidfd_getfd`; sends, connects, `sendfile` and `splice` on a UDP socket received from another
-    process; `dup2` of a carried socket below the range; and starting with an inherited UDP
-    socket.
+    process; `dup2` of a carried socket below the range; passing a carried socket to another
+    process over `SCM_RIGHTS`, where its receives would have returned its headers as data
+    (release review H5, D-50 amended); and starting with an inherited UDP socket.
   - **Known limitations found while building it:**
     - a program that makes itself non-dumpable (`ssh-agent`, `gpg-agent`) is refused its connects
       and sends, TCP included, with a diagnostic naming the cause;
@@ -59,7 +60,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   - **DNS over TCP** (D-52): a TCP connection to the system resolver's port 53, as resolvers make
     after a truncated answer, goes to `dns` too, by SOCKS5 `CONNECT` through the proxy or chain,
     on the program's own socket, which the program then uses natively. Large answers and `options
-    use-vc` now resolve; before, the connection was refused.
+    use-vc` now resolve; before, the connection was refused. TCP Fast Open by `sendto()`,
+    `sendmsg()` and `sendmmsg()` is carried the same way; `sendmmsg()` reached the system
+    resolver directly until the release review (M11).
   - **`udpchains` ignores `SIGPIPE` when supervising,** so a diagnostic written to a stderr whose
     reader has gone (`2>&1 | head`), or a write to a proxy that has reset the connection, no
     longer kills it and the program with it. The program keeps its own disposition.
@@ -83,9 +86,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 2346 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
-  unit-config, `FR-SV-supervise` (66 checks, with static programs making 18, 6, 37, 25, 4, 24, 26,
-  2, 4, 26, 4, 7 and 5 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
+- 2348 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
+  unit-config, `FR-SV-supervise` (68 checks, with static programs making 25, 4, 18, 6, 37, 24, 29,
+  2, 4, 29, 5, 7, 5, 10 and 18 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
   through two hops), and the fidelity test built `-static` under it (172). The supervisor also
   runs under ASan and UBSan, with the static matrix and fidelity tests.
 

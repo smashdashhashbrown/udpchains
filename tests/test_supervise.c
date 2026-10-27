@@ -72,6 +72,10 @@
  *                                        process passing a socket would
  *   test_supervise received <path>       under the supervisor: takes that
  *                                        socket, and tries to send on it
+ *   test_supervise passing <echo port>   under the supervisor: a carried UDP
+ *                                        socket is never passed over
+ *                                        SCM_RIGHTS, and other descriptors
+ *                                        are (D-50)
  */
 #include "tap.h"
 
@@ -1456,6 +1460,29 @@ static int dns(int dnsd_port)
 		TAP_OK(dns_answers(r, n, 0x1209, "192.0.2.1"), "answered too");
 		close(fd);
 
+		/* sendmmsg(): its first message connects and is sent.  The
+		 * second finds the socket connected, which ends the call there,
+		 * so it returns 1, as natively. */
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		qn = dns_query_tcp(q, 0x120b, "a.test");
+		{
+			struct iovec v = { q, qn };
+			struct mmsghdr mm[2];
+
+			memset(mm, 0, sizeof(mm));
+			mm[0].msg_hdr.msg_name = &to;
+			mm[0].msg_hdr.msg_namelen = len_of(&to);
+			mm[0].msg_hdr.msg_iov = &v;
+			mm[0].msg_hdr.msg_iovlen = 1;
+			mm[1] = mm[0];
+			TAP_EQ_INT(sendmmsg(fd, mm, 2, MSG_FASTOPEN | MSG_NOSIGNAL), 1,
+			           "and by sendmmsg() with MSG_FASTOPEN: its first message sent");
+			TAP_EQ_INT((int)mm[0].msg_len, (int)qn, "with msg_len the query's length");
+		}
+		n = tcp_answer(fd, r, sizeof(r));
+		TAP_OK(dns_answers(r, n, 0x120b, "192.0.2.1"), "answered by dns too");
+		close(fd);
+
 		/* Connected already: the kernel has the call, whatever it makes
 		 * of the address, and the connection is left alone. */
 		fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1515,6 +1542,21 @@ static int nodns(void)
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	TAP_OK(fails_with(connect(fd, (struct sockaddr *)&to, len_of(&to)), ENETUNREACH),
 	       "connect() a TCP socket to 127.0.0.53:53: ENETUNREACH");
+	close(fd);
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	{
+		struct iovec v = { q, qn };
+		struct mmsghdr mm;
+
+		memset(&mm, 0, sizeof(mm));
+		mm.msg_hdr.msg_name = &to;
+		mm.msg_hdr.msg_namelen = len_of(&to);
+		mm.msg_hdr.msg_iov = &v;
+		mm.msg_hdr.msg_iovlen = 1;
+		TAP_OK(fails_with(sendmmsg(fd, &mm, 1, MSG_FASTOPEN | MSG_NOSIGNAL), ENETUNREACH),
+		       "TCP Fast Open's sendmmsg() to 127.0.0.53:53: ENETUNREACH, never sent "
+		       "to it directly");
+	}
 	close(fd);
 	TAP_DONE();
 }
@@ -1812,6 +1854,139 @@ static int received(const char *path)
 	TAP_DONE();
 }
 
+/* Passes the n descriptors in fds over the Unix socket sock, with one byte:
+ * by sendmsg(), or as the second message of a sendmmsg() whose first passes
+ * nothing.  What the call returns. */
+static int send_fds(int sock, const int *fds, int n, int mmsg)
+{
+	char cbuf[CMSG_SPACE(4 * sizeof(int))];
+	struct iovec iov = { (void *)(uintptr_t)"F", 1 };
+	struct mmsghdr mm[2];
+	struct cmsghdr *c;
+
+	memset(cbuf, 0, sizeof(cbuf));
+	memset(mm, 0, sizeof(mm));
+	mm[0].msg_hdr.msg_iov = &iov;
+	mm[0].msg_hdr.msg_iovlen = 1;
+	mm[1] = mm[0];
+	mm[1].msg_hdr.msg_control = cbuf;
+	mm[1].msg_hdr.msg_controllen = CMSG_SPACE((size_t)n * sizeof(int));
+	c = CMSG_FIRSTHDR(&mm[1].msg_hdr);
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type = SCM_RIGHTS;
+	c->cmsg_len = CMSG_LEN((size_t)n * sizeof(int));
+	memcpy(CMSG_DATA(c), fds, (size_t)n * sizeof(int));
+	if (mmsg)
+		return sendmmsg(sock, mm, 2, 0);
+	return (int)sendmsg(sock, &mm[1].msg_hdr, 0);
+}
+
+/* Takes what is queued on sock, without waiting: the number of descriptors
+ * that arrived with it, which are closed, or -1 if nothing was queued. */
+static int recv_fds(int sock)
+{
+	char cbuf[CMSG_SPACE(4 * sizeof(int))], b;
+	struct iovec iov = { &b, 1 };
+	struct msghdr mh;
+	struct cmsghdr *c;
+	int got = 0;
+
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = cbuf;
+	mh.msg_controllen = sizeof(cbuf);
+	if (recvmsg(sock, &mh, MSG_DONTWAIT) < 0)
+		return -1;
+	for (c = CMSG_FIRSTHDR(&mh); c != NULL; c = CMSG_NXTHDR(&mh, c)) {
+		int k, n, fd;
+
+		if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+			continue;
+		n = (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+		for (k = 0; k < n; k++) {
+			memcpy(&fd, CMSG_DATA(c) + (size_t)k * sizeof(int), sizeof(fd));
+			close(fd);
+			got++;
+		}
+	}
+	return got;
+}
+
+/* Under the supervisor: a carried socket passed over SCM_RIGHTS would arrive
+ * below the range, where its receives would return its headers as data, so
+ * every such pass is refused; any other descriptor passes (D-50). */
+static int passing(int echo_port)
+{
+	static char big[140000];
+	struct sockaddr_in to = loopback(echo_port);
+	struct timeval tv = { 2, 0 };
+	int sp[2], p[2], fds[2], udp, dupd, tcp, st;
+	char back[16];
+	pid_t pid;
+
+	TAP_GROUP("a carried UDP socket is never passed to another process (D-50)");
+	udp = socket(AF_INET, SOCK_DGRAM, 0);
+	TAP_OK(udp >= RANGE, "a UDP socket, at %d", udp);
+	TAP_EQ_INT(socketpair(AF_UNIX, SOCK_DGRAM, 0, sp), 0, "a Unix socket pair");
+	TAP_OK(fails_with(send_fds(sp[0], &udp, 1, 0), EPERM),
+	       "sendmsg() passing it over SCM_RIGHTS: EPERM");
+	TAP_EQ_INT(recv_fds(sp[1]), -1, "and nothing arrives at the other end");
+	dupd = dup(udp);
+	TAP_OK(dupd >= RANGE && fails_with(send_fds(sp[0], &dupd, 1, 0), EPERM),
+	       "a dup() of it, also in the range: EPERM");
+	TAP_EQ_INT(pipe(p), 0, "a pipe");
+	fds[0] = p[0];
+	fds[1] = udp;
+	TAP_OK(fails_with(send_fds(sp[0], fds, 2, 0), EPERM),
+	       "the pipe and the socket in one message: EPERM");
+	TAP_EQ_INT(recv_fds(sp[1]), -1, "and nothing arrives");
+	TAP_OK(fails_with(send_fds(sp[0], &udp, 1, 1), EPERM),
+	       "sendmmsg() passing it in its second message: EPERM, refused whole");
+	TAP_EQ_INT(recv_fds(sp[1]), -1, "and not even the first message arrives");
+	pid = fork();
+	if (pid == 0)
+		_exit(fails_with(send_fds(sp[0], &udp, 1, 0), EPERM) ? 0 : 1);
+	TAP_OK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+	       "a forked child passing its inherited copy: EPERM");
+	TAP_EQ_INT(recv_fds(sp[1]), -1, "and nothing arrives");
+
+	TAP_GROUP("other descriptors still pass");
+	TAP_EQ_INT(send_fds(sp[0], fds, 1, 0), 1, "a pipe passes");
+	TAP_EQ_INT(recv_fds(sp[1]), 1, "and arrives");
+	tcp = socket(AF_INET, SOCK_STREAM, 0);
+	TAP_EQ_INT(send_fds(sp[0], &tcp, 1, 1), 2, "a TCP socket passes, by sendmmsg()");
+	TAP_EQ_INT(recv_fds(sp[1]) + recv_fds(sp[1]), 1, "and arrives");
+	{
+		struct iovec iov = { (void *)(uintptr_t)"F", 1 };
+		struct msghdr mh;
+
+		/* The kernel's own limit, optmem_max, is 128 KiB by default. */
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_iov = &iov;
+		mh.msg_iovlen = 1;
+		mh.msg_control = big;
+		mh.msg_controllen = sizeof(big);
+		TAP_OK(fails_with(sendmsg(sp[0], &mh, 0), ENOBUFS),
+		       "control data above 128 KiB: ENOBUFS, not partly looked through");
+	}
+
+	TAP_GROUP("the socket itself is unharmed");
+	setsockopt(udp, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	memset(back, 0, sizeof(back));
+	TAP_OK(sendto(udp, "kept", 4, 0, (struct sockaddr *)&to, sizeof(to)) == 4 &&
+	               recv(udp, back, sizeof(back), 0) == 4 && memcmp(back, "kept", 4) == 0,
+	       "it still round-trips through the proxy");
+	close(tcp);
+	close(p[0]);
+	close(p[1]);
+	close(dupd);
+	close(udp);
+	close(sp[0]);
+	close(sp[1]);
+	TAP_DONE();
+}
+
 int main(int argc, char **argv)
 {
 	if (argc == 3 && strcmp(argv[1], "refusals") == 0)
@@ -1855,6 +2030,8 @@ int main(int argc, char **argv)
 		return pass(argv[2], atoi(argv[3]));
 	if (argc == 3 && strcmp(argv[1], "received") == 0)
 		return received(argv[2]);
+	if (argc == 3 && strcmp(argv[1], "passing") == 0)
+		return passing(atoi(argv[2]));
 	fprintf(stderr, "usage: test_supervise refusals <tcp port> | range <echo port> | "
 	                "signals <delayed echo port> <echo port> | silent | "
 	                "abandon <echo port> | lifecycle <echo port> | "
@@ -1863,6 +2040,6 @@ int main(int argc, char **argv)
 	                "nodump <tcp port> | "
 	                "churn <echo port> <n> <secs> | "
 	                "pass <path> <port> | "
-	                "received <path>\n");
+	                "received <path> | passing <echo port>\n");
 	return 2;
 }

@@ -879,6 +879,13 @@ again, so the signal is handled at once and nothing has been sent.
   checked is the one bound.
 - **The `dup` family:** `dup` and `F_DUPFD` of a carried socket are installed in the range;
   `dup2` and `dup3` of one below the range are refused with `EPERM`.
+- **Passing a carried socket** (D-50, amended): a `sendmsg` or `sendmmsg` on a Unix socket has its
+  control data read, and one passing a carried socket over `SCM_RIGHTS` fails with `EPERM`
+  (`call_passes_carried`), a `sendmmsg` refused whole. It would arrive below the range, where its
+  receives are not trapped. Control data above 128 KiB fails with `ENOBUFS`, as the kernel fails
+  it. A carried socket found below the range by any other route is not carried: its calls fail
+  with `EPERM` (`EINVAL` for `sendfile` and `splice`), and `splice` from one is refused at any
+  number.
 - **Any other descriptor:** a UDP, raw or packet socket the supervisor did not make is refused for
   anything that would send, connect or move data, with `EPERM` (`EINVAL` for `sendfile` and
   `splice`). Anything else continues. A descriptor that cannot be classified is refused; when the
@@ -901,11 +908,13 @@ with the socket. With `dns` unset the send fails with `ENETUNREACH`.
 - `deliver()` reports a reply from `dns` as from the address the program asked.
 - The loopback guard checks `dns`, where such a socket's datagrams go.
 - In `decide_other`, a `connect()` of an inet stream socket to the system resolver's port 53, or a
-  `sendto()`/`sendmsg()` naming it with `MSG_FASTOPEN`, goes to `dns_over_tcp()`. On a TCP socket
+  `sendto()`/`sendmsg()` naming it with `MSG_FASTOPEN`, or a `sendmmsg()` whose first message
+  does, goes to `dns_over_tcp()`. On a TCP socket
   in `TCP_CLOSE` (`TCP_INFO`), it connects the supervisor's copy of the program's socket to hop 1
   and makes the SOCKS5 `CONNECT` to `dns` through the chain (`udpc_socks_connect_on`, which makes
   the socket non-blocking for the handshake and restores its flags), then answers 0, or, for Fast
-  Open, sends the call's data on it and answers the count. The program then uses the socket
+  Open, sends the call's data on it and answers the count (for `sendmmsg()`, its first message's,
+  setting its `msg_len` and answering 1, as natively). The program then uses the socket
   natively. A failure dissolves the connection (`connect(AF_UNSPEC)`) and returns its error; a
   signal does the same, and the call is made again (D-54). A socket in any other state goes to the
   kernel. A stream socket that is not TCP is refused with `ECONNREFUSED`; with `dns` unset,
@@ -967,7 +976,8 @@ with the socket. With `dns` unset the send fails with `ENETUNREACH`.
   from the first thread and from another, and the close-on-exec socket's association let go after
   an `exec`; the leak client, static and dynamic, against a dead proxy sending nothing; a UDP
   socket received from an unsupervised process refused on every send route but D-50's `write()`
-  gap, which delivers its one byte; and an inherited UDP socket refusing the run.
+  gap, which delivers its one byte; a carried socket never passed over `SCM_RIGHTS`
+  (`test_supervise passing`); and an inherited UDP socket refusing the run.
 - `FR-SV-T1-matrix`: the hook matrix, built `-static`, under the supervisor, directly and through
   two hops.
 - `FR-SV-fidelity`: TST-05 built `-static`, checking the two documented differences as such:

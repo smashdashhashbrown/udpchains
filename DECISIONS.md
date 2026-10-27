@@ -2036,7 +2036,8 @@ cannot, it refuses to supervise.
 ## D-50
 ### UDP sockets live in a reserved range; outside it, UDP sends and connects are refused
 
-**Date:** 2026-10-22 · **Status:** Accepted; built (steps 2, 3 and 5) · FR-SV-04, FR-SV-18. Chosen by the
+**Date:** 2026-10-22, amended 2026-10-26 · **Status:** Accepted; built (steps 2, 3 and 5, and the
+amendment) · FR-SV-04, FR-SV-18. Chosen by the
 maintainer: trap sends on every descriptor and check its type, with three additions, over
 trapping `recvmsg` everywhere and over documenting the gap.
 
@@ -2090,7 +2091,7 @@ supervisor would cost two context switches on each.
   TCP programs that use `sendmsg`. So does every `connect`.
 - **A supervised UDP socket passed to an unsupervised process** is still connected to the relay.
   What that process writes reaches the relay without a SOCKS header, and goes no further; it is not
-  a leak, but it does not work.
+  a leak, but it does not work. *Closed by the amendment of 2026-10-26: the pass is refused.*
 - **The range is decided before the program runs.** A program that raises its own descriptor
   limit later (Go does, at start-up) keeps the range where it was.
 
@@ -2134,6 +2135,7 @@ It adds two limitations:
   `SCM_RIGHTS`) still has its sends and `connect` carried, since those are trapped on every
   descriptor. `write` and `read` there are not trapped: what is written reaches the relay without
   a header and goes no further, and what is read still has its header. Neither is a leak.
+  *Closed by the amendment of 2026-10-26, which found this understated: the pass is refused.*
 
 **Built in step 5** (2026-10-23): threads, `fork`, `vfork`, `clone` and `exec`.
 
@@ -2154,8 +2156,39 @@ It adds one limitation:
   than act on another table. On a kernel without `kcmp` (no `CONFIG_KCMP`), every thread is taken
   to share its process's table, as before.
 
-**Revisit if:** the gap above is met by a real program, which would justify trapping `recvmsg` on
-Unix sockets.
+**Amended 2026-10-26** (release review, H5): a carried socket is never passed over `SCM_RIGHTS`.
+
+- **Found.** A carried socket passed over `SCM_RIGHTS`, even by a process to itself, arrives at
+  the lowest free number, below the range. Its sends were carried, but none of its receives: a
+  static probe's `recvfrom()` on it returned the 10-byte SOCKS header and the payload, from the
+  relay's address. That is the defect FR-I-02 forbids, which step 3's limitation above
+  understated: it named only `read` and `write`, and only another process. Once the program
+  closed its copy in the range, the sweep forgot the socket, and the same sends became `EPERM`.
+- **Decision.** `sendmsg` and `sendmmsg`, already trapped on every descriptor, have their control
+  data read when the socket is a Unix socket. A message passing a carried socket, alone or with
+  other descriptors, fails with `EPERM` and a diagnostic; a `sendmmsg` doing so in any message is
+  refused whole. A descriptor being passed that cannot be inspected is refused the same way.
+  Control data above 128 KiB, the kernel's default `optmem_max`, fails with `ENOBUFS`, as the
+  kernel itself fails it, rather than being looked through only in part. Nothing else pays: a
+  send without control data, or on any other socket, is checked as before.
+- **And for any other route there,** none known: a carried socket below the range is not carried.
+  Its calls that reach the supervisor fail with `EPERM` (`EINVAL` for `sendfile` and `splice`),
+  and `splice` from a carried socket is refused at any number. No test reaches this; it rests on
+  inspection.
+- **Rejected:** moving a received socket into the range, which needs every `recvmsg` and
+  `recvmmsg` on every descriptor trapped (all D-Bus and Wayland traffic), and system calls
+  injected into the receiving thread at its exit stop.
+- **Consequence:** a program that hands its UDP sockets to another process, a prefork server
+  say, fails at the pass, with a diagnostic, rather than working half. Both limitations about
+  passed carried sockets are closed.
+- **Tested** (`test_supervise passing`): passing a carried socket to the same process, a `dup` of
+  it, it with a pipe in one message, it in a `sendmmsg`'s second message (the first not sent
+  either), and from a forked child, each `EPERM` with nothing arriving; a pipe and a TCP socket
+  still pass; control data above 128 KiB gives `ENOBUFS`, as it does unsupervised; the socket
+  still carries afterwards. Removing the check (a mutation) failed 10 of the probe's 18 checks.
+
+**Revisit if:** a real program needs to pass a UDP socket between processes, which would justify
+trapping `recvmsg` on Unix sockets.
 
 ---
 
@@ -2342,6 +2375,15 @@ resolver's port 53 goes to `dns`:
 - **Found by test:** a non-blocking connect that has completed marks the socket connected only
   once `connect()` is called again; without that call, a second `connect()` by the program
   succeeded instead of failing with `EISCONN`. `udpc_socks_connect_on` makes it.
+
+**`sendmmsg()` too, 2026-10-26** (release review, M11). Fast Open by `sendmmsg()` was not
+checked, so with `dns` unset a static probe's `sendmmsg(..., MSG_FASTOPEN)` naming
+`127.0.0.53:53` connected to it directly, and systemd-resolved answered from outside the proxy.
+Now its first message is checked as a `sendmsg()` is: only that one can connect, as the socket is
+connected by the time the kernel reaches the second. Carried, the first message is sent and the
+call returns 1, as natively, where the second message fails with `EISCONN` and ends the call;
+with `dns` unset it fails with `ENETUNREACH`. Tested in the `dns` and `nodns` probes. Removing the
+check (a mutation) failed both, and the `dns` probe through a chain.
 
 ---
 

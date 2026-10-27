@@ -440,6 +440,14 @@ sleep 0.3
 check "only the documented write() gap reached the destination, 1 byte" \
 	"$(($(echoed) - before))" 1
 
+echo "# a carried UDP socket is never passed over SCM_RIGHTS (D-50)"
+timeout -k 5 30 "${SV[@]}" "$P" passing "$ECHO" > "$TMP/passing.tap" 2> "$TMP/passing.err"
+rc=$?
+sed 's/^/#   /' "$TMP/passing.tap"
+check "test_supervise passing passes" "$rc" 0
+grep -q "sendmsg refused: a carried UDP socket passed over SCM_RIGHTS" "$TMP/passing.err" &&
+	ok "the refused pass says why" || notok "no diagnostic for the refused pass"
+
 echo "# an inherited UDP socket stops the program from starting (D-50)"
 exec 5<> "/dev/udp/127.0.0.1/$ECHO"
 out=$(timeout 20 "${SV[@]}" /bin/echo PROGRAM-RAN 2>&1)

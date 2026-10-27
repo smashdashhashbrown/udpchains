@@ -291,8 +291,10 @@ the mode is built (FR-SV-19). Each is explained in its record.
   connected before it was passed, and never connected again by the program.
 - **Every `sendto`, `sendmsg`, `sendmmsg` and `connect` makes a round trip to the supervisor,**
   UDP or not (D-50): D-Bus traffic, TCP programs using `sendmsg`, and every connection.
-- **A supervised UDP socket passed to an unsupervised process** does not work there: what it writes
-  reaches the relay without a header (D-50). Not a leak.
+- **A supervised UDP socket cannot be passed to another process** over `SCM_RIGHTS`: the
+  `sendmsg` fails with `EPERM` (D-50, amended 2026-10-26). Below the range, where it would
+  arrive, its receives would return its headers as data. A program that hands UDP sockets to
+  workers fails at the pass.
 - **The reserved range is fixed before the program runs** (D-50); a program raising its own
   descriptor limit does not move it.
 - **An inherited UDP socket stops the program from starting** (D-50), so a service handed a UDP
@@ -320,8 +322,6 @@ the mode is built (FR-SV-19). Each is explained in its record.
     are refused, and it cannot make a UDP socket;
   - a socket is placed at a free number, but a program with the range's start of descriptors open
     could, from another thread, open one at that number in the instant before the install;
-  - a carried socket passed to another supervised process below the range is carried by its
-    sends, but not by `write` and `read` there;
   - stdio on a UDP socket is carried, where the shim refuses it (D-36): a difference between the
     modes, not a limitation.
 - **Found in step 5** (D-50): before Linux 6.9, a thread with a descriptor table of its own

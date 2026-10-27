@@ -67,6 +67,12 @@
  * not looked through. */
 #define CONTROL_MAX 4096
 
+/* Control data read from a send on a Unix socket, to look for a carried socket
+ * being passed (D-50).  The kernel's default optmem_max: more than that it
+ * refuses itself, with ENOBUFS, and so does the supervisor, rather than
+ * looking through only part of it. */
+#define PASS_CONTROL_MAX 131072
+
 /* --- the call being answered ----------------------------------------------*/
 
 struct call {
@@ -123,7 +129,8 @@ static enum sv_outcome let_through(struct call *c)
  * another: a refused raw socket does not silence a refused io_uring. */
 enum {
 	WHY_RAW, WHY_ICMP, WHY_URING, WHY_PIDFD, WHY_UNKNOWN_FD, WHY_RECEIVED_FD,
-	WHY_DUP_OUT, WHY_NOT_INSPECTABLE, WHY_OWN_TABLE, WHY_NO_DNS, WHY_DNS_TCP, WHY_COUNT
+	WHY_DUP_OUT, WHY_NOT_INSPECTABLE, WHY_OWN_TABLE, WHY_NO_DNS, WHY_DNS_TCP,
+	WHY_PASS_CARRIED, WHY_CARRIED_BELOW, WHY_COUNT
 };
 static struct udpc_ratelimit g_rl_refuse[WHY_COUNT];
 
@@ -436,6 +443,7 @@ static int install(struct call *c, int src, int newfd, bool cloexec)
 static struct iovec g_riov[IOV_MAX];
 static uint8_t g_hdr[UDPC_SOCKS_CHAIN_HDR_MAX];
 static uint8_t g_control[CONTROL_MAX];
+static uint8_t g_pass_control[PASS_CONTROL_MAX];
 
 /* 0, or EFAULT if the whole of it cannot be read. */
 static int mem_read(const struct call *c, uint64_t addr, void *buf, size_t len)
@@ -1345,7 +1353,9 @@ static enum sv_outcome decide_dup2(struct call *c)
  * to the kernel, unless it is a UDP, raw or packet socket it did not make
  * (D-50) and the call would send, connect or move data on it. */
 /* D-52: whether a call connects a stream socket to the system resolver's port
- * 53, by connect(), or by a sendto() or sendmsg() naming it (TCP Fast Open). */
+ * 53, by connect(), or by a sendto(), sendmsg() or sendmmsg() naming it (TCP
+ * Fast Open).  Of a sendmmsg(), only the first message can connect: the
+ * socket is connected by the time the kernel reaches the second. */
 static bool stream_to_system_resolver(struct call *c, int copy)
 {
 	const __u64 *a = c->req->data.args;
@@ -1370,9 +1380,13 @@ static bool stream_to_system_resolver(struct call *c, int copy)
 		name = a[4];
 		namelen = (socklen_t)a[5];
 		break;
-	case SYS_sendmsg: {
+	case SYS_sendmsg:
+	case SYS_sendmmsg: {
 		struct msghdr m;
 
+		/* A struct mmsghdr starts with its message's msghdr. */
+		if (c->req->data.nr == SYS_sendmmsg && (unsigned)a[2] == 0)
+			return false;
 		if (mem_read(c, a[1], &m, sizeof(m)) != 0)
 			return false;
 		name = (uint64_t)(uintptr_t)m.msg_name;
@@ -1388,8 +1402,8 @@ static bool stream_to_system_resolver(struct call *c, int copy)
 }
 
 /* TCP Fast Open's data, after its connection has been made: sent on the
- * program's socket as the call would have sent it.  Returns the count sent, or
- * -errno. */
+ * program's socket as the call would have sent it -- for sendmmsg(), its first
+ * message.  Returns the count sent, or -errno. */
 static long long fastopen_data(struct call *c, int copy)
 {
 	const __u64 *a = c->req->data.args;
@@ -1413,7 +1427,7 @@ static long long fastopen_data(struct call *c, int copy)
 		if (err != 0)
 			return -err;
 		iovcnt = (unsigned long)m.msg_iovlen;
-		flags = (int)a[2];
+		flags = (int)a[c->req->data.nr == SYS_sendmsg ? 2 : 3];
 	}
 	/* A stream may send less than asked; the program sends the rest. */
 	if (total > c->sv->buflen)
@@ -1432,8 +1446,10 @@ static long long fastopen_data(struct call *c, int copy)
  * The program then reads and writes it natively, its epoll registrations and
  * options as they were.  connect() returns 0 once the tunnel is up, even on a
  * non-blocking socket; a send with MSG_FASTOPEN connects so, then sends its
- * data.  A failure leaves the socket unconnected, as a failed connect does,
- * and a signal abandons the setup, the call made again once it is handled. */
+ * data -- a sendmmsg() its first message, returning 1, as the kernel does when
+ * the next one finds the socket connected.  A failure leaves the socket
+ * unconnected, as a failed connect does, and a signal abandons the setup, the
+ * call made again once it is handled. */
 static enum sv_outcome dns_over_tcp(struct call *c, int copy)
 {
 	const struct udpc_config *cfg = c->sv->cfg;
@@ -1458,7 +1474,7 @@ static enum sv_outcome dns_over_tcp(struct call *c, int copy)
 	/* Only a socket not connected yet connects.  On any other the kernel
 	 * fails the connect, or sends on the connection the socket has; and a
 	 * send without MSG_FASTOPEN never connects. */
-	flags = nr == SYS_sendto ? (int)a[3] : nr == SYS_sendmsg ? (int)a[2] : 0;
+	flags = nr == SYS_connect ? 0 : (int)a[nr == SYS_sendmsg ? 2 : 3];
 	if (ti.tcpi_state != TCP_CLOSE || (nr != SYS_connect && !(flags & MSG_FASTOPEN))) {
 		close(copy);
 		return let_through(c);
@@ -1493,6 +1509,14 @@ static enum sv_outcome dns_over_tcp(struct call *c, int copy)
 	if (nr != SYS_connect)
 		sent = fastopen_data(c, copy);
 	close(copy);
+	if (sent >= 0 && nr == SYS_sendmmsg) {
+		unsigned msg_len = (unsigned)sent;
+
+		if (mem_write(c, a[1] + offsetof(struct mmsghdr, msg_len), &msg_len,
+		              sizeof(msg_len)) != 0)
+			return answer(c, 0, EFAULT);
+		sent = 1;
+	}
 	return sent < 0 ? answer(c, 0, (int)-sent) : answer(c, sent, 0);
 }
 
@@ -1529,6 +1553,100 @@ static void refused_daemon(const struct call *c, const char *daemon)
 	          c->req->pid, daemon);
 }
 
+/* D-50: whether control data of the program's, len bytes at control, passes a
+ * carried socket over SCM_RIGHTS.  It would arrive below the range, where the
+ * receives that would strip its headers are not trapped.  0 if not; else the
+ * errno the call is refused with, the refusal reported. */
+static int passes_carried(struct call *c, uint64_t control, size_t len)
+{
+	struct cmsghdr *h;
+	struct msghdr m;
+
+	if (control == 0 || len < sizeof(struct cmsghdr))
+		return 0;
+	if (len > sizeof(g_pass_control)) {
+		refused(c, WHY_PASS_CARRIED, "control data larger than the kernel's default "
+		                             "optmem_max, too much to look through for a "
+		                             "carried UDP socket (D-50)");
+		return ENOBUFS;
+	}
+	if (mem_read(c, control, g_pass_control, len) != 0)
+		return 0; /* the kernel fails it with EFAULT */
+	memset(&m, 0, sizeof(m));
+	m.msg_control = g_pass_control;
+	m.msg_controllen = len;
+	for (h = CMSG_FIRSTHDR(&m); h != NULL; h = CMSG_NXTHDR(&m, h)) {
+		size_t room = len - (size_t)((uint8_t *)h - g_pass_control), n, k;
+
+		/* One running past the end is malformed: the kernel's EINVAL. */
+		if (h->cmsg_len < CMSG_LEN(0) || h->cmsg_len > room)
+			return 0;
+		if (h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS)
+			continue;
+		n = (h->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+		for (k = 0; k < n; k++) {
+			bool carried;
+			int fd, copy;
+
+			memcpy(&fd, CMSG_DATA(h) + k * sizeof(int), sizeof(fd));
+			copy = copy_of(c, fd);
+			if (copy == -EBADF)
+				continue; /* not open: the kernel's EBADF */
+			if (copy < 0) {
+				/* Cannot tell: never let through unchecked. */
+				if (copy == -EPERM)
+					refused_uninspectable(c);
+				else
+					refused(c, WHY_UNKNOWN_FD, "cannot tell what a descriptor "
+					                           "being passed is, so cannot let "
+					                           "it through");
+				return EPERM;
+			}
+			carried = svsock_find(cookie_of(copy)) != NULL;
+			close(copy);
+			if (carried) {
+				refused(c, WHY_PASS_CARRIED, "a carried UDP socket passed over "
+				                             "SCM_RIGHTS would arrive below the "
+				                             "reserved range, where its receives "
+				                             "could not be carried (D-50)");
+				return EPERM;
+			}
+		}
+	}
+	return 0;
+}
+
+/* passes_carried for each message of a sendmsg() or sendmmsg() on a Unix
+ * socket.  A sendmmsg() passing a carried socket in any message is refused
+ * whole. */
+static int call_passes_carried(struct call *c, int copy)
+{
+	const __u64 *a = c->req->data.args;
+	unsigned vlen = 1, i;
+	int domain = 0, err;
+	socklen_t len = sizeof(domain);
+
+	/* SCM_RIGHTS is a Unix socket's alone; the kernel refuses it on any
+	 * other. */
+	if (getsockopt(copy, SOL_SOCKET, SO_DOMAIN, &domain, &len) != 0 || domain != AF_UNIX)
+		return 0;
+	if (c->req->data.nr == SYS_sendmmsg) {
+		vlen = (unsigned)a[2];
+		if (vlen > MMSG_MAX)
+			vlen = MMSG_MAX;
+	}
+	for (i = 0; i < vlen; i++) {
+		struct msghdr m;
+
+		if (mem_read(c, a[1] + (uint64_t)i * sizeof(struct mmsghdr), &m, sizeof(m)) != 0)
+			return 0; /* the kernel fails it, or stops there */
+		err = passes_carried(c, (uint64_t)(uintptr_t)m.msg_control, m.msg_controllen);
+		if (err != 0)
+			return err;
+	}
+	return 0;
+}
+
 static enum sv_outcome decide_other(struct call *c, int copy)
 {
 	int nr = c->req->data.nr;
@@ -1537,9 +1655,18 @@ static enum sv_outcome decide_other(struct call *c, int copy)
 
 	/* D-52: the local resolver would send the queries upstream itself,
 	 * around the proxy; the connection goes to dns instead. */
-	if ((nr == SYS_connect || nr == SYS_sendto || nr == SYS_sendmsg) &&
+	if ((nr == SYS_connect || nr == SYS_sendto || nr == SYS_sendmsg || nr == SYS_sendmmsg) &&
 	    stream_to_system_resolver(c, copy))
 		return dns_over_tcp(c, copy);
+	/* D-50: a carried socket never leaves the range by SCM_RIGHTS. */
+	if (nr == SYS_sendmsg || nr == SYS_sendmmsg) {
+		int err = call_passes_carried(c, copy);
+
+		if (err != 0) {
+			close(copy);
+			return answer(c, 0, err);
+		}
+	}
 	/* D-55: a daemon the lookup was handed to would resolve it outside the
 	 * proxy.  Refused as a daemon not running is, so the lookup falls
 	 * through to DNS. */
@@ -1591,18 +1718,18 @@ static enum sv_outcome decide(struct call *c)
 	case SYS_dup3:
 		return decide_dup2(c);
 	case SYS_splice:
-		/* Either end on a carried socket moves bytes without a header;
-		 * the destination is checked as a send's is. */
-		if ((unsigned)a[0] >= sv->range) {
-			copy = copy_of(c, (int)a[0]);
-			if (copy == -ENOENT)
-				return SV_ANSWERED;
-			if (copy >= 0) {
-				s = svsock_find(cookie_of(copy));
-				close(copy);
-				if (s != NULL)
-					return answer(c, 0, EINVAL);
-			}
+		/* Either end on a carried socket moves bytes without a header.
+		 * The source is checked at any number, as a carried socket
+		 * below the range is never carried (D-50); the destination as a
+		 * send's is. */
+		copy = copy_of(c, (int)a[0]);
+		if (copy == -ENOENT)
+			return SV_ANSWERED;
+		if (copy >= 0) {
+			s = svsock_find(cookie_of(copy));
+			close(copy);
+			if (s != NULL)
+				return answer(c, 0, EINVAL);
 		}
 		fd = (int)a[2];
 		break;
@@ -1636,6 +1763,16 @@ static enum sv_outcome decide(struct call *c)
 		return answer(c, 0, (nr == SYS_sendfile || nr == SYS_splice) ? EINVAL : EPERM);
 	}
 	s = svsock_find(cookie_of(copy));
+	if (s != NULL && (unsigned)fd < sv->range) {
+		/* D-50: below the range its receives are not trapped, and would
+		 * return its headers as data, so it is not carried there at
+		 * all.  SCM_RIGHTS, the one route there, is refused; this is
+		 * for any other. */
+		close(copy);
+		refused(c, WHY_CARRIED_BELOW, "a carried UDP socket below the reserved range, "
+		                              "where its receives could not be carried (D-50)");
+		return answer(c, 0, (nr == SYS_sendfile || nr == SYS_splice) ? EINVAL : EPERM);
+	}
 	if (s != NULL)
 		return on_carried(c, s, copy, fd);
 	return decide_other(c, copy);

@@ -1,4 +1,156 @@
-# Release review backlog — `udpchains` 0.1.0
+# Release review backlog
+
+Findings of each pre-release review, newest first. Each item keeps the ID it was given in its
+review, so discussions and commits can refer to it; IDs continue from one review to the next.
+
+---
+
+# Next release (supervisor mode) — review of 2026-10-26
+
+Comprehensive review of code, documentation and tests on branch `release_review`, at `e9c08bb`.
+`make test` was run from a clean build: all 26 groups passed (2346 assertions, 91 symbol checks);
+tftp, ntpdate and iperf3 were skipped. Findings are recorded, not fixed, until the maintainer says
+which to fix.
+
+**Reproduced** means shown with a test program, recorded with the finding; **inspection** means
+found by reading the code. File and line references are to `e9c08bb`.
+
+## Critical
+
+None found.
+
+## High
+
+- [ ] **H5** — *Reproduced.* A carried UDP socket received below the range, over `SCM_RIGHTS`, is
+  carried for `sendto`, `sendmsg`, `sendmmsg` and `connect`, which are trapped on every
+  descriptor, but not for `recvfrom`, `recv`, `recvmsg`, `recvmmsg`, `read`, `readv`, `write` or
+  `splice`, which are trapped only in the range. A static program that passed its own socket to
+  itself got fd 5: `sendto` reached the echo server through the proxy, then `recvfrom` returned 19
+  bytes from the relay's address, `00 00 00 01 7f 00 00 01 ae fc` followed by the 9-byte payload.
+  That is the SOCKS header delivered as data, the defect of §0.3.2 that FR-I-02 (M) forbids.
+  `write` on it sends the payload to the relay with no header. `decide()` (`src/svcall.c:1638`)
+  calls `on_carried` for any descriptor whose cookie is known, whatever its number. By inspection,
+  once the program closes its in-range copy, the sweep forgets the socket (`mark_table` skips
+  numbers below the range), and the same calls switch to `EPERM`.
+  D-50 accepts this, but its text says only "another supervised process" (the same process
+  does it too) and only `read`/`write`. The README and man page do not mention it (see D8).
+  *Suggested:* refuse every call but `close`, `getsockname` and `getpeername` on a carried
+  socket below the range with `EPERM`, as FR-SV-18 does for a socket the supervisor did not make,
+  and add the case to `test_supervise received`.
+  **Fixed, not yet committed:** refused at the pass instead (D-50 amended): a `sendmsg` or
+  `sendmmsg` passing a carried socket over `SCM_RIGHTS` fails with `EPERM`; a carried socket
+  below the range by any other route is refused too. New probe `test_supervise passing`.
+
+## Medium
+
+- [ ] **M11** — *Reproduced.* A TCP query to the system resolver sent with
+  `sendmmsg(..., MSG_FASTOPEN)` reaches it directly. `decide_other` checks only `connect`,
+  `sendto` and `sendmsg` (`src/svcall.c:1540`, `stream_to_system_resolver` at `:1349`). A
+  static probe supervised with `dns` unset sent a TCP query for `example.com` to
+  `127.0.0.53:53` by `sendmmsg`, was connected to `127.0.0.53:53`, and got a 63-byte answer
+  from systemd-resolved, which resolved it outside the proxy. FR-SV-12 (M): "never made
+  directly". The call is unusual, but closing the gap means adding one case.
+  **Fixed, not yet committed:** `sendmmsg` is checked and carried as `sendmsg` is (D-52); tested
+  in the `dns` and `nodns` probes.
+- [ ] **M12** — *Reproduced.* Every `read`, `write`, `readv`, `writev`, `close`, `bind` and
+  name call on any descriptor at 768 and up is traced, whatever it is (`g_in_range`,
+  `src/supervise.c:116`). A `read` of `/dev/zero` at fd 800 took 39 µs supervised, against
+  1.1 µs natively and 2.2 µs at fd 3. A program with more than 768 descriptors open (a server;
+  Go raises its soft limit to the hard one at start-up) pays this on every file and TCP call at
+  those numbers. The README, the man page and FUTURE-STATIC-BINARIES §9 do not say so; §9 and
+  DESIGN §13.3 say only that I/O *below* the range never leaves the kernel. *Suggested:* document
+  it at least.
+- [ ] **M13** — *Measured.* Each sweep (`svsock_sweep`, `src/svsock.c:212`) opens
+  `/proc/<pid>/stat` for **every process on the host** to find the supervisor's descendants.
+  It runs every 5 s while any socket is carried, and 200 ms after every `close`, `close_range`,
+  `dup2`, exit or `exec` in the range. The supervisor is one thread, so every traced call of
+  every supervised process waits meanwhile. A C loop over the same files took 12.9 ms per pass
+  with 391 processes on this host, and the cost grows with the host, not the program. Marking is
+  also O(descriptors × sockets): each socket descriptor walks every bucket. *Suggested:* the
+  supervisor already sees every tracee start and end (`PTRACE_EVENT_FORK`/`CLONE`, `waitpid`),
+  so it can keep its own list of processes, and index sockets by inode.
+
+## Low
+
+- [ ] **L8** — *Inspection.* The two modes classify a datagram socket's protocol differently. The
+  shim allows only `0` and `IPPROTO_UDP` (`src/hooks.c:279`), as D-29 decides. The supervisor
+  refuses only ICMP, ICMPv6 and UDP-Lite (`src/svcall.c:1257`), so any other `SOCK_DGRAM`
+  protocol the kernel accepts (L2TP/IP, for one) is made and "carried" as if it were UDP. Nothing
+  goes direct, but it fails strangely instead of with `EPROTONOSUPPORT`. DESIGN §13.5 describes
+  the denylist.
+- [ ] **L9** — *Reproduced.* Once the program has exited, a signal sent to `udpchains` by another
+  process is no longer forwarded (`!sv->child_done`, `src/supervise.c:364`), yet the
+  supervisor goes on waiting for the descendants left running. `udpchains --supervise sh -c
+  'sleep 30 & exit 0'` was still running 2 s after `kill -TERM`; only `SIGKILL` ended it.
+- [ ] **L10** — *Inspection.* On a full send buffer, `send_via` (`src/svcall.c:569`) blocks the
+  whole supervisor for up to 1 s, then returns `EAGAIN` to a socket the program made blocking,
+  which never returns `EAGAIN` natively.
+- [ ] **L11** — *Inspection.* `free_number` (`src/svcall.c:388`) probes every number from the
+  range's start with `pidfd_getfd` until it finds a free one, so a program holding *n* sockets
+  pays *n* + 1 system calls for each new `socket()` or `dup`: quadratic for a program that keeps
+  many.
+- [ ] **L12** — *Inspection.* Dead code in the shipped library and wrapper: `udpc_shim_ready()`
+  (`src/shim.c:58`) has had no caller since the first commit. `udpc_socks_associate`,
+  `udpc_socks_disconnect`, `udpc_socks_control_alive` and `udpc_socks_encode_domain` are called
+  only by the unit tests; production uses the chain versions.
+- [ ] **L13** — *Inspection.* The shim's `sendmmsg` and `recvmmsg` (`src/hooks.c:853`, `:1012`) do
+  not cap `vlen` at 1024 (`UIO_MAXIOV`) as the kernel does, so a blocking `recvmmsg` with a
+  larger `vlen` waits for more datagrams than the kernel would return, and `sendmmsg` sends more
+  than it would. The supervisor caps both (`MMSG_MAX`), so the two modes differ. FR-F-09:
+  partial success "as the kernel does".
+- [ ] **L14** — *Reproduced.* A supervised program is given the full shim environment
+  (`udpc_config_export`, `src/wrapper.c:528`): `UDPCHAINS_PROXY`, `UDPCHAINS_USERNAME`, the
+  password file's path (or `UDPCHAINS_PASSWORD_CONFIG`) and the rest. The supervisor, not the
+  program, talks to the proxy, so none of it is needed. This is no worse than shim mode (D-25),
+  but it is exposure that serves no purpose.
+- [ ] **L15** — *Inspection.* `dns_redirected` (`src/svcall.c:669`) stays set on a socket for good.
+  If the same socket later sends to the configured `dns` address itself, replies from it are
+  relabelled as coming from the system resolver it once asked.
+- [ ] **L16** — *Inspection, not reproduced.* seccomp(2) ranks `SECCOMP_RET_USER_NOTIF` above
+  `SECCOMP_RET_TRACE`. A supervised program that installs its own filter with a listener and
+  answers with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` has those calls run without the supervisor
+  seeing them. This is deliberate evasion, covered by "not a sandbox" (D-48), but a program that
+  uses seccomp notification itself would bypass the supervisor without meaning to. Worth one line
+  in the limitations.
+- [ ] **L17** — *Inspection.* Test harness:
+  - 37 supervised runs in the test scripts use `timeout` without `-k`, which CLAUDE.md asks for
+    because the supervisor passes `SIGTERM` on to its program;
+  - TST-04 passes with three of its five tools skipped, and `NFR-04-bench`, which cannot fail, is
+    counted among the groups passed, so the headline "ALL 26 TEST GROUPS PASSED" does not show
+    either;
+  - nothing tests a carried socket received below the range (H5); FR-SV-T3's `SCM_RIGHTS` check
+    covers only a socket from an unsupervised process.
+
+## Documentation
+
+- [ ] **D8** — FR-SV-19 (M) is marked Verified, but neither the README's *What supervisor mode
+  cannot do* nor the man page's *Limitations* states several of D-50's accepted limitations: H5's
+  carried socket below the range; a supervised socket passed to an unsupervised process; the
+  reserved range fixed before the program runs; the race in placing a socket. M12's cost at 768
+  and up is not documented either. README line 370, "Everything the shim refuses is refused here
+  too", is not true of stdio (`fdopen`), which the shim refuses and the supervisor carries, nor,
+  per L8, of protocols other than UDP.
+- [ ] **D9** — The decision index at the top of `DECISIONS.md` stops at D-54; D-55 is missing.
+- [ ] **D10** — `docs/TRACEABILITY.md`: the TST-02 row says 71 symbol checks; the run, and the
+  paragraph above the table, say 91. **Fixed, not yet committed,** with the totals regenerated
+  for H5 and M11.
+- [ ] **D11** — The man page's EXIT STATUS lists only 0, 1, 126 and 127. It does not say that
+  otherwise `udpchains` exits with the program's status, or, supervised, dies of the signal that
+  killed it, nor that 1 can be the program's own status as well as a refusal.
+- [ ] **D12** — `UDP-PRELOAD-REQUIREMENTS.md`: the header still describes an `LD_PRELOAD` shim for
+  dynamically linked programs only, and is marked "Draft for implementation, 2026-08-17".
+- [ ] **D13** — Release steps not yet done: `VERSION` in the `Makefile` is still `0.2.0`, and the
+  CHANGELOG entry is `[Unreleased]`.
+
+## Carried over
+
+Not new: from the 0.1.0 review below, still open, and deferred by the maintainer until a second
+host exists: **D2 interop** and **C4 interop** across hosts. Supervisor mode has had the same
+same-host interop as the shim, not yet across hosts (FR-SV-17 waits on it).
+
+---
+
+# `udpchains` 0.1.0
 
 Open findings from the pre-release review of 2026-09-23, on branch `release_1.0.0_review`. Each item
 keeps the ID it was given in the review so discussions and commits can refer to it.

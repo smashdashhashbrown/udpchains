@@ -356,6 +356,9 @@ The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/res
   write.
 - **An inherited UDP socket stops the program from starting,** so a service handed one by its
   service manager cannot be supervised.
+- **A UDP socket cannot be passed to another process** over `SCM_RIGHTS`, as a prefork server
+  hands one to its workers: the `sendmsg` fails with `EPERM`, with a diagnostic. Where it would
+  arrive, its receives could not be carried.
 - **A process that makes itself non-dumpable** (`ssh-agent`, `gpg-agent`) cannot be inspected: its
   connects and sends fail with `EPERM`, TCP included, with a diagnostic naming the cause.
 - **No `gdb` or `strace` inside the supervision,** and a program that uses `ptrace` itself gets
