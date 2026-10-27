@@ -89,6 +89,8 @@ None found.
   set with a zero timeout, `SIGCHLD` excluded), and passes it on (`si_code` at or below zero, as
   `on_signal` does). The program's thread then has it pending, and the setup is abandoned as for
   a signal of its own.
+  **Fixed, not yet committed,** as suggested (D-54 amended); the check now uses a probe with no
+  signal of its own, `test_supervise hang`, and passes or fails every time.
 
 ## Low
 

@@ -872,7 +872,10 @@ decides it, and then:
 cut into 50 ms slices (`udpc_socks_set_cancel`). Between slices the supervisor reads the thread's
 `/proc/<tid>/status`. A signal pending for the thread or its process, not blocked, and not
 ignored either explicitly or by default, abandons the setup with `EINTR`. The call is then made
-again, so the signal is handled at once and nothing has been sent.
+again, so the signal is handled at once and nothing has been sent. First, though, a signal sent
+to the supervisor itself, which the loop cannot read until the setup ends, is taken
+(`sv_forward_pending`, `sigtimedwait` with no wait) and passed on to the program as the loop
+would pass it, so that it too abandons the setup (release review M14).
 
 - **`socket()`:** raw and packet sockets `EPERM`, ICMP and UDP-Lite `EPROTONOSUPPORT`; UDP as
   above; anything else continues. Its arguments are values, so continuing cannot be raced.

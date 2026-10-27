@@ -28,7 +28,8 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     stopped by `ptrace`, so a signal never loses a received datagram, never makes a send fail
     with `EINTR` or go twice, and never leaves a `close` undone. A receive with nothing queued
     waits in the program's own kernel, so `SO_RCVTIMEO`, `EINTR` and `SA_RESTART` behave exactly
-    as natively. A signal arriving while an association is set up is handled at once. If
+    as natively. A signal arriving while an association is set up is handled at once, one sent
+    to `udpchains` included (release review M14). If
     `udpchains` is killed, so is the program.
   - **Threads, `fork`, `vfork`, `clone` and `exec`** (step 5): followed and tested. A thread with
     a descriptor table of its own is reached through a thread pidfd (Linux 6.9), and the sweep

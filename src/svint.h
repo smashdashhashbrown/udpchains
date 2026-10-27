@@ -191,6 +191,12 @@ bool sv_uncarriable(int fd);
  * replaced. */
 void sv_sweep_soon(struct sv *sv);
 
+/* Passes on to the program, now, any signal another process has sent the
+ * supervisor and the loop has not read yet, as the loop would (supervise.c):
+ * for a handshake, which keeps the loop from reading them until it ends.
+ * True if there was one. */
+bool sv_forward_pending(struct sv *sv);
+
 long long sv_now_ms(void);
 
 /* --- DNS (D-52) ------------------------------------------------------------*/

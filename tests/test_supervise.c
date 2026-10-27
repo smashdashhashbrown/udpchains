@@ -79,6 +79,9 @@
  *   test_supervise orphan <echo port>    under the supervisor: a grandchild
  *                                        orphaned onto the supervisor keeps
  *                                        its inherited socket carried (D-50)
+ *   test_supervise hang <echo port>      under the supervisor, with the silent
+ *                                        proxy: one send, whose setup only a
+ *                                        signal sent to udpchains can end
  */
 #include "tap.h"
 
@@ -801,6 +804,23 @@ static int abandon(int echo_port)
 	       elapsed_ms(&t0));
 	close(fd);
 	TAP_DONE();
+}
+
+/* Under the supervisor, with the silent proxy: one send, with no signal of its
+ * own to abandon the setup, so a signal sent to udpchains is all that can
+ * (release review M14).  Says when it is about to send. */
+static int hang(int echo_port)
+{
+	struct sockaddr_in e = loopback(echo_port);
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	ssize_t r;
+
+	printf("SENDING\n");
+	fflush(stdout);
+	r = sendto(fd, "x", 1, 0, (struct sockaddr *)&e, sizeof(e));
+	printf("SENT %d\n", (int)r);
+	close(fd);
+	return 0;
 }
 
 /* --- lifecycle -------------------------------------------------------------*/
@@ -2083,6 +2103,8 @@ int main(int argc, char **argv)
 		return passing(atoi(argv[2]));
 	if (argc == 3 && strcmp(argv[1], "orphan") == 0)
 		return orphan(atoi(argv[2]));
+	if (argc == 3 && strcmp(argv[1], "hang") == 0)
+		return hang(atoi(argv[2]));
 	fprintf(stderr, "usage: test_supervise refusals <tcp port> | range <echo port> | "
 	                "signals <delayed echo port> <echo port> | silent | "
 	                "abandon <echo port> | lifecycle <echo port> | "
@@ -2091,6 +2113,7 @@ int main(int argc, char **argv)
 	                "nodump <tcp port> | "
 	                "churn <echo port> <n> <secs> | "
 	                "pass <path> <port> | "
-	                "received <path> | passing <echo port> | orphan <echo port>\n");
+	                "received <path> | passing <echo port> | orphan <echo port> | "
+	                "hang <echo port>\n");
 	return 2;
 }

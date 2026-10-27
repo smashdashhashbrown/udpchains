@@ -350,6 +350,31 @@ static const int g_forwarded[] = {
 	SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGALRM, SIGWINCH,
 };
 
+static void forward(const struct sv *sv, int signo, int code)
+{
+	if (code <= 0 && !sv->child_done)
+		kill(sv->child, signo);
+}
+
+bool sv_forward_pending(struct sv *sv)
+{
+	static const struct timespec none = { 0, 0 };
+	siginfo_t si;
+	sigset_t set;
+	bool any = false;
+	size_t k;
+
+	/* SIGCHLD is left for the loop, which reaps on it. */
+	sigemptyset(&set);
+	for (k = 0; k < sizeof(g_forwarded) / sizeof(g_forwarded[0]); k++)
+		sigaddset(&set, g_forwarded[k]);
+	while (sigtimedwait(&set, &si, &none) > 0) {
+		forward(sv, si.si_signo, si.si_code);
+		any = true;
+	}
+	return any;
+}
+
 /* SIGCHLD comes for each stop of a traced thread as well as for each exit:
  * svtrace.c handles both. */
 static void on_signal(struct sv *sv, bool *none_left)
@@ -361,8 +386,7 @@ static void on_signal(struct sv *sv, bool *none_left)
 			svtrace_reap(sv, none_left);
 			continue;
 		}
-		if (si.ssi_code <= 0 && !sv->child_done)
-			kill(sv->child, (int)si.ssi_signo);
+		forward(sv, (int)si.ssi_signo, si.ssi_code);
 	}
 }
 

@@ -281,7 +281,10 @@ static bool g_abandoned;
 
 static bool abandon(void *arg)
 {
-	(void)arg;
+	/* A signal sent to udpchains meanwhile is passed on at once, not when
+	 * the setup ends (release review M14), and then abandons it as one
+	 * sent to the program does. */
+	sv_forward_pending(arg);
 	if (!signal_waiting(g_for))
 		return false;
 	g_abandoned = true;
@@ -295,7 +298,7 @@ static void with_abandon(struct sv *sv, struct sv_traced *t, long long peeked, b
 {
 	g_for = t->tid;
 	g_abandoned = false;
-	udpc_socks_set_cancel(abandon, NULL);
+	udpc_socks_set_cancel(abandon, sv);
 	if (waited)
 		svcall_waited(sv, t, peeked);
 	else

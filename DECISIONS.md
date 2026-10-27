@@ -2720,6 +2720,26 @@ tests cannot show, a signal arriving after the supervisor has taken the call. Wi
 step would rely on `ADDFD` with `SEND` being atomic under interruption, which has only been
 measured, not documented.
 
+**Amended 2026-10-26** (release review, M14): a signal sent to `udpchains` during a setup is
+passed on at once.
+
+- **Found.** While a setup waits, the supervisor is inside the handshake and does not read its
+  own signals, and the setup was abandoned only for a signal pending for the program's thread. So
+  a `SIGTERM` to `udpchains` reached the program only once the setup ended, up to
+  `connect_timeout` per hop later. The test of it passed only because its probe's own `SIGALRM`
+  abandoned the setup first, and was late in 4 of 30 runs.
+- **Decision.** Between slices the abandon check first takes any forwardable signal pending for
+  the supervisor (`sigtimedwait` with no wait, `SIGCHLD` left for the loop) and passes it on as
+  the loop does (`si_code` at or below zero). Pending for the program then, it abandons the setup
+  as a signal of its own would, unless the program blocks or ignores it.
+- **What it does not reach:** a signal is passed on to the program's first process, as ever. If
+  the setup is for another of its processes, it is not abandoned, and if the first process is
+  itself stopped at a call waiting its turn, it takes the signal once that call is answered.
+- **Tested** with a probe that sends once through the silent proxy and has no signal of its own
+  (`test_supervise hang`): `SIGTERM` to `udpchains` 300 ms into the handshake ended the program at
+  once in 10 runs of 10. With the change removed (a mutation), each of 10 waited the full
+  `connect_timeout`.
+
 **Revisit if:** Linux gains a way for a notification's reply to be committed to the program before
 a signal can take effect. Every call could then return to user notification.
 

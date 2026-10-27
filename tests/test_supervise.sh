@@ -167,14 +167,19 @@ sed 's/^/#   /' "$TMP/abandon.tap"
 check "test_supervise abandon passes, -static" "$rc" 0
 # SIGTERM to udpchains is passed to the program while its send waits for the
 # silent proxy; the setup is abandoned, and the program dies at once rather
-# than after connect_timeout.
+# than after connect_timeout.  The probe has no signal of its own that could
+# end the setup first (release review M14).
 start=$(date +%s%N)
 UDPCHAINS_CONNECT_TIMEOUT=10000 "$W" --supervise -p "127.0.0.1:$SILENT" \
-	"$P" abandon "$ECHO" > /dev/null 2>&1 &
+	"$P" hang "$ECHO" > "$TMP/hang.out" 2> /dev/null &
 pid=$!
 (sleep 20; kill -KILL "$pid") 2> /dev/null &
 dog=$!
-sleep 0.15
+for ((i = 0; i < 100; i++)); do
+	grep -q SENDING "$TMP/hang.out" 2> /dev/null && break
+	sleep 0.02
+done
+sleep 0.3 # into the handshake, which the silent proxy never answers
 kill -TERM "$pid"
 wait "$pid"
 rc=$?
