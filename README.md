@@ -512,7 +512,7 @@ host's loopback.
   including GSSAPI (`0x01`). A proxy selecting one is refused with a diagnostic.
 - Chains that skip a dead hop or pick hops at random (proxychains' `dynamic_chain` and
   `random_chain`). Chains are strict ([`DECISIONS.md`](DECISIONS.md) D-37).
-- Supervisor mode on architectures other than x86-64 (aarch64 is planned).
+- Supervisor mode on architectures other than x86-64 (aarch64 is deferred).
 - Loopback and multicast bypass. Deferred ([`DECISIONS.md`](DECISIONS.md) D-05).
 
 ## Comparison with similar tools

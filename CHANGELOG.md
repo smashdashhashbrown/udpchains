@@ -13,10 +13,10 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Added
 
-- **Supervisor mode** (D-48 to D-54), in progress, for static and Go binaries, which the shim
+- **Supervisor mode** (D-48 to D-55), for static and Go binaries, which the shim
   cannot see. `udpchains --supervise` (or `supervise = yes`, or `UDPCHAINS_SUPERVISE=1`) runs the
   program under a seccomp filter whose calls udpchains answers, instead of preloading the shim.
-  - **So far** (steps 2 to 5 of `docs/FUTURE-STATIC-BINARIES.md`): a static program's UDP is
+  - **UDP** (steps 2 to 5 of `docs/FUTURE-STATIC-BINARIES.md`): a static program's UDP is
     carried through the proxy or chain. The supervisor makes each UDP socket in a reserved range
     of descriptors (768 and up) and performs its sends and receives there: headers added and
     checked, the true sender reported, blocking and non-blocking receives, `SO_RCVTIMEO`,

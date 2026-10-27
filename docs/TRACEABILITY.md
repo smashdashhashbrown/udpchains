@@ -88,7 +88,7 @@ from a run rather than editing it by hand.
 | FR-P-07 | M | §4.3 | unit-socks5 | **Verified** — encode/decode of ATYP 0x03. Not reachable via the socket API (no libc UDP call takes a hostname); covered by unit test, as §4.3 notes |
 | FR-P-08 | S | §4.4 | faults | **Verified** — fixture expires an association; the shim re-associates before the send, so no datagram is lost |
 | FR-P-09 | S | §4.1 | unit-socks5, FR-P-09-auth | **Verified** — RFC 1929 implemented (D-20, superseding the D-08 deferral). `0x02` is offered only when credentials are configured; the sub-negotiation version byte is `0x01`, not SOCKS5's `0x05`, which the unit test asserts specifically. End-to-end against a fixture performing real authentication: correct credentials round-trip, and wrong or absent credentials deliver **nothing** rather than falling through to a direct send. A test asserts the password appears in no log on either side (NFR-05, SEC-03) |
-| FR-P-10 | C | — | — | **In progress** — a §8 non-goal for v1, now §2a; see [Multi-hop chains](#multi-hop-chains-2a-in-progress) |
+| FR-P-10 | C | — | — | **Implemented in 0.2.0** — a §8 non-goal for v1, now §2a; see [Multi-hop chains](#multi-hop-chains-2a) |
 
 ## §3 Syscall fidelity
 
@@ -184,8 +184,8 @@ from a run rather than editing it by hand.
 
 ## Multi-hop chains (§2a)
 
-Not part of v1 scope, and not counted in the summary above. Design: D-37 to D-47. `Not started`
-means no code yet.
+Not part of v1 scope, and not counted in the summary above. Design: D-37 to D-47. Released in
+0.2.0.
 
 | ID | Pri | Test | Status |
 |---|---|---|---|
@@ -208,16 +208,19 @@ means no code yet.
 | FR-CH-T3 | M | faults | **Verified** — expiry at the middle hop, `FRAG` at the middle and innermost layers, a forged inner source behind a genuine outer one, and a hop refusing `CONNECT` |
 | FR-CH-T4 | S | interop | **Verified** on this host — `make interop` runs a ring of 2-hop chains of the seven proxies, so each is once a middle hop and once the exit hop, and one chain of all seven. Every proxy serves as a middle hop. Each 2-hop chain passes the matrix, the resolver over UDP and chained `CONNECT`, an IPv6 destination, and a hop 2 given by name; fidelity and the port-switch test follow the exit hop alone; the largest datagram is as predicted from each hop's own; and with each hop killed in turn, nothing reaches the destination and the same socket recovers. The 7-hop chain passes the matrix, lifecycle, resolver, IPv6 and size checks, and the same with its middle hop killed. Results in [`INTEROP-CHECKLIST.md`](INTEROP-CHECKLIST.md) §13. Not across hosts |
 
-## Supervisor mode (§2b), in progress
+## Supervisor mode (§2b)
 
 Not part of v1 scope, and not counted in the summary above. Design: D-48 to D-53, decided
-2026-10-22, and D-54, 2026-10-23. Steps 2 to 6 of the plan are built, for x86-64:
+2026-10-22, D-54, 2026-10-23, and D-55, 2026-10-26. Built for x86-64, all six steps of the plan,
+on `develop` and not yet released:
 - the supervisor runs a program under its filter and carries its UDP;
 - every call is handled while its thread is stopped by `ptrace`, so signals lose nothing;
 - it follows the program's threads, children and `exec`s;
-- queries to the system resolver are redirected to `dns`.
+- queries to the system resolver go to `dns`, by UDP and by TCP, and resolver daemons are refused.
 
-The wire capture's run as root is by hand. aarch64 remains. The accepted limitations are listed in
+The wire capture's run as root is by hand. aarch64 (FR-SV-16) is deferred by the maintainer;
+automatic choice of the mode (FR-SV-17) is not planned before supervisor mode has had the shim's
+interop. The accepted limitations are listed in
 [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §9.
 
 | ID | Pri | Test | Status |
@@ -237,8 +240,8 @@ The wire capture's run as root is by hand. aarch64 remains. The accepted limitat
 | FR-SV-13 | M | FR-SV-supervise, capture | **Verified** (D-54) — with `udpchains` killed, its program is killed with it (`PTRACE_O_EXITKILL`, tested); a traced call with no tracer fails with `ENOSYS` (checked by hand); notified calls fail with `ENOSYS` once the listener has gone (`seccomp_unotify(2)`). On the wire, `udpchains` killed while its program sent: the program died with it and no packet reached the destination (capture, run as root) |
 | FR-SV-14 | M | inspection, FR-SV-supervise | **Verified** by inspection — the supervisor's only sockets are the program's (made for it, then closed) and its control connections to the proxy; nothing listens. Its debug lines carry addresses, lengths and the ATYP byte, never payload (NFR-05). setuid, setgid and capability targets are refused before supervision, as in shim mode |
 | FR-SV-15 | S | manual (benchmark) | **Measured** 2026-10-23 with `bench_latency` (a send and a receive per round trip, 2000 round trips, three runs each, this 2-CPU host, the fixture proxy on loopback). Median per round trip: direct 7.2–7.7 µs, shim 43.5–67.5 µs, supervised 66.6–84.5 µs; p99 15–33, 245–323 and 367–726 µs. Supervised, the added latency, proxy hop included, is 59–77 µs at the median, under NFR-04's 100 µs, and up to about 700 µs at the 99th percentile. Reported, not a gate (D-08) |
-| FR-SV-16 | S | — | **Not started** |
-| FR-SV-17 | C | — | **Not started** |
+| FR-SV-16 | S | — | **Deferred** by the maintainer (2026-10-24); any build other than x86-64 refuses supervisor mode (FR-SV-03) |
+| FR-SV-17 | C | — | **Not started** — waits for supervisor mode to have had the same interop as the shim (D-49), remote hosts included |
 | FR-SV-18 | M | FR-SV-supervise | **Verified** — a UDP socket received over `SCM_RIGHTS` from an unsupervised process: `sendto`, `send`, `sendmsg`, `sendmmsg` and `connect` fail with `EPERM`, `sendfile` and `splice` onto it with `EINVAL`; D-50's documented `write()` gap is shown to deliver its one byte and nothing else. An inherited UDP socket refuses the run, naming the descriptor. With the `socket()` trap removed (a mutation), the dynamic and static leak clients still sent nothing |
 | FR-SV-19 | M | inspection | **Verified** by inspection — the README's "Supervisor mode" section, the man page's SUPERVISOR MODE and `-h` state what each mode cannot see: the shim's bypasses (`io_uring`, system calls without libc), supervisor mode's write-family gap (D-50), that it is not a sandbox (D-48), and its other limits |
 | FR-SV-T1 | M | FR-SV-T1-matrix, FR-SV-T1-matrix-2hop | **Verified** — the 108-cell matrix with the probe built `-static`, directly and through two hops; also under ASan and UBSan. With `read` removed from the filter's range calls (a mutation), the 9 `read` cells failed |

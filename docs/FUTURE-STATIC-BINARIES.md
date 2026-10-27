@@ -1,10 +1,10 @@
 # Future requirement — static and Go binaries (supervisor mode)
 
-**Status:** in progress after 0.2.0, on branch `supervisor_mode`. Steps 1 to 3 of §7 are done: the
-decisions are D-48 to D-53, the requirements are §2b of
-[`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the reference for
-them, and the supervisor carries a static program's UDP (DESIGN.md §13). §9 lists the known
-limitations the decisions accept.
+**Status:** built for x86-64, all six steps of §7, on `develop` (merged 2026-10-26) and not yet
+released; aarch64 is deferred by the maintainer. The decisions are D-48 to D-55, the requirements
+are §2b of [`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the
+reference for them, and the design is DESIGN.md §13. §9 lists the known limitations the decisions
+accept. This document is the plan and its history; where it differs from those, they are current.
 **Written:** 2026-10-20, against `9acf337`. Line counts and file references are as of that
 commit; recheck them before starting. The kernel versions in §8 were confirmed in the man pages
 on 2026-10-22.

@@ -704,14 +704,15 @@ once a second, with no vaguer line after it (D-43). A dropped datagram names its
 
 ---
 
-## 13. Supervisor mode (FR-SV-*), in progress
+## 13. Supervisor mode (FR-SV-*)
 
-**Status:** step 6 of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md) §7. The decisions are
-D-48 to D-54, the requirements §2b. The supervisor carries a static program's UDP through the
+**Status:** built for x86-64, all six steps of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md)
+§7; on `develop`, not yet released. The decisions are D-48 to D-55, the requirements §2b. The supervisor carries a static program's UDP through the
 proxy or chain, from sockets it makes in a reserved range. Calls on those sockets are carried
 while their thread is stopped by `ptrace`, so a signal can never part what was done for a call
 from what it returns (D-54). Threads, `fork`, `vfork`, `clone` and `exec` are followed (step 5), and
-queries to the system resolver are redirected to `dns` (step 6, D-52). Not yet: aarch64.
+queries to the system resolver go to `dns`, by UDP and by TCP (step 6, D-52), with resolver
+daemons refused (D-55). aarch64 is deferred.
 
 ### 13.1 Where it lives
 

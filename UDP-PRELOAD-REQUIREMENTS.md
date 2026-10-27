@@ -174,9 +174,10 @@ it. Design: D-37 to D-47 in [`DECISIONS.md`](DECISIONS.md); background and estim
 
 ## 2b. Functional requirements — Supervisor mode (static and Go binaries)
 
-Planned after 0.2.0; nothing here is built yet. A second front end over the same SOCKS5 client,
+Built after 0.2.0 for x86-64, not yet released; status per requirement in
+[`docs/TRACEABILITY.md`](docs/TRACEABILITY.md). A second front end over the same SOCKS5 client,
 which sees system calls instead of libc functions, for programs the shim cannot reach (§8).
-Priorities are within this feature: **M** means it is not done without it. Design: D-48 to D-53
+Priorities are within this feature: **M** means it is not done without it. Design: D-48 to D-55
 in [`DECISIONS.md`](DECISIONS.md); background, estimate and order in
 [`docs/FUTURE-STATIC-BINARIES.md`](docs/FUTURE-STATIC-BINARIES.md).
 
