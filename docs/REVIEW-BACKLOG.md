@@ -52,7 +52,7 @@ None found.
   directly". The call is unusual, but closing the gap means adding one case.
   **Fixed (6570c74):** `sendmmsg` is checked and carried as `sendmsg` is (D-52); tested
   in the `dns` and `nodns` probes.
-- [ ] **M12** — *Reproduced.* Every `read`, `write`, `readv`, `writev`, `close`, `bind` and
+- [x] **M12** — *Reproduced.* Every `read`, `write`, `readv`, `writev`, `close`, `bind` and
   name call on any descriptor at 768 and up is traced, whatever it is (`g_in_range`,
   `src/supervise.c:116`). A `read` of `/dev/zero` at fd 800 took 39 µs supervised, against
   1.1 µs natively and 2.2 µs at fd 3. A program with more than 768 descriptors open (a server;
@@ -60,10 +60,10 @@ None found.
   those numbers. The README, the man page and FUTURE-STATIC-BINARIES §9 do not say so; §9 and
   DESIGN §13.3 say only that I/O *below* the range never leaves the kernel. *Suggested:* document
   it at least.
-  **Documented, not yet committed,** as the maintainer chose: README, man page, DESIGN §13.3,
+  **Documented (78ac9fb),** as the maintainer chose: README, man page, DESIGN §13.3,
   FUTURE-STATIC-BINARIES §9, FR-SV-15, and D-50, which records the two fixes considered (a range
   capped at 1024, and placeholder descriptors) and when to revisit them.
-- [ ] **M13** — *Measured.* Each sweep (`svsock_sweep`, `src/svsock.c:212`) opens
+- [x] **M13** — *Measured.* Each sweep (`svsock_sweep`, `src/svsock.c:212`) opens
   `/proc/<pid>/stat` for **every process on the host** to find the supervisor's descendants.
   It runs every 5 s while any socket is carried, and 200 ms after every `close`, `close_range`,
   `dup2`, exit or `exec` in the range. The supervisor is one thread, so every traced call of
@@ -72,10 +72,10 @@ None found.
   also O(descriptors × sockets): each socket descriptor walks every bucket. *Suggested:* the
   supervisor already sees every tracee start and end (`PTRACE_EVENT_FORK`/`CLONE`, `waitpid`),
   so it can keep its own list of processes, and index sockets by inode.
-  **Fixed, not yet committed:** the sweep reads only the processes `svtrace.c` records as the
+  **Fixed (78ac9fb):** the sweep reads only the processes `svtrace.c` records as the
   kernel reports them, plus any child not reported yet, from `/proc/<pid>/task/<tid>/children`;
   sockets are indexed by inode (D-50 amended). New probe `test_supervise orphan`.
-- [ ] **M14** — *Reproduced; found while testing M13.* A signal sent to `udpchains` while an
+- [x] **M14** — *Reproduced; found while testing M13.* A signal sent to `udpchains` while an
   association is being set up is not passed to the program until the setup ends, up to
   `connect_timeout` per hop later. The supervisor is inside the handshake, not reading its
   signalfd, and the handshake is abandoned only for a signal pending for the *program's* thread
@@ -89,7 +89,7 @@ None found.
   set with a zero timeout, `SIGCHLD` excluded), and passes it on (`si_code` at or below zero, as
   `on_signal` does). The program's thread then has it pending, and the setup is abandoned as for
   a signal of its own.
-  **Fixed, not yet committed,** as suggested (D-54 amended); the check now uses a probe with no
+  **Fixed (a8f7be1),** as suggested (D-54 amended); the check now uses a probe with no
   signal of its own, `test_supervise hang`, and passes or fails every time.
 
 ## Low
