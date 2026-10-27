@@ -486,6 +486,10 @@ Before Linux 6.9, a thread that has unshared its descriptor table is refused
 its UDP calls.
 Every send and connect, UDP or not, and every call on a UDP socket costs a
 round trip to the supervisor, of tens of microseconds.
+So does every read, write and close on any descriptor at 768 and up, file or
+TCP connection too, as the filter cannot tell them from UDP sockets: a program
+with that many descriptors open pays about 40 microseconds a call there,
+against about 1 natively.
 While an association is set up, the program's other supervised calls wait.
 A blocking
 .BR recvmmsg (2)

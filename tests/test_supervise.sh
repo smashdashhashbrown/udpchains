@@ -258,7 +258,8 @@ grep -q "dup2 refused" "$TMP/range.err" && ok "the refused dup2 says why" ||
 	notok "no diagnostic for the refused dup2"
 
 echo "# the supervisor lets go of sockets the program has closed"
-timeout 60 "${SV[@]}" "$P" churn "$ECHO" 40 6 > "$TMP/churn.out" 2> "$TMP/churn.err" &
+# -v: the sweep's line, which says how many process tables it read, is debug.
+timeout 60 "${SV[@]}" -v "$P" churn "$ECHO" 40 6 > "$TMP/churn.out" 2> "$TMP/churn.err" &
 churn=$!
 PIDS+=($churn)
 for ((i = 0; i < 200; i++)); do
@@ -276,6 +277,15 @@ nfd=$(ls "/proc/$svpid/fd" 2> /dev/null | wc -l)
 	notok "the supervisor still holds $nfd descriptors"
 wait "$churn"
 check "and the program exits 0" "$?" 0
+# D-50: the sweep reads the supervised processes' tables, not all of /proc's.
+swept=$(sed -n 's/.*no supervised process uses any longer, after reading \([0-9]*\) process table.*/\1/p' \
+	"$TMP/churn.err" | sort -u | tr '\n' ' ')
+check "each sweep read one process table, the program's, of the host's $(ls -d /proc/[0-9]* 2> /dev/null | wc -l)" \
+	"$swept" "1 "
+timeout -k 5 30 "${SV[@]}" "$P" orphan "$ECHO" > "$TMP/orphan.tap" 2> /dev/null
+rc=$?
+sed 's/^/#   /' "$TMP/orphan.tap"
+check "test_supervise orphan passes: the sweep keeps an orphan's socket" "$rc" 0
 
 echo "# threads, fork, vfork, clone, exec and close_range (FR-SV-11, FR-SV-T3)"
 "${SV[@]}" "$P" lifecycle "$ECHO" > "$TMP/lifecycle.tap" 2> /dev/null &

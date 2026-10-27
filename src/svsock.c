@@ -23,12 +23,18 @@
 
 #define NBUCKETS 256
 
-static struct sv_sock *g_bucket[NBUCKETS];
+static struct sv_sock *g_bucket[NBUCKETS];     /* by cookie */
+static struct sv_sock *g_ino_bucket[NBUCKETS]; /* by inode, for the sweep */
 static unsigned g_count;
 
 static unsigned bucket_of(uint64_t cookie)
 {
 	return (unsigned)(cookie ^ (cookie >> 8) ^ (cookie >> 16)) % NBUCKETS;
+}
+
+static unsigned ino_bucket_of(unsigned long ino)
+{
+	return (unsigned)(ino % NBUCKETS);
 }
 
 struct sv_sock *svsock_find(uint64_t cookie)
@@ -44,7 +50,7 @@ struct sv_sock *svsock_find(uint64_t cookie)
 struct sv_sock *svsock_add(uint64_t cookie, unsigned long ino, int family)
 {
 	struct sv_sock *s = calloc(1, sizeof(*s));
-	unsigned b = bucket_of(cookie);
+	unsigned b = bucket_of(cookie), ib = ino_bucket_of(ino);
 
 	if (s == NULL)
 		return NULL;
@@ -53,6 +59,8 @@ struct sv_sock *svsock_add(uint64_t cookie, unsigned long ino, int family)
 	s->family = family;
 	s->next = g_bucket[b];
 	g_bucket[b] = s;
+	s->ino_next = g_ino_bucket[ib];
+	g_ino_bucket[ib] = s;
 	g_count++;
 	return s;
 }
@@ -74,6 +82,11 @@ void svsock_remove(struct sv_sock *s)
 	if (*pp == NULL)
 		return;
 	*pp = s->next;
+	pp = &g_ino_bucket[ino_bucket_of(s->ino)];
+	while (*pp != NULL && *pp != s)
+		pp = &(*pp)->ino_next;
+	if (*pp != NULL)
+		*pp = s->ino_next;
 	g_count--;
 	svsock_drop_assoc(s);
 	free(s);
@@ -84,58 +97,10 @@ unsigned svsock_count(void)
 	return g_count;
 }
 
-/* --- the sweep ------------------------------------------------------------*/
-
-struct proc {
-	pid_t pid, ppid;
-};
-
-static int by_pid(const void *a, const void *b)
-{
-	pid_t x = ((const struct proc *)a)->pid, y = ((const struct proc *)b)->pid;
-
-	return (x > y) - (x < y);
-}
-
-/* The parent of pid, from /proc/<pid>/stat: the field after the command name,
- * which may itself contain spaces and parentheses, so it is found from the
- * last ')'.  -1 if the process has gone. */
-static pid_t ppid_of(const char *pid)
-{
-	char path[64], line[512], *close;
-	int ppid;
-	FILE *f;
-	size_t n;
-
-	snprintf(path, sizeof(path), "/proc/%s/stat", pid);
-	f = fopen(path, "re");
-	if (f == NULL)
-		return -1;
-	n = fread(line, 1, sizeof(line) - 1, f);
-	fclose(f);
-	line[n] = '\0';
-	close = strrchr(line, ')');
-	if (close == NULL || sscanf(close + 1, " %*c %d", &ppid) != 1)
-		return -1;
-	return (pid_t)ppid;
-}
-
-static bool descends_from(const struct proc *procs, size_t n, pid_t pid, pid_t self)
-{
-	int depth;
-
-	for (depth = 0; depth < 256 && pid > 1; depth++) {
-		struct proc key = { pid, 0 }, *p;
-
-		p = bsearch(&key, procs, n, sizeof(*procs), by_pid);
-		if (p == NULL)
-			return false;
-		if (p->ppid == self)
-			return true;
-		pid = p->ppid;
-	}
-	return false;
-}
+/* --- the sweep ------------------------------------------------------------
+ *
+ * It reads the tables of the processes the supervisor traces (svtrace.c), and
+ * nothing else on the host (D-50). */
 
 /* Marks every carried socket held at a descriptor in the range of the table
  * listed at path.  False if it cannot be read, which says nothing about what
@@ -153,7 +118,6 @@ static bool mark_table(const char *path, unsigned range_start)
 		unsigned long fd, ino;
 		struct sv_sock *s;
 		ssize_t n;
-		unsigned b;
 
 		if (!isdigit((unsigned char)e->d_name[0]))
 			continue;
@@ -166,10 +130,11 @@ static bool mark_table(const char *path, unsigned range_start)
 		link[n] = '\0';
 		if (sscanf(link, "socket:[%lu]", &ino) != 1)
 			continue;
-		for (b = 0; b < NBUCKETS; b++)
-			for (s = g_bucket[b]; s != NULL; s = s->next)
-				if (s->ino == ino)
-					s->seen = true;
+		/* Every entry with the inode: a socket forgotten late may share
+		 * the number of one made since. */
+		for (s = g_ino_bucket[ino_bucket_of(ino)]; s != NULL; s = s->ino_next)
+			if (s->ino == ino)
+				s->seen = true;
 	}
 	closedir(d);
 	return true;
@@ -209,62 +174,81 @@ static bool mark_held(pid_t pid, unsigned range_start)
 	return true;
 }
 
+static int by_tgid(const void *a, const void *b)
+{
+	pid_t x = ((const struct sv_task *)a)->tgid, y = ((const struct sv_task *)b)->tgid;
+
+	return (x > y) - (x < y);
+}
+
+static bool listed(const struct sv_task *t, size_t n, pid_t tgid)
+{
+	struct sv_task key = { 0, tgid };
+
+	return bsearch(&key, t, n, sizeof(*t), by_tgid) != NULL;
+}
+
+/* A child a thread has made that is not listed yet: between its creation and
+ * its parent's fork stop the kernel has not reported it, but it already holds
+ * what it inherited.  It cannot have run, so has no children of its own.  The
+ * kernel lists a thread's children in /proc (CONFIG_PROC_CHILDREN); without
+ * that file there is nothing to add.  False if a table cannot be read; *read
+ * counts the tables read. */
+static bool mark_unlisted_children(const struct sv_task *t, size_t n, const struct sv_task *k,
+                                   unsigned range_start, size_t *read)
+{
+	char path[96];
+	FILE *f;
+	int pid;
+	bool ok = true;
+
+	snprintf(path, sizeof(path), "/proc/%d/task/%d/children", (int)k->tgid, (int)k->tid);
+	f = fopen(path, "re");
+	if (f == NULL)
+		return errno == ENOENT; /* gone, or no such file on this kernel */
+	while (ok && fscanf(f, "%d", &pid) == 1) {
+		if (listed(t, n, (pid_t)pid))
+			continue;
+		ok = mark_held((pid_t)pid, range_start);
+		(*read)++;
+	}
+	fclose(f);
+	return ok;
+}
+
 void svsock_sweep(unsigned range_start)
 {
-	struct proc *procs = NULL;
-	size_t n = 0, cap = 0, i;
-	pid_t self = getpid();
+	struct sv_task *t;
 	struct sv_sock *s, *next;
-	struct dirent *e;
+	size_t n, i, read = 0;
 	unsigned b, dropped = 0;
-	DIR *d;
 
-	if (g_count == 0)
-		return;
-	d = opendir("/proc");
-	if (d == NULL)
-		return;
-	while ((e = readdir(d)) != NULL) {
-		pid_t ppid;
-
-		if (!isdigit((unsigned char)e->d_name[0]))
-			continue;
-		ppid = ppid_of(e->d_name);
-		if (ppid < 0)
-			continue;
-		if (n == cap) {
-			struct proc *more;
-
-			cap = cap ? cap * 2 : 256;
-			more = realloc(procs, cap * sizeof(*procs));
-			if (more == NULL) {
-				free(procs);
-				closedir(d);
-				return; /* try again at the next sweep */
-			}
-			procs = more;
-		}
-		procs[n].pid = (pid_t)strtol(e->d_name, NULL, 10);
-		procs[n].ppid = ppid;
-		n++;
-	}
-	closedir(d);
-	qsort(procs, n, sizeof(*procs), by_pid);
+	if (g_count == 0 || !svtrace_complete())
+		return; /* a thread not recorded might hold any of them */
+	t = svtrace_tasks(&n);
+	if (t == NULL)
+		return; /* try again at the next sweep */
+	qsort(t, n, sizeof(*t), by_tgid);
 
 	for (b = 0; b < NBUCKETS; b++)
 		for (s = g_bucket[b]; s != NULL; s = s->next)
 			s->seen = false;
 	for (i = 0; i < n; i++) {
-		if (!descends_from(procs, n, procs[i].pid, self))
-			continue;
-		/* A descendant whose descriptors cannot be read might hold any
+		/* A process whose descriptors cannot be read might hold any
 		 * of them: forget nothing this time. */
-		if (!mark_held(procs[i].pid, range_start)) {
-			free(procs);
+		if (i == 0 || t[i].tgid != t[i - 1].tgid) {
+			if (!mark_held(t[i].tgid, range_start)) {
+				free(t);
+				return;
+			}
+			read++;
+		}
+		if (!mark_unlisted_children(t, n, &t[i], range_start, &read)) {
+			free(t);
 			return;
 		}
 	}
-	free(procs);
+	free(t);
 
 	for (b = 0; b < NBUCKETS; b++)
 		for (s = g_bucket[b]; s != NULL; s = next) {
@@ -276,8 +260,8 @@ void svsock_sweep(unsigned range_start)
 		}
 	if (dropped > 0)
 		udpc_debug("closed %u association%s no supervised process uses any "
-		           "longer",
-		           dropped, dropped == 1 ? "" : "s");
+		           "longer, after reading %zu process table%s",
+		           dropped, dropped == 1 ? "" : "s", read, read == 1 ? "" : "s");
 }
 
 /* --- associations ---------------------------------------------------------*/

@@ -60,6 +60,9 @@ None found.
   those numbers. The README, the man page and FUTURE-STATIC-BINARIES §9 do not say so; §9 and
   DESIGN §13.3 say only that I/O *below* the range never leaves the kernel. *Suggested:* document
   it at least.
+  **Documented, not yet committed,** as the maintainer chose: README, man page, DESIGN §13.3,
+  FUTURE-STATIC-BINARIES §9, FR-SV-15, and D-50, which records the two fixes considered (a range
+  capped at 1024, and placeholder descriptors) and when to revisit them.
 - [ ] **M13** — *Measured.* Each sweep (`svsock_sweep`, `src/svsock.c:212`) opens
   `/proc/<pid>/stat` for **every process on the host** to find the supervisor's descendants.
   It runs every 5 s while any socket is carried, and 200 ms after every `close`, `close_range`,
@@ -69,6 +72,23 @@ None found.
   also O(descriptors × sockets): each socket descriptor walks every bucket. *Suggested:* the
   supervisor already sees every tracee start and end (`PTRACE_EVENT_FORK`/`CLONE`, `waitpid`),
   so it can keep its own list of processes, and index sockets by inode.
+  **Fixed, not yet committed:** the sweep reads only the processes `svtrace.c` records as the
+  kernel reports them, plus any child not reported yet, from `/proc/<pid>/task/<tid>/children`;
+  sockets are indexed by inode (D-50 amended). New probe `test_supervise orphan`.
+- [ ] **M14** — *Reproduced; found while testing M13.* A signal sent to `udpchains` while an
+  association is being set up is not passed to the program until the setup ends, up to
+  `connect_timeout` per hop later. The supervisor is inside the handshake, not reading its
+  signalfd, and the handshake is abandoned only for a signal pending for the *program's* thread
+  (`abandon()`, `src/svtrace.c`). The FR-SV-supervise check "SIGTERM during a hung association
+  setup ends the program" passes only because its probe's own `SIGALRM`, at 300 ms, happens to
+  abandon the setup first. If the retried send stops again before the loop reads the signalfd,
+  the second setup hangs for the full timeout. Late in 4 of 30 runs at `8dbbf74`, and 9 of 30
+  with M13's change, a difference within chance; once with exit status 0, the signal arriving
+  after the program had ended. The check is therefore flaky (L17). *Suggested:* the abandon check
+  first takes any forwardable signal pending for the supervisor (`sigtimedwait` on the forwarded
+  set with a zero timeout, `SIGCHLD` excluded), and passes it on (`si_code` at or below zero, as
+  `on_signal` does). The program's thread then has it pending, and the setup is abandoned as for
+  a signal of its own.
 
 ## Low
 

@@ -159,6 +159,88 @@ static void forget(pid_t tid)
 	free(w);
 }
 
+/* --- the threads traced -----------------------------------------------------
+ *
+ * What the sweep reads, instead of looking through all of /proc for the
+ * supervisor's descendants: its cost follows the program, not the host
+ * (D-50).  A traced orphan stays traced, so it stays here whoever its parent
+ * becomes. */
+
+struct task {
+	struct sv_task t;
+	struct task *next;
+};
+
+#define NTASK 256
+static struct task *g_task[NTASK];
+static size_t g_ntask;
+static bool g_task_lost; /* a thread that could not be recorded */
+
+static struct task **task_slot(pid_t tid)
+{
+	struct task **pp = &g_task[(unsigned)tid % NTASK];
+
+	while (*pp != NULL && (*pp)->t.tid != tid)
+		pp = &(*pp)->next;
+	return pp;
+}
+
+/* Records tid, of process tgid, or of the process /proc says if tgid is 0. */
+static void task_add(pid_t tid, pid_t tgid)
+{
+	struct task **pp = task_slot(tid), *k;
+
+	if (*pp != NULL) {
+		if (tgid > 0)
+			(*pp)->t.tgid = tgid;
+		return;
+	}
+	if (tgid <= 0)
+		tgid = sv_tgid_of(tid);
+	if (tgid <= 0)
+		return; /* gone already: its exit is still to be reaped */
+	k = calloc(1, sizeof(*k));
+	if (k == NULL) {
+		g_task_lost = true;
+		return;
+	}
+	k->t.tid = tid;
+	k->t.tgid = tgid;
+	*pp = k;
+	g_ntask++;
+}
+
+static void task_remove(pid_t tid)
+{
+	struct task **pp = task_slot(tid), *k = *pp;
+
+	if (k == NULL)
+		return;
+	*pp = k->next;
+	free(k);
+	g_ntask--;
+}
+
+struct sv_task *svtrace_tasks(size_t *n)
+{
+	struct sv_task *out = malloc((g_ntask ? g_ntask : 1) * sizeof(*out));
+	struct task *k;
+	unsigned b;
+
+	*n = 0;
+	if (out == NULL)
+		return NULL;
+	for (b = 0; b < NTASK; b++)
+		for (k = g_task[b]; k != NULL; k = k->next)
+			out[(*n)++] = k->t;
+	return out;
+}
+
+bool svtrace_complete(void)
+{
+	return !g_task_lost;
+}
+
 /* --- signals waiting --------------------------------------------------------*/
 
 /* Signals whose default is to be ignored: pending, they interrupt nothing
@@ -375,11 +457,23 @@ static void on_stop(struct sv *sv, pid_t tid, int st)
 		return;
 	}
 	if (event != 0) {
-		/* fork, vfork, clone or exec.  An exec ends every other
-		 * thread, and may give the execing one the leader's number;
-		 * and it closes the close-on-exec descriptors, which the
-		 * sweep notices (FR-SV-11). */
+		unsigned long msg = 0;
+
+		/* fork, vfork, clone or exec.  The new thread or process is
+		 * recorded before its parent goes on, so from here no sweep can
+		 * miss what it inherited. */
+		if ((event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK ||
+		     event == PTRACE_EVENT_CLONE) &&
+		    ptrace(PTRACE_GETEVENTMSG, tid, 0, &msg) == 0)
+			task_add((pid_t)msg, event == PTRACE_EVENT_CLONE ? 0 : (pid_t)msg);
+		/* An exec ends every other thread, and may give the execing
+		 * one the leader's number, its former number never reported
+		 * as exiting; and it closes the close-on-exec descriptors,
+		 * which the sweep notices (FR-SV-11). */
 		if (event == PTRACE_EVENT_EXEC) {
+			if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &msg) == 0 && (pid_t)msg != tid)
+				task_remove((pid_t)msg);
+			task_add(tid, tid);
 			forget(tid);
 			sv_sweep_soon(sv);
 		}
@@ -402,6 +496,7 @@ int svtrace_attach(pid_t child)
 
 	if (ptrace(PTRACE_SEIZE, child, 0, (void *)opts) != 0)
 		return errno;
+	task_add(child, child);
 	return 0;
 }
 
@@ -413,9 +508,12 @@ void svtrace_reap(struct sv *sv, bool *none_left)
 	/* __WALL: threads are reported too, as their tracer. */
 	while ((p = waitpid(-1, &st, WNOHANG | __WALL)) > 0) {
 		if (WIFSTOPPED(st)) {
+			/* Its first stop, if its parent's has not named it. */
+			task_add(p, 0);
 			on_stop(sv, p, st);
 			continue;
 		}
+		task_remove(p);
 		forget(p);
 		sv_sweep_soon(sv);
 		if (p == sv->child) {

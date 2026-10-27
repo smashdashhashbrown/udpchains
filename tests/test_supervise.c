@@ -76,6 +76,9 @@
  *                                        socket is never passed over
  *                                        SCM_RIGHTS, and other descriptors
  *                                        are (D-50)
+ *   test_supervise orphan <echo port>    under the supervisor: a grandchild
+ *                                        orphaned onto the supervisor keeps
+ *                                        its inherited socket carried (D-50)
  */
 #include "tap.h"
 
@@ -1854,6 +1857,52 @@ static int received(const char *path)
 	TAP_DONE();
 }
 
+/* Under the supervisor: a grandchild whose parent has exited is the
+ * supervisor's child now (it is a subreaper), in no supervised process's list
+ * of children.  The socket it inherited is still carried once the program has
+ * closed its own copy and a sweep has run (D-50). */
+static int orphan(int echo_port)
+{
+	int fd, p[2], go[2], ok = 0, st;
+	char r = 0;
+	pid_t child;
+
+	g_echo = loopback(echo_port);
+	TAP_GROUP("an orphaned grandchild's inherited socket is still carried (D-50)");
+	fd = udp_timed(2000);
+	TAP_OK(fd >= RANGE && round_trip(fd, fd, "first"), "a socket in the range, carried");
+	TAP_OK(pipe(p) == 0 && pipe(go) == 0, "two pipes");
+	child = fork();
+	if (child == 0) {
+		if (fork() == 0) {
+			/* The grandchild: waits until the program has closed its
+			 * copy and a sweep has had time to run, then sends. */
+			close(p[0]);
+			close(go[1]);
+			if (read(go[0], &r, 1) == 1)
+				r = round_trip(fd, fd, "orphan") ? 'y' : 'n';
+			if (write(p[1], &r, 1) != 1)
+				_exit(1);
+			_exit(0);
+		}
+		_exit(0);
+	}
+	TAP_OK(child > 0 && waitpid(child, &st, 0) == child && WIFEXITED(st),
+	       "its child forked a grandchild and exited");
+	close(fd);
+	close(p[1]);
+	close(go[0]);
+	usleep(800000); /* past the sweep due 200 ms after the close */
+	if (write(go[1], "s", 1) == 1 && read(p[0], &r, 1) == 1)
+		ok = r == 'y';
+	TAP_OK(ok, "after the program closed its copy and a sweep ran, the orphan's send is "
+	           "carried (%c)",
+	       r ? r : '-');
+	close(go[1]);
+	close(p[0]);
+	TAP_DONE();
+}
+
 /* Passes the n descriptors in fds over the Unix socket sock, with one byte:
  * by sendmsg(), or as the second message of a sendmmsg() whose first passes
  * nothing.  What the call returns. */
@@ -2032,6 +2081,8 @@ int main(int argc, char **argv)
 		return received(argv[2]);
 	if (argc == 3 && strcmp(argv[1], "passing") == 0)
 		return passing(atoi(argv[2]));
+	if (argc == 3 && strcmp(argv[1], "orphan") == 0)
+		return orphan(atoi(argv[2]));
 	fprintf(stderr, "usage: test_supervise refusals <tcp port> | range <echo port> | "
 	                "signals <delayed echo port> <echo port> | silent | "
 	                "abandon <echo port> | lifecycle <echo port> | "
@@ -2040,6 +2091,6 @@ int main(int argc, char **argv)
 	                "nodump <tcp port> | "
 	                "churn <echo port> <n> <secs> | "
 	                "pass <path> <port> | "
-	                "received <path> | passing <echo port>\n");
+	                "received <path> | passing <echo port> | orphan <echo port>\n");
 	return 2;
 }

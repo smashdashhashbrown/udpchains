@@ -291,6 +291,9 @@ the mode is built (FR-SV-19). Each is explained in its record.
   connected before it was passed, and never connected again by the program.
 - **Every `sendto`, `sendmsg`, `sendmmsg` and `connect` makes a round trip to the supervisor,**
   UDP or not (D-50): D-Bus traffic, TCP programs using `sendmsg`, and every connection.
+- **Every data, name and close call on a descriptor at 768 and up** makes one too, file or TCP
+  connection alike, as the filter cannot tell them from UDP sockets (D-50): about 40 µs, against
+  about 1 µs natively, for a program with that many descriptors open (release review M12).
 - **A supervised UDP socket cannot be passed to another process** over `SCM_RIGHTS`: the
   `sendmsg` fails with `EPERM` (D-50, amended 2026-10-26). Below the range, where it would
   arrive, its receives would return its headers as data. A program that hands UDP sockets to

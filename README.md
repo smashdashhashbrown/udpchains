@@ -365,6 +365,10 @@ The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/res
   `EPERM`. A program built with LeakSanitizer cannot run its leak check.
 - **Every send and connect, UDP or not,** and every call on a UDP socket, costs a round trip to the
   supervisor. While an association is set up, the program's other supervised calls wait.
+- **Descriptors at 768 and up are all treated as possible UDP sockets,** since the filter cannot
+  tell a file from a socket. A program with that many descriptors open, a busy server say, pays
+  the round trip on every read, write and close of its files and TCP connections there: about
+  40 µs a call, against about 1 µs natively.
 - **A blocking `recvmmsg`** returns the datagrams already queued, at least one, rather than waiting
   for as many as asked.
 - **Before Linux 6.9,** a thread with a descriptor table of its own (`unshare(CLONE_FILES)`) is

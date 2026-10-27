@@ -784,7 +784,10 @@ kernel makes after the stop sends the marked call by notification, the only way 
 at a chosen number.
 
 Everything else runs in the kernel, so file and TCP I/O below the range never reaches the
-supervisor, nor does any other `fcntl`. With no tracer attached, a traced call fails with `ENOSYS`
+supervisor, nor does any other `fcntl`. At and above the range's start the filter cannot tell a
+file or a TCP socket from a UDP one, so each call listed above on any descriptor there is traced,
+and let through after the check: a `read` at descriptor 800 took 39 µs supervised, against 1.1 µs
+natively (release review M12). With no tracer attached, a traced call fails with `ENOSYS`
 and never runs (`seccomp(2)`). The assembler refuses a jump to a label placed before it, as BPF
 jumps only forward, and the kernel then refuses the empty filter. `pread64`, `pwrite64`, `preadv` and `pwritev` are not sent: the kernel refuses them on
 a socket itself. A descriptor is compared unsigned, so a negative one counts as in the range and
@@ -811,11 +814,19 @@ work unaided (FR-I-07).
 
 **The sweep.** The kernel does not say when the last descriptor for a socket closes. 200 ms after
 a `close`, `close_range`, `dup2` or `dup3` in the range, a child's exit or an `exec`, and every 5 s
-while any socket is carried, the supervisor lists `/proc`, picks its descendants by their parent
-links, and reads the socket inodes in their descriptors at or above the range's start. It reads
-the tables of their threads with tables of their own too (`/proc/<pid>/task/<tid>/fd`, for each
-thread `kcmp(KCMP_FILES)` says differs). An entry nothing holds has its association closed. If a
-table cannot be read, nothing is forgotten that time.
+while any socket is carried, the supervisor reads the socket inodes in the descriptors at or
+above the range's start of every process it traces, and nothing else on the host. `svtrace.c`
+keeps that list: each thread is recorded, with its process, when its parent's fork, vfork or
+clone stop names it, before the parent goes on, or at its own first stop; it is forgotten when its
+exit is reaped, or, for the former number of a thread whose `exec` gave it the leader's, at the
+exec. A traced orphan stays listed whoever its parent becomes. A child made in the instant before
+its parent's stop is reported is found in that thread's `/proc/<pid>/task/<tid>/children`, where
+the kernel lists it from its creation. It reads the tables of their threads with tables of their
+own too (`/proc/<pid>/task/<tid>/fd`, for each thread `kcmp(KCMP_FILES)` says differs), and
+finds each inode's entries by an index. An entry nothing holds has its association closed. If a
+table cannot be read, or a thread could not be recorded, nothing is forgotten that time. Until
+the release review (M13) the sweep listed `/proc` and followed every process's parent link,
+which took 12.9 ms a pass with 391 processes on the host.
 
 **Which table.** A call names its thread. Its descriptors are looked up through a pidfd for its
 process, kept in a small cache. A thread whose table is not its process's (`unshare(CLONE_FILES)`,

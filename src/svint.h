@@ -44,7 +44,8 @@ struct sv_sock {
 	struct sockaddr_storage dns_asked; /* that query's address, its reply's sender */
 
 	bool seen;           /* by the sweep in progress */
-	struct sv_sock *next;
+	struct sv_sock *next;     /* in its cookie's bucket */
+	struct sv_sock *ino_next; /* in its inode's, for the sweep */
 };
 
 struct sv_sock *svsock_find(uint64_t cookie);
@@ -59,8 +60,8 @@ unsigned svsock_count(void);
 
 /* Forgets every socket no supervised process holds any longer in the range:
  * the supervisor is not told when the program's last descriptor for a socket
- * closes, so it looks.  Supervised processes are the supervisor's descendants
- * (it is their subreaper, so an orphan stays one). */
+ * closes, so it looks.  It looks at the processes svtrace_tasks() lists, and
+ * at any child of theirs the kernel has not reported yet. */
 void svsock_sweep(unsigned range_start);
 
 /* Ensures s has an association: the chain set up and the socket, through copy
@@ -163,6 +164,24 @@ int svtrace_attach(pid_t child);
 /* Handles every stop and exit the kernel has to report.  Sets *none_left once
  * no child or traced thread is left, and records the program's status. */
 void svtrace_reap(struct sv *sv, bool *none_left);
+
+/* A traced thread, and the process it belongs to. */
+struct sv_task {
+	pid_t tid, tgid;
+};
+
+/* Every thread the supervisor traces, as a copy for the caller to free, with
+ * their count in *n; NULL if out of memory.  Each is recorded when its
+ * parent's fork, vfork or clone stop names it, or at its own first stop,
+ * whichever comes first, and forgotten when its exit is reaped. */
+struct sv_task *svtrace_tasks(size_t *n);
+
+/* False once a thread could not be recorded: the list is not every one, so
+ * a sweep must not take it for the whole. */
+bool svtrace_complete(void);
+
+/* The process of a thread, from /proc/<tid>/status; -1 if it has gone. */
+pid_t sv_tgid_of(pid_t tid);
 
 /* A UDP, raw or packet socket: what the supervisor carries only when it made
  * it (D-50), or never (D-36). */

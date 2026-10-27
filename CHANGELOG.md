@@ -80,15 +80,21 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 - **Under supervision, `fcntl` is trapped only for `F_DUPFD` and `F_DUPFD_CLOEXEC`** (D-54). Every
   other command runs in the kernel, so `fcntl(F_GETFD)` and its like are never interrupted.
+- **The supervisor's sweep for closed sockets reads only the processes it traces** (D-50,
+  release review M13), which it records as the kernel reports them, rather than every process on
+  the host: with 889 processes, the worst supervised round trip fell from 11–18 ms to 3–5 ms.
+- **Documented:** in supervisor mode, every read, write and close on a descriptor at 768 and up
+  costs a round trip to the supervisor, files and TCP included, about 40 µs against about 1 µs
+  (release review M12).
 - The checks both front ends apply to a datagram (multicast and broadcast, `MSG_MORE`, GSO, the
   loopback guard, and a received datagram's headers) moved from the shim's `core.c`, `assoc.c`
   and `hooks.c` into `dgram.c`, unchanged, so the supervisor applies the same ones.
 
 ### Verification
 
-- 2348 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
-  unit-config, `FR-SV-supervise` (68 checks, with static programs making 25, 4, 18, 6, 37, 24, 29,
-  2, 4, 29, 5, 7, 5, 10 and 18 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
+- 2350 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
+  unit-config, `FR-SV-supervise` (70 checks, with static programs making 25, 4, 18, 6, 37, 4, 24,
+  29, 2, 4, 29, 5, 7, 5, 10 and 18 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
   through two hops), and the fidelity test built `-static` under it (172). The supervisor also
   runs under ASan and UBSan, with the static matrix and fidelity tests.
 

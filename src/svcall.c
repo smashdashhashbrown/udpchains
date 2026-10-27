@@ -210,7 +210,7 @@ bool sv_uncarriable(int fd)
 
 /* The thread group of a thread: a notification names the thread that made
  * the call, and pidfd_open() needs its process. */
-static pid_t tgid_of(pid_t tid)
+pid_t sv_tgid_of(pid_t tid)
 {
 	char path[64], line[128];
 	FILE *f;
@@ -316,7 +316,7 @@ static int process_of(struct call *c)
 		c->pidfd = fd;
 		return fd;
 	}
-	c->tgid = tgid_of(tid);
+	c->tgid = sv_tgid_of(tid);
 	if (c->tgid <= 0)
 		return -1;
 	fd = thread_pidfd(c, tid);

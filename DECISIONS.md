@@ -2187,8 +2187,58 @@ It adds one limitation:
   still pass; control data above 128 KiB gives `ENOBUFS`, as it does unsupervised; the socket
   still carries afterwards. Removing the check (a mutation) failed 10 of the probe's 18 checks.
 
+**Amended 2026-10-26** (release review, M13): the sweep reads only the processes the supervisor
+traces.
+
+- **Found.** To find its descendants, each sweep opened `/proc/<pid>/stat` for every process on
+  the host and followed the parent links: 12.9 ms a pass with 391 processes, growing with the
+  host, while the one-threaded supervisor answered nothing else. It runs 200 ms after every close
+  in the range and every 5 s.
+- **Decision.** `svtrace.c` lists every thread the supervisor traces, with its process: recorded
+  when its parent's fork, vfork or clone stop names it, before the parent goes on, or at its own
+  first stop, whichever comes first; forgotten when its exit is reaped, or at an `exec` that gave
+  it the leader's number. The sweep reads those processes' tables. A traced orphan stays listed,
+  whoever its parent becomes. A child made in the instant before its parent's stop is reported
+  already holds what it inherited, and is found in its parent thread's
+  `/proc/<pid>/task/<tid>/children`, which the kernel fills at creation. Each socket is also
+  indexed by inode, so marking costs a lookup a descriptor, not a walk of every socket. A thread
+  that cannot be recorded (out of memory) stops sweeps from forgetting anything, as a table that
+  cannot be read does. The timing is unchanged.
+- **Tested.** Each sweep of a supervised program closing 40 sockets read one process table, with
+  414 processes on the host (`churn` at `-v`). A new probe, `test_supervise orphan`, keeps a
+  socket carried in a grandchild orphaned onto the supervisor, which no traced thread lists as
+  its child, after the program has closed its copy and a sweep has run. Mutations: recording no
+  new thread failed the orphan probe; recording none and reading no `children` file failed it and
+  two more checks (a child still using a socket its parent closed, and the shim found in an
+  inherited `LD_PRELOAD`). The `children` file alone, its use for the instant before a fork stop,
+  cannot be shown failing by a test: that instant is too short to aim at.
+- **Measured** with 889 processes on the host, a supervised round trip with a socket closed every
+  50, three runs each: the worst round trip fell from 11 to 18 ms to 3 to 5 ms, the median the
+  same, 86 to 103 µs. Without the added processes, the two cannot be told apart.
+- **Limitation:** on a kernel without `CONFIG_PROC_CHILDREN`, a child made in the instant a sweep
+  runs, before its parent's stop is reported, could have the sockets it inherited forgotten: they
+  would then be refused with `EPERM`, never sent directly.
+
+**Found in the release review (M12):** every call the filter traces in the range is traced on any
+descriptor there, as the filter cannot tell what one is. A program with 768 or more descriptors
+open, a server say (Go raises its soft limit at start-up), pays a round trip on every `read`,
+`write` and `close` of its files and TCP sockets at those numbers: 39 µs for a `read` at
+descriptor 800, against 1.1 µs natively and 2.2 µs at descriptor 3. Documented, not changed.
+Considered and not built:
+
+- **Capping the range at 1024**, so that higher descriptors run natively. A program with more
+  than 1024 open would have filled 768 to 1023 with its own, and could then make no UDP socket at
+  all: `socket()`, and so its next lookup, would fail with `EMFILE`.
+- **Holding the range with placeholders**: copies of `/dev/null` at 768 to 1023 before the
+  `exec`, which the kernel's lowest-free allocation then skips, and which UDP sockets replace.
+  It fixes the cost and removes the race in placing a socket, but the program inherits 256
+  descriptors it did not open (LVM warns of each), they count against its limit, a program that
+  closes every inherited descriptor drops back to today's behaviour, and a number a closed UDP
+  socket frees can still be taken by a file.
+
 **Revisit if:** a real program needs to pass a UDP socket between processes, which would justify
-trapping `recvmsg` on Unix sockets.
+trapping `recvmsg` on Unix sockets; or a real program is slowed by M12's cost, which would justify
+the placeholders.
 
 ---
 
