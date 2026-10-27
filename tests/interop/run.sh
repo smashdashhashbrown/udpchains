@@ -385,7 +385,7 @@ hop_args() {
 shim() {
 	local HOPS
 	hop_args "$2"
-	UDPCHAINS_QUIET=1 timeout "$1" "$W" "${HOPS[@]}" "${@:3}"
+	UDPCHAINS_QUIET=1 timeout -k 5 "$1" "$W" "${HOPS[@]}" "${@:3}"
 }
 
 # A test program under the shim: ok if it passes.
@@ -402,7 +402,7 @@ check_prog() {	# <check> <timeout> <proxy> <cmd...>
 sv() {
 	local HOPS
 	hop_args "$2"
-	UDPCHAINS_QUIET=1 timeout "$1" "$W" --supervise "${HOPS[@]}" "${@:3}"
+	UDPCHAINS_QUIET=1 timeout -k 5 "$1" "$W" --supervise "${HOPS[@]}" "${@:3}"
 }
 
 check_sv() {	# <check> <timeout> <proxy> <cmd...>
@@ -480,7 +480,7 @@ check_ipv6() {
 	local f="$LOGS/$CUR.ipv6.log" HOPS wire
 	hop_args "$1"
 	wire=$((122 + 10 * (${#HOPS[@]} / 2 - 1)))
-	UDPCHAINS_QUIET=0 timeout 30 "$W" -v "${HOPS[@]}" "$PROBE" sweep ::1 "$E6" 100 > "$f" 2>&1
+	UDPCHAINS_QUIET=0 timeout -k 5 30 "$W" -v "${HOPS[@]}" "$PROBE" sweep ::1 "$E6" 100 > "$f" 2>&1
 	if grep -qx '100 whole' "$f" && grep -q "ATYP 0x04).* $wire bytes on the wire" "$f"; then
 		result ok ipv6 "ATYP 0x04, 22-byte header, to ::1 ($wire bytes on the wire)"
 	else
@@ -574,7 +574,7 @@ check_internet() {
 IDLE_JOBS=()
 queue_idle() {	# <label> <proxy addr> <secs>
 	# -v, so the log shows whether the proxy dropped the association.
-	timeout $(($3 + 30)) "$W" -v -p "$2" "$PROBE" idle 127.0.0.1 "$E1" "$3" \
+	timeout -k 5 $(($3 + 30)) "$W" -v -p "$2" "$PROBE" idle 127.0.0.1 "$E1" "$3" \
 		> "$LOGS/idle.$1.log" 2>&1 &
 	PIDS+=($!)
 	IDLE_JOBS+=("$!:$1")
@@ -787,7 +787,7 @@ check_chain_auth() {	# <hop 1> <hop 2>
 # and the shim can check that layer's source by port alone (D-41).
 check_named() {	# <hop 1 addr> <hop 2 port>
 	local f="$LOGS/$CUR.named.log"
-	UDPCHAINS_QUIET=0 timeout 60 "$W" -v -p "$1" -p "$HOPNAME:$2" \
+	UDPCHAINS_QUIET=0 timeout -k 5 60 "$W" -v -p "$1" -p "$HOPNAME:$2" \
 		"$PROBE" sweep 127.0.0.1 "$E1" 100 > "$f" 2>&1
 	if ! grep -q "via relay .*, then $HOPNAME:[0-9]" "$f"; then
 		result FAIL named "hop 2's relay was not named, so this tested nothing (see $f)"

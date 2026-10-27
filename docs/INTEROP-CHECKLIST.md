@@ -26,6 +26,7 @@ Run everything with `-v` and keep the output. The per-datagram debug line names 
 | dual-stack → v4-mapped (§6a) | ✅ passed 2026-08-19 — `ATYP 0x01` with a 10-byte header from an `AF_INET6` socket. D-14 confirmed fixed against the real proxy, outbound direction |
 | Seven other proxies, on this host (§12) | ✅ run 2026-10-19 — Dante, 3proxy, gost, Xray, sing-box, hev-socks5-server and shadowsocks-rust. No proxy-specific udpchains defect; one general `errno` bug found and fixed. Found per-proxy datagram limits, above which the proxy silently truncates; four proxies that drop zero-length datagrams; and Dante port-restricted by default. Also covers `ATYP 0x04` to `::1`, the resolver's `CONNECT` fallback, and idle expiry |
 | The same seven as hops of chains (§13) | ✅ run 2026-10-21 — each a middle hop and an exit hop, and all seven as one chain. Every datagram limit through a chain was as predicted from the hops'; every proxy accepted a hop's relay named in a UDP header; a dead hop leaked nothing |
+| §12 and §13 again, after the release review's fixes | ✅ run 2026-10-27 — `make interop` in full, supervised checks included: 153 results ok and 28 expected, every one as recorded in §12 and §13 |
 
 TFTP is **lockstep**: one block, wait for the ACK. It never has more than one datagram in flight, so
 despite the volume it says nothing about burst behaviour, receive-queue pressure, or batching. That
@@ -619,6 +620,8 @@ The same seven proxies, with static programs run under `udpchains --supervise` (
 
 Each proxy did to a supervised program's datagrams exactly what it did to the shim's: the
 zero-length results are the proxies' own, as above. Chains were not run supervised.
+
+Rerun on 2026-10-27, after the release review's fixes (H5, M11, M13, M14): the same table.
 
 ### Configurations used
 

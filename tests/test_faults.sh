@@ -53,7 +53,7 @@ run_scenario() {
 	echo
 	echo "--- $name"
 	if UDPCHAINS_PROXY="127.0.0.1:$proxy_port" UDPCHAINS_QUIET=1 \
-		timeout 120 "$WRAPPER" "$BUILD/test_faults" "$@" ; then
+		timeout -k 5 120 "$WRAPPER" "$BUILD/test_faults" "$@" ; then
 		echo "--- $name: PASS"
 	else
 		echo "--- $name: FAIL" >&2
@@ -110,7 +110,7 @@ run_chain() {
 	local name=$1 chain=$2; shift 2
 	echo
 	echo "--- $name"
-	if UDPCHAINS_PROXY="$chain" timeout 120 "$WRAPPER" -v "$BUILD/test_faults" "$@" \
+	if UDPCHAINS_PROXY="$chain" timeout -k 5 120 "$WRAPPER" -v "$BUILD/test_faults" "$@" \
 		> "$TMP/chain.out" 2> "$TMP/chain.err"; then
 		sed 's/^/#   /' "$TMP/chain.out"
 		echo "--- $name: PASS"
@@ -164,7 +164,7 @@ HB=$(start_proxy hb)
 echo
 echo "--- FR-CH-T3 a forged inner source behind a genuine outer one"
 : > "$TMP/chain.out"
-UDPCHAINS_PROXY="127.0.0.1:$HA,127.0.0.1:$HB,127.0.0.1:$HC" timeout 60 \
+UDPCHAINS_PROXY="127.0.0.1:$HA,127.0.0.1:$HB,127.0.0.1:$HC" timeout -k 5 60 \
 	"$WRAPPER" -v "$BUILD/test_faults" forged "$ECHO" 4 \
 	> "$TMP/chain.out" 2> "$TMP/chain.err" &
 FPID=$!
@@ -201,7 +201,7 @@ NECHO=$(start_loud_echo necho)
 echo
 echo "--- FR-CH-T3 a hop refusing CONNECT"
 OUT=$(UDPCHAINS_PROXY="127.0.0.1:$HA,127.0.0.1:$P_NOCONN,127.0.0.1:$HC" \
-	timeout 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$NECHO" 2> "$TMP/chain.err")
+	timeout -k 5 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$NECHO" 2> "$TMP/chain.err")
 echo "$OUT" | sed 's/^/#   /'
 check "every send fails" "$(echo "$OUT" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')" 0
 sleep 0.3
@@ -238,7 +238,7 @@ check "and the destination received exactly those: none went direct" \
 # before any association -- and run with warnings ON, which run.sh turns off.
 echo
 echo "--- D-33 diagnostics"
-diag() { env -u UDPCHAINS_QUIET UDPCHAINS_PROXY=127.0.0.1:9 timeout 60 "$WRAPPER" "$@"; }
+diag() { env -u UDPCHAINS_QUIET UDPCHAINS_PROXY=127.0.0.1:9 timeout -k 5 60 "$WRAPPER" "$@"; }
 
 if diag "$BUILD/test_faults" mcast-burst 9 > "$TMP/burst.out" 2> "$TMP/burst.err" &&
    grep -q '^ok' "$TMP/burst.out"; then

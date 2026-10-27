@@ -47,7 +47,7 @@ graftcp-strict)
 	exit 2 ;;
 esac
 
-run() { timeout 120 $W "$@" 2>&1; }
+run() { timeout -k 5 120 $W "$@" 2>&1; }
 
 # One process per cell: a crash inside a tool costs only that cell.
 matrix() {	# <section> <client binary> <server address> [warm]
@@ -57,7 +57,7 @@ matrix() {	# <section> <client binary> <server address> [warm]
 			# env, because an assignment that comes from an
 			# expansion is not treated as one by the shell.
 			out=$(env CMP_SENDER=$s CMP_RECVER=$r ${4:+CMP_WARM=1} \
-				timeout 30 $W "$2" cell "$T-$1" "$3" $PORT 2>&1)
+				timeout -k 5 30 $W "$2" cell "$T-$1" "$3" $PORT 2>&1)
 			rc=$?
 			if echo "$out" | grep -q '^CELL'; then
 				echo "$out" | grep '^CELL'

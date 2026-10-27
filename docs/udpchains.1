@@ -497,6 +497,17 @@ returns the datagrams already queued, at least one, rather than waiting until
 it has as many as asked.
 A signal arriving while an association is set up is handled at once, and the
 call made again.
+The range of descriptors is fixed before the program runs; a program that
+raises its own file limit later, as Go does, keeps it where it was.
+A program that already has the range's start of descriptors open could, from
+another thread, open one at the number a new UDP socket is about to be given,
+in the instant before it is; that descriptor would be replaced.
+Stdio on a UDP socket
+.RB ( fdopen (3)),
+which the shim refuses, is carried, and a datagram socket for an IP protocol
+other than UDP, ICMP and UDP\-Lite, which the shim refuses, is made and handled
+as UDP: what it sends goes to the proxy's relay in that protocol, and arrives
+nowhere.
 .SH EXIT STATUS
 .TP
 .B 0

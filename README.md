@@ -369,14 +369,22 @@ The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/res
   tell a file from a socket. A program with that many descriptors open, a busy server say, pays
   the round trip on every read, write and close of its files and TCP connections there: about
   40 µs a call, against about 1 µs natively.
+- **The range is fixed before the program runs,** at 768, or half the file limit when that is
+  below 1024. A program that raises its own limit later, as Go does at start-up, keeps it there.
+- **A narrow race in placing a socket.** A UDP socket goes at the lowest free number in the range.
+  A program that already has that many descriptors open could, from another thread, open one at
+  that number in the instant before the socket is put there; that descriptor would be replaced.
 - **A blocking `recvmmsg`** returns the datagrams already queued, at least one, rather than waiting
   for as many as asked.
 - **Before Linux 6.9,** a thread with a descriptor table of its own (`unshare(CLONE_FILES)`) is
   refused its UDP calls.
 - **x86-64 only** so far.
-- Everything the shim refuses is refused here too: raw, packet, ICMP and UDP-Lite sockets,
-  multicast and broadcast, `MSG_MORE` and GSO, `sendfile` and `splice` onto a UDP socket, and
-  setuid and setgid programs.
+- **The shim's refusals apply here too:** raw, packet, ICMP and UDP-Lite sockets, multicast and
+  broadcast, `MSG_MORE` and GSO, `sendfile` and `splice` onto a UDP socket, and setuid and setgid
+  programs. Two differ. Stdio on a UDP socket (`fdopen`), which the shim refuses, is carried. A
+  datagram socket for an IP protocol other than UDP, ICMP and UDP-Lite, which the shim refuses,
+  is made and handled as UDP: what it sends goes to the proxy's relay in that protocol, and
+  arrives nowhere.
 
 ## Security considerations
 
@@ -540,8 +548,8 @@ Measured 2026-10-19 in a Docker lab: client, SOCKS5 proxy (gost 3.3.1) and serve
 addresses. The server logged the source of every datagram and DNS query. A control run with no
 tool showed every datagram arriving directly. Versions: `dante-client` 1.4.3 (Ubuntu 24.04),
 PR #570 at `04f6622`, Proxando at `c7ff4ac`, graftcp v0.8.3. udpchains' supervisor mode was added
-on 2026-10-23, in the same lab, under Docker's default seccomp filter; the others were not run
-again.
+on 2026-10-23, in the same lab, under Docker's default seccomp filter. The whole comparison was
+run again on 2026-10-27, before the next release, with the same results for every tool.
 
 | | udpchains | udpchains `--supervise` | Dante `socksify` | PR #570 | Proxando | graftcp |
 |---|---|---|---|---|---|---|

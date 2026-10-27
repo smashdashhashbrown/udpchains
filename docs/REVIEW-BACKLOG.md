@@ -143,6 +143,11 @@ None found.
   - nothing tests a carried socket received below the range (H5); FR-SV-T3's `SCM_RIGHTS` check
     covers only a socket from an unsupervised process.
 
+  **Fixed, not yet committed:** every `timeout` in the test scripts, `make interop`'s and
+  `make compare`'s included, has `-k 5`; `run.sh` counts each group's skipped checks, reports them
+  on the group's line and in the summary as not a pass, and says that `NFR-04-bench` cannot fail.
+  The third was covered by H5's `test_supervise passing`.
+
 ## Documentation
 
 - [ ] **D8** — FR-SV-19 (M) is marked Verified, but neither the README's *What supervisor mode
@@ -152,7 +157,10 @@ None found.
   and up is not documented either. README line 370, "Everything the shim refuses is refused here
   too", is not true of stdio (`fdopen`), which the shim refuses and the supervisor carries, nor,
   per L8, of protocols other than UDP.
+  **Fixed, not yet committed:** the README and man page now state the fixed range and the race,
+  and say how the two modes' refusals differ; H5 and M12 were documented with their fixes.
 - [ ] **D9** — The decision index at the top of `DECISIONS.md` stops at D-54; D-55 is missing.
+  **Fixed, not yet committed.**
 - [x] **D10** — `docs/TRACEABILITY.md`: the TST-02 row says 71 symbol checks; the run, and the
   paragraph above the table, say 91. **Fixed (6570c74),** with the totals regenerated
   for H5 and M11.

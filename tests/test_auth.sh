@@ -64,7 +64,7 @@ echo "# a proxy demanding RFC 1929 authentication"
 # --- correct credentials -----------------------------------------------------
 out=$(echo "auth-round-trip" | UDPCHAINS_USERNAME=alice \
 	UDPCHAINS_PASSWORD_FILE="$TMP/pass" \
-	timeout 15 "$WRAPPER" -p "127.0.0.1:$PROXY" \
+	timeout -k 5 15 "$WRAPPER" -p "127.0.0.1:$PROXY" \
 	nc -u -w 3 127.0.0.1 "$ECHO_PORT" 2>&1) || true
 
 if printf '%s' "$out" | grep -q auth-round-trip; then
@@ -91,7 +91,7 @@ printf 'wrongpass' > "$TMP/badpass"
 chmod 600 "$TMP/badpass"
 out=$(echo "must-not-arrive" | UDPCHAINS_USERNAME=alice \
 	UDPCHAINS_PASSWORD_FILE="$TMP/badpass" \
-	timeout 15 "$WRAPPER" -v -p "127.0.0.1:$PROXY" \
+	timeout -k 5 15 "$WRAPPER" -v -p "127.0.0.1:$PROXY" \
 	nc -u -w 3 127.0.0.1 "$ECHO_PORT" 2>&1) || true
 
 if printf '%s' "$out" | grep -q must-not-arrive; then
@@ -107,7 +107,7 @@ else
 fi
 
 # --- no credentials at all ---------------------------------------------------
-out=$(echo "must-not-arrive" | timeout 15 "$WRAPPER" -v \
+out=$(echo "must-not-arrive" | timeout -k 5 15 "$WRAPPER" -v \
 	-p "127.0.0.1:$PROXY" nc -u -w 3 127.0.0.1 "$ECHO_PORT" 2>&1) || true
 
 if printf '%s' "$out" | grep -q must-not-arrive; then
@@ -126,7 +126,7 @@ fi
 PROXY2=$(start proxy2 "$SOCKS5D" --port 0 --quiet)
 out=$(echo "open-proxy-ok" | UDPCHAINS_USERNAME=alice \
 	UDPCHAINS_PASSWORD_FILE="$TMP/pass" \
-	timeout 15 "$WRAPPER" -p "127.0.0.1:$PROXY2" \
+	timeout -k 5 15 "$WRAPPER" -p "127.0.0.1:$PROXY2" \
 	nc -u -w 3 127.0.0.1 "$ECHO_PORT" 2>&1) || true
 
 if printf '%s' "$out" | grep -q open-proxy-ok; then
@@ -156,7 +156,7 @@ fi
 # directory before its first datagram still finds the file.
 out=$(cd "$TMP" && echo "relative-path-ok" | UDPCHAINS_USERNAME=alice \
 	UDPCHAINS_PASSWORD_FILE=pass \
-	timeout 15 "$WRAPPER" -p "127.0.0.1:$PROXY" \
+	timeout -k 5 15 "$WRAPPER" -p "127.0.0.1:$PROXY" \
 	sh -c "cd / && exec nc -u -w 3 127.0.0.1 $ECHO_PORT" 2>&1) || true
 if printf '%s' "$out" | grep -q relative-path-ok; then
 	ok "a relative password file still works after the target changes directory"
@@ -173,7 +173,7 @@ if printf '%s' "$envout" | grep -q s3cret; then
 else
 	ok "D-25: an inline config password is not in the target's environment"
 fi
-out=$(echo "inline-config-ok" | timeout 15 "$WRAPPER" -f "$TMP/auth.conf" \
+out=$(echo "inline-config-ok" | timeout -k 5 15 "$WRAPPER" -f "$TMP/auth.conf" \
 	-p "127.0.0.1:$PROXY" nc -u -w 3 127.0.0.1 "$ECHO_PORT" 2>&1) || true
 if printf '%s' "$out" | grep -q inline-config-ok; then
 	ok "and it still authenticates, read by the shim from the config file"
@@ -224,7 +224,7 @@ PC
 chmod 600 "$TMP/proxychains.conf"
 before=$(grep -c "user 'alice' accepted" "$TMP/proxy.out" || true)
 out=$(echo "proxychains-conf-ok" | env -u UDPCHAINS_PROXY -u UDPCHAINS_QUIET \
-	timeout 15 "$WRAPPER" -f "$TMP/proxychains.conf" \
+	timeout -k 5 15 "$WRAPPER" -f "$TMP/proxychains.conf" \
 	nc -u -w 3 127.0.0.1 "$ECHO_PORT" 2>&1) || true
 if printf '%s' "$out" | grep -q proxychains-conf-ok; then
 	ok "FR-CH-14: a proxychains.conf's chain carries the datagram"

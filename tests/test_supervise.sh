@@ -75,27 +75,27 @@ SV=("$W" --supervise -p "127.0.0.1:$PROXY")
 echoed() { grep -c bytes "$TMP/echo.err"; }
 
 echo "# exit status is the program's (FR-SV-11)"
-timeout 20 "${SV[@]}" true; check "true exits 0" "$?" 0
-timeout 20 "${SV[@]}" false; check "false exits 1" "$?" 1
-timeout 20 "${SV[@]}" sh -c 'exit 42'; check "exit 42 is 42" "$?" 42
-timeout 20 "${SV[@]}" sh -c 'kill -TERM $$'
+timeout -k 5 20 "${SV[@]}" true; check "true exits 0" "$?" 0
+timeout -k 5 20 "${SV[@]}" false; check "false exits 1" "$?" 1
+timeout -k 5 20 "${SV[@]}" sh -c 'exit 42'; check "exit 42 is 42" "$?" 42
+timeout -k 5 20 "${SV[@]}" sh -c 'kill -TERM $$'
 check "a program killed by SIGTERM: udpchains dies of it too" "$?" 143
-env -u UDPCHAINS_PROXY -u UDPCHAINS_CONFIG HOME="$TMP" timeout 20 "$W" --supervise \
+env -u UDPCHAINS_PROXY -u UDPCHAINS_CONFIG HOME="$TMP" timeout -k 5 20 "$W" --supervise \
 	sh -c 'exit 0' 2> "$TMP/noproxy.err"
 check "no proxy configured: refused, as in shim mode" "$?" 1
 # udpchains' own stderr is a pipe whose reader has gone: its next diagnostic,
 # the association line, must not kill it and the program with it.  The
 # program writes nothing there.  -v: run.sh's UDPCHAINS_QUIET would hide the
 # line, and with it the write that matters.
-timeout 20 "${SV[@]}" -v sh -c "exec > /dev/null 2>&1; sleep 0.5; \"$P\" spray 127.0.0.1 $ECHO 1;
+timeout -k 5 20 "${SV[@]}" -v sh -c "exec > /dev/null 2>&1; sleep 0.5; \"$P\" spray 127.0.0.1 $ECHO 1;
 	exit 7" 2>&1 | true
 check "udpchains' stderr closed: no SIGPIPE kills it, the program exits 7" "${PIPESTATUS[0]}" 7
-timeout 20 "${SV[@]}" sh -c 'sleep 0.3; while :; do echo x; done' | true
+timeout -k 5 20 "${SV[@]}" sh -c 'sleep 0.3; while :; do echo x; done' | true
 check "a program writing to a closed pipe still dies of SIGPIPE, as natively" \
 	"${PIPESTATUS[0]}" 141
 
 echo "# the program is supervised, and given no shim (D-49)"
-out=$(timeout 20 "${SV[@]}" sh -c 'grep "^Seccomp:" /proc/self/status')
+out=$(timeout -k 5 20 "${SV[@]}" sh -c 'grep "^Seccomp:" /proc/self/status')
 check "the program runs under a seccomp filter" "$out" "$(printf 'Seccomp:\t2')"
 if [ "$NO_SHIM" = 1 ]; then
 	skip "LD_PRELOAD stripping (NO_SHIM)"
@@ -104,32 +104,32 @@ if [ "$NO_SHIM" = 1 ]; then
 else
 	# The shim also loads into the wrapper itself here, and says it is
 	# not configured; that is not what is checked.
-	out=$(LD_PRELOAD="$PWD/libudpchains.so:/nonexistent-other.so" timeout 20 "${SV[@]}" \
+	out=$(LD_PRELOAD="$PWD/libudpchains.so:/nonexistent-other.so" timeout -k 5 20 "${SV[@]}" \
 		sh -c 'echo "[$LD_PRELOAD]"' 2> /dev/null)
 	check "libudpchains.so is removed from an inherited LD_PRELOAD, the rest kept" \
 		"$out" "[/nonexistent-other.so]"
-	out=$(LD_PRELOAD="$PWD/libudpchains.so" timeout 20 "${SV[@]}" \
+	out=$(LD_PRELOAD="$PWD/libudpchains.so" timeout -k 5 20 "${SV[@]}" \
 		sh -c 'echo "[${LD_PRELOAD-unset}]"' 2> /dev/null)
 	check "and an LD_PRELOAD of only the shim is unset" "$out" "[unset]"
 	# Loaded into the supervisor, the shim would wrap its datagrams to the
 	# relay a second time; udpchains runs itself again without it.
-	out=$(LD_PRELOAD="$PWD/libudpchains.so" timeout 30 "${SV[@]}" "$P" range "$ECHO" \
+	out=$(LD_PRELOAD="$PWD/libudpchains.so" timeout -k 5 30 "${SV[@]}" "$P" range "$ECHO" \
 		2> /dev/null | grep -c '^not ok')
 	check "with the shim in an inherited LD_PRELOAD, UDP is still carried once" "$out" 0
 fi
-out=$(UDPCHAINS_SUPERVISE=1 timeout 20 "$W" -p "127.0.0.1:$PROXY" \
+out=$(UDPCHAINS_SUPERVISE=1 timeout -k 5 20 "$W" -p "127.0.0.1:$PROXY" \
 	sh -c 'grep "^Seccomp:" /proc/self/status; echo "[${UDPCHAINS_SUPERVISE-unset}]"')
 check "UDPCHAINS_SUPERVISE=1 chooses it, and is not passed to the program" \
 	"$out" "$(printf 'Seccomp:\t2\n[unset]')"
 printf 'proxy = 127.0.0.1:%s\nsupervise = yes\n' "$PROXY" > "$TMP/sv.conf"
 chmod 600 "$TMP/sv.conf"
-out=$(env -u UDPCHAINS_PROXY timeout 20 "$W" -f "$TMP/sv.conf" \
+out=$(env -u UDPCHAINS_PROXY timeout -k 5 20 "$W" -f "$TMP/sv.conf" \
 	sh -c 'grep "^Seccomp:" /proc/self/status')
 check "supervise = yes in a config file chooses it" "$out" "$(printf 'Seccomp:\t2')"
 if [ "$NO_SHIM" = 1 ]; then
 	skip "shim mode has no filter (NO_SHIM)"
 else
-	out=$(timeout 20 "$W" -p "127.0.0.1:$PROXY" sh -c 'grep "^Seccomp:" /proc/self/status')
+	out=$(timeout -k 5 20 "$W" -p "127.0.0.1:$PROXY" sh -c 'grep "^Seccomp:" /proc/self/status')
 	check "without it, shim mode as before: no filter" "$out" "$(printf 'Seccomp:\t0')"
 fi
 
@@ -156,11 +156,11 @@ signalled USR1 sh -c 'trap "exit 7" USR1; while :; do sleep 0.1; done'
 check "a signal the program handles is delivered to it (exit 7 from its handler)" "$?" 7
 
 echo "# signals during a traced call (FR-SV-T4, D-54)"
-timeout 120 "${SV[@]}" "$P" signals "$DELAYED" "$ECHO" > "$TMP/signals.tap" 2> /dev/null
+timeout -k 5 120 "${SV[@]}" "$P" signals "$DELAYED" "$ECHO" > "$TMP/signals.tap" 2> /dev/null
 rc=$?
 sed 's/^/#   /' "$TMP/signals.tap"
 check "test_supervise signals passes, -static" "$rc" 0
-UDPCHAINS_CONNECT_TIMEOUT=1000 timeout 30 "$W" --supervise -p "127.0.0.1:$SILENT" \
+UDPCHAINS_CONNECT_TIMEOUT=1000 timeout -k 5 30 "$W" --supervise -p "127.0.0.1:$SILENT" \
 	"$P" abandon "$ECHO" > "$TMP/abandon.tap" 2> /dev/null
 rc=$?
 sed 's/^/#   /' "$TMP/abandon.tap"
@@ -210,7 +210,7 @@ done
 # here udpchains is traced by strace.
 NOLEAK="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0"
 if command -v strace > /dev/null; then
-	out=$(ASAN_OPTIONS="$NOLEAK" timeout 30 strace -f -o /dev/null "${SV[@]}" \
+	out=$(ASAN_OPTIONS="$NOLEAK" timeout -k 5 30 strace -f -o /dev/null "${SV[@]}" \
 		/bin/echo PROGRAM-RAN 2>&1)
 	rc=$?
 	case $out in
@@ -224,7 +224,7 @@ fi
 
 echo "# the supervisor stays for descendants the program leaves running (FR-SV-11)"
 start=$(date +%s%N)
-timeout 30 "${SV[@]}" sh -c \
+timeout -k 5 30 "${SV[@]}" sh -c \
 	'(sleep 1; grep "^Seccomp:" /proc/self/status > "$0") &' "$TMP/late"
 elapsed=$((($(date +%s%N) - start) / 1000000))
 [ "$elapsed" -ge 900 ] && ok "udpchains waited for the orphaned descendant (${elapsed} ms)" ||
@@ -233,7 +233,7 @@ check "and the descendant was supervised" "$(cat "$TMP/late" 2> /dev/null)" \
 	"$(printf 'Seccomp:\t2')"
 
 echo "# a static program: refusals, and what still runs (D-48, D-50, D-53)"
-timeout 30 "${SV[@]}" "$P" refusals "$PROXY" > "$TMP/refusals.tap" 2> "$TMP/refusals.err"
+timeout -k 5 30 "${SV[@]}" "$P" refusals "$PROXY" > "$TMP/refusals.tap" 2> "$TMP/refusals.err"
 rc=$?
 sed 's/^/#   /' "$TMP/refusals.tap"
 check "test_supervise refusals passes, -static" "$rc" 0
@@ -243,7 +243,7 @@ for what in "ICMP" "raw and packet" "io_uring" "pidfd_getfd"; do
 done
 
 echo "# a process the supervisor cannot inspect fails closed (D-48)"
-timeout 30 "${SV[@]}" "$P" nodump "$PROXY" > "$TMP/nodump.tap" 2> "$TMP/nodump.err"
+timeout -k 5 30 "${SV[@]}" "$P" nodump "$PROXY" > "$TMP/nodump.tap" 2> "$TMP/nodump.err"
 rc=$?
 sed 's/^/#   /' "$TMP/nodump.tap"
 check "test_supervise nodump passes, -static" "$rc" 0
@@ -252,7 +252,7 @@ grep -q "cannot be inspected: it has made itself non-dumpable" "$TMP/nodump.err"
 
 echo "# a static program's UDP, carried (D-50, D-51, FR-SV-04)"
 # -v: the association line is information, which run.sh's UDPCHAINS_QUIET hides.
-timeout 60 "${SV[@]}" -v "$P" range "$ECHO" > "$TMP/range.tap" 2> "$TMP/range.err"
+timeout -k 5 60 "${SV[@]}" -v "$P" range "$ECHO" > "$TMP/range.tap" 2> "$TMP/range.err"
 rc=$?
 sed 's/^/#   /' "$TMP/range.tap"
 check "test_supervise range passes, -static" "$rc" 0
@@ -264,7 +264,7 @@ grep -q "dup2 refused" "$TMP/range.err" && ok "the refused dup2 says why" ||
 
 echo "# the supervisor lets go of sockets the program has closed"
 # -v: the sweep's line, which says how many process tables it read, is debug.
-timeout 60 "${SV[@]}" -v "$P" churn "$ECHO" 40 6 > "$TMP/churn.out" 2> "$TMP/churn.err" &
+timeout -k 5 60 "${SV[@]}" -v "$P" churn "$ECHO" 40 6 > "$TMP/churn.out" 2> "$TMP/churn.err" &
 churn=$!
 PIDS+=($churn)
 for ((i = 0; i < 200; i++)); do
@@ -325,7 +325,7 @@ done
 check "20 runs of a program whose threads exit first: none hung or failed" "$bad" 0
 
 echo "# DNS: queries to the system resolver go to dns, through the proxy (FR-SV-12, D-52)"
-UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 60 "${SV[@]}" "$P" dns "$DNSD" \
+UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout -k 5 60 "${SV[@]}" "$P" dns "$DNSD" \
 	> "$TMP/dns.tap" 2> "$TMP/dns.err"
 rc=$?
 sed 's/^/#   /' "$TMP/dns.tap"
@@ -339,7 +339,7 @@ check "and never the query sent to port 53 elsewhere" \
 	ok "dns received big.test over TCP, from the query and from getaddrinfo()" ||
 	notok "dns did not receive the TCP queries"
 before=$(grep -c 'QUERY tcp' "$TMP/dnsd.err")
-UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 60 "$W" --supervise -p "127.0.0.1:$NOCONN" \
+UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout -k 5 60 "$W" --supervise -p "127.0.0.1:$NOCONN" \
 	"$P" dnsrefused "$DNSD" > "$TMP/dnsrefused.tap" 2> "$TMP/dnsrefused.err"
 rc=$?
 sed 's/^/#   /' "$TMP/dnsrefused.tap"
@@ -348,13 +348,13 @@ check "a proxy that refuses CONNECT: no TCP query reaches dns" \
 	"$(($(grep -c 'QUERY tcp' "$TMP/dnsd.err") - before))" 0
 grep -q "could not be carried to dns" "$TMP/dnsrefused.err" &&
 	ok "the failed TCP query says why" || notok "no diagnostic for the failed TCP query"
-UDPCHAINS_CONNECT_TIMEOUT=1000 UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 30 "$W" --supervise \
+UDPCHAINS_CONNECT_TIMEOUT=1000 UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout -k 5 30 "$W" --supervise \
 	-p "127.0.0.1:$SILENT" "$P" tcpabandon > "$TMP/tcpabandon.tap" 2> /dev/null
 rc=$?
 sed 's/^/#   /' "$TMP/tcpabandon.tap"
 check "test_supervise tcpabandon passes, -static" "$rc" 0
 # Through a chain, the last hop makes the CONNECT to dns.
-UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 60 "$W" --supervise -p "127.0.0.1:$PROXY" \
+UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout -k 5 60 "$W" --supervise -p "127.0.0.1:$PROXY" \
 	-p "127.0.0.1:$HOP2" "$P" dns "$DNSD" > "$TMP/dnschain.tap" 2> /dev/null
 rc=$?
 grep -v '^ok' "$TMP/dnschain.tap" | sed 's/^/#   /'
@@ -363,7 +363,7 @@ check "test_supervise dns passes through a chain of two, -static" "$rc" 0
 	ok "the chain's second hop made the TCP queries' CONNECTs to dns" ||
 	notok "the second hop made no CONNECT to dns"
 # Without a config file of the user's own, which might set dns.
-env -u UDPCHAINS_DNS -u UDPCHAINS_CONFIG HOME="$TMP" timeout 60 "${SV[@]}" "$P" nodns \
+env -u UDPCHAINS_DNS -u UDPCHAINS_CONFIG HOME="$TMP" timeout -k 5 60 "${SV[@]}" "$P" nodns \
 	> "$TMP/nodns.tap" 2> "$TMP/nodns.err"
 rc=$?
 sed 's/^/#   /' "$TMP/nodns.tap"
@@ -373,14 +373,14 @@ grep -q "with no dns configured" "$TMP/nodns.err" &&
 
 echo "# resolver daemons are refused, so lookups fall through to DNS (D-55)"
 # -v: the warning is hidden by run.sh's UDPCHAINS_QUIET.
-timeout 20 "${SV[@]}" -v "$P" daemons refused > "$TMP/daemons.tap" 2> "$TMP/daemons.err"
+timeout -k 5 20 "${SV[@]}" -v "$P" daemons refused > "$TMP/daemons.tap" 2> "$TMP/daemons.err"
 rc=$?
 sed 's/^/#   /' "$TMP/daemons.tap"
 check "test_supervise daemons refused passes, -static" "$rc" 0
 check "one warning for the six refusals, not one each" \
 	"$(grep -c 'warning: .*(D-55)' "$TMP/daemons.err")" 1
 "$P" daemons > "$TMP/daemons.native" 2>&1
-UDPCHAINS_ALLOW_RESOLVER_DAEMONS=yes timeout 20 "${SV[@]}" "$P" daemons \
+UDPCHAINS_ALLOW_RESOLVER_DAEMONS=yes timeout -k 5 20 "${SV[@]}" "$P" daemons \
 	> "$TMP/daemons.allowed" 2> /dev/null
 cmp -s "$TMP/daemons.native" "$TMP/daemons.allowed" &&
 	ok "with allow_resolver_daemons, each connect() does what it does unsupervised" ||
@@ -389,11 +389,11 @@ cmp -s "$TMP/daemons.native" "$TMP/daemons.allowed" &&
 # knows nss.local, so only a lookup that fell through to DNS finds it.
 if grep -qE '^hosts:.*mdns[^ ]* \[NOTFOUND=return\]' /etc/nsswitch.conf 2> /dev/null &&
 	[ -S /run/avahi-daemon/socket ] && command -v getent > /dev/null; then
-	out=$(UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 20 "${SV[@]}" getent ahostsv4 nss.local \
+	out=$(UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout -k 5 20 "${SV[@]}" getent ahostsv4 nss.local \
 		2> /dev/null | awk 'NR == 1 { print $1 }')
 	check "nss-mdns refused avahi: getent ahostsv4 nss.local falls through to dns" \
 		"$out" 192.0.2.77
-	UDPCHAINS_ALLOW_RESOLVER_DAEMONS=yes UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 20 \
+	UDPCHAINS_ALLOW_RESOLVER_DAEMONS=yes UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout -k 5 20 \
 		"${SV[@]}" getent ahostsv4 nss.local > /dev/null 2>&1
 	check "allowed, avahi answers instead: nss.local is not found" "$?" 2
 else
@@ -409,7 +409,7 @@ if command -v go > /dev/null; then
 	if (cd "$(dirname "$0")/goclient" &&
 	    CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS= go build -o "$TMP/goclient" main.go) \
 		> "$TMP/gobuild.err" 2>&1; then
-		UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 120 "${SV[@]}" "$TMP/goclient" "$ECHO" \
+		UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout -k 5 120 "${SV[@]}" "$TMP/goclient" "$ECHO" \
 			> "$TMP/go.tap" 2> /dev/null
 		rc=$?
 		sed 's/^/#   /' "$TMP/go.tap"
@@ -427,14 +427,14 @@ before=$(echoed)
 # A sanitiser build's leakclient cannot run LeakSanitizer once supervised, as
 # it traces its own threads (D-54); udpchains keeps its own.
 for client in "$B/leakclient-static" "$B/leakclient"; do
-	out=$(timeout 60 "$W" --supervise -p "127.0.0.1:$DEAD" \
+	out=$(timeout -k 5 60 "$W" --supervise -p "127.0.0.1:$DEAD" \
 		env ASAN_OPTIONS="$NOLEAK" "$client" 127.0.0.1 "$ECHO" 2> /dev/null)
 	check "$(basename "$client"): every send fails" \
 		"$(echo "$out" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')" 0
 done
 sleep 0.3
 check "and nothing reached the destination" "$(echoed)" "$before"
-out=$(timeout 60 "${SV[@]}" "$B/leakclient-static" 127.0.0.1 "$ECHO" 2> /dev/null)
+out=$(timeout -k 5 60 "${SV[@]}" "$B/leakclient-static" 127.0.0.1 "$ECHO" 2> /dev/null)
 sent=$(echo "$out" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')
 [ "${sent:-0}" -gt 20 ] && ok "with the proxy up, the same sends are carried ($sent)" ||
 	notok "with the proxy up, only ${sent:-0} sends were carried"
@@ -447,7 +447,7 @@ for ((i = 0; i < 100; i++)); do
 	sleep 0.05
 done
 before=$(echoed)
-timeout 30 "${SV[@]}" "$P" received "$TMP/u.sock" > "$TMP/received.tap" 2> /dev/null
+timeout -k 5 30 "${SV[@]}" "$P" received "$TMP/u.sock" > "$TMP/received.tap" 2> /dev/null
 rc=$?
 sed 's/^/#   /' "$TMP/received.tap"
 check "test_supervise received passes" "$rc" 0
@@ -465,7 +465,7 @@ grep -q "sendmsg refused: a carried UDP socket passed over SCM_RIGHTS" "$TMP/pas
 
 echo "# an inherited UDP socket stops the program from starting (D-50)"
 exec 5<> "/dev/udp/127.0.0.1/$ECHO"
-out=$(timeout 20 "${SV[@]}" /bin/echo PROGRAM-RAN 2>&1)
+out=$(timeout -k 5 20 "${SV[@]}" /bin/echo PROGRAM-RAN 2>&1)
 rc=$?
 exec 5>&-
 check "refused" "$rc" 1

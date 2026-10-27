@@ -81,7 +81,7 @@ if [ -z "$ECHO" ]; then
 fi
 
 OUT=$(UDPCHAINS_PROXY="$DEAD_PROXY" UDPCHAINS_QUIET=1 \
-	timeout 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO" 2>&1)
+	timeout -k 5 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO" 2>&1)
 echo "$OUT" | sed 's/^/#   /'
 
 SENT_OK=$(echo "$OUT" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')
@@ -104,7 +104,7 @@ done
 
 ECHO2=$(start_echo refused)
 OUT=$(UDPCHAINS_PROXY="127.0.0.1:$RPORT" UDPCHAINS_QUIET=1 \
-	timeout 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO2" 2>&1)
+	timeout -k 5 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO2" 2>&1)
 echo "$OUT" | sed 's/^/#   /'
 
 SENT_OK=$(echo "$OUT" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')
@@ -119,7 +119,7 @@ ECHO3=$(start_echo unconfigured)
 # to run (FR-C-03), but the shim itself must still fail closed rather than let
 # datagrams through.
 OUT=$(env -u UDPCHAINS_PROXY LD_PRELOAD="$ROOT/libudpchains.so" \
-	timeout 60 "$BUILD/leakclient" 127.0.0.1 "$ECHO3" 2>&1)
+	timeout -k 5 60 "$BUILD/leakclient" 127.0.0.1 "$ECHO3" 2>&1)
 echo "$OUT" | sed 's/^/#   /'
 
 SENT_OK=$(echo "$OUT" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')
@@ -145,7 +145,7 @@ done
 printf '127.0.0.1\tlocalhost\n203.0.113.5\thostsonly.test\n' > "$TMP/hosts"
 OUT=$(UDPCHAINS_PROXY="$DEAD_PROXY" UDPCHAINS_QUIET=1 UDPCHAINS_DNS="127.0.0.1:$DPORT" \
 	UDPCHAINS_HOSTS_FILE="$TMP/hosts" UDPCHAINS_DNS_TIMEOUT=2000 \
-	timeout 60 "$WRAPPER" "$BUILD/test_resolve" down 2>&1)
+	timeout -k 5 60 "$WRAPPER" "$BUILD/test_resolve" down 2>&1)
 RC=$?
 echo "$OUT" | sed 's/^/#   /'
 check "every lookup that needs DNS fails with the proxy down" "$RC" "0"
@@ -157,7 +157,7 @@ echo "# TST-03 scenario 5: raw and packet sockets are refused (D-36)"
 # diagnostic is what shows the refusal is the shim's.  As root, the EPERM count
 # alone proves it.
 OUT=$(UDPCHAINS_PROXY="$DEAD_PROXY" UDPCHAINS_QUIET=0 \
-	timeout 30 "$WRAPPER" "$BUILD/leakclient" raw 2>&1)
+	timeout -k 5 30 "$WRAPPER" "$BUILD/leakclient" raw 2>&1)
 echo "$OUT" | sed 's/^/#   /'
 check "all 8 raw and packet socket attempts fail with EPERM" \
 	"$(echo "$OUT" | grep -c '^RAW .* Operation not permitted$')" "8"
@@ -191,7 +191,7 @@ for dead in 1 2 3; do
 	esac
 	ECHOC=$(start_echo "chain$dead")
 	OUT=$(UDPCHAINS_PROXY="$CHAIN" UDPCHAINS_QUIET=1 \
-		timeout 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHOC" 2>&1)
+		timeout -k 5 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHOC" 2>&1)
 	echo "$OUT" | sed 's/^/#   /'
 	SENT_OK=$(echo "$OUT" | sed -n 's/.*sent_ok=\([0-9]*\).*/\1/p')
 	check "hop $dead of 3 dead: every send fails" "${SENT_OK:-x}" "0"
@@ -203,7 +203,7 @@ for dead in 1 2 3; do
 	before=$(grep -c '^QUERY' "$TMP/dnsd.log")
 	OUT=$(UDPCHAINS_PROXY="$CHAIN" UDPCHAINS_QUIET=1 UDPCHAINS_DNS="127.0.0.1:$DPORT" \
 		UDPCHAINS_HOSTS_FILE="$TMP/hosts" UDPCHAINS_DNS_TIMEOUT=2000 \
-		timeout 60 "$WRAPPER" "$BUILD/test_resolve" down 2>&1)
+		timeout -k 5 60 "$WRAPPER" "$BUILD/test_resolve" down 2>&1)
 	RC=$?
 	echo "$OUT" | sed 's/^/#   /'
 	check "hop $dead of 3 dead: every lookup that needs DNS fails" "$RC" "0"
@@ -215,7 +215,7 @@ echo "# TST-03 control: the same client DOES reach the destination unproxied"
 # Without this, the test could pass because the client is broken rather than
 # because the shim is working.
 ECHO4=$(start_echo control)
-timeout 30 "$BUILD/leakclient" 127.0.0.1 "$ECHO4" > /dev/null 2>&1
+timeout -k 5 30 "$BUILD/leakclient" 127.0.0.1 "$ECHO4" > /dev/null 2>&1
 sleep 0.3
 CONTROL=$(received control)
 if [ "$CONTROL" -gt 0 ]; then

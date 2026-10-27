@@ -43,7 +43,7 @@ else
 	# is attributable to the shim rather than to the network.
 	DNS=""
 	for cand in 127.0.0.53 1.1.1.1 8.8.8.8; do
-		if timeout 5 dig +short +tries=1 +time=2 "@$cand" example.com A \
+		if timeout -k 5 5 dig +short +tries=1 +time=2 "@$cand" example.com A \
 			> /dev/null 2>&1; then
 			DNS=$cand
 			break
@@ -53,7 +53,7 @@ else
 	if [ -z "$DNS" ]; then
 		skip dig "no reachable DNS server to test against"
 	else
-		OUT=$(timeout 20 "$WRAPPER" dig +short +tries=1 +time=5 \
+		OUT=$(timeout -k 5 20 "$WRAPPER" dig +short +tries=1 +time=5 \
 			"@$DNS" example.com A 2>&1)
 		if echo "$OUT" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
 			pass "dig @$DNS resolves through the shim"
@@ -68,7 +68,7 @@ fi
 if ! command -v nc > /dev/null 2>&1; then
 	skip nc "not installed"
 else
-	OUT=$(echo "hello-from-nc" | timeout 15 "$WRAPPER" \
+	OUT=$(echo "hello-from-nc" | timeout -k 5 15 "$WRAPPER" \
 		nc -u -w 3 127.0.0.1 "$ECHO_PORT" 2>&1)
 	if echo "$OUT" | grep -q "hello-from-nc"; then
 		pass "nc -u round-trips through the shim"
@@ -105,7 +105,7 @@ else
 	iperf3 -s -1 -p 5201 > /dev/null 2>&1 &
 	IPERF_PID=$!
 	sleep 0.5
-	if timeout 25 "$WRAPPER" iperf3 -u -c 127.0.0.1 -p 5201 -t 2 -b 1M \
+	if timeout -k 5 25 "$WRAPPER" iperf3 -u -c 127.0.0.1 -p 5201 -t 2 -b 1M \
 		> /dev/null 2>&1; then
 		pass "iperf3 -u runs through the shim"
 	else

@@ -187,12 +187,12 @@ run_asan() {
 	# most of what it does with a datagram (FR-SV-T1).
 	start_fixtures || { OVERALL=1; return; }
 	echo "--- supervisor: matrix"
-	UDPCHAINS_PROXY="127.0.0.1:$PROXY" timeout 300 "$ROOT/udpchains" --supervise \
+	UDPCHAINS_PROXY="127.0.0.1:$PROXY" timeout -k 5 300 "$ROOT/udpchains" --supervise \
 		"$BUILD/test_matrix-static" "$ECHO1" "$ECHO6" > "$TMP/svm.out" 2>&1
 	rc=$?
 	report "supervisor: matrix" "$TMP/svm.out" "$rc"
 	echo "--- supervisor: fidelity"
-	UDPCHAINS_PROXY="127.0.0.1:$PROXY" timeout 300 "$ROOT/udpchains" --supervise \
+	UDPCHAINS_PROXY="127.0.0.1:$PROXY" timeout -k 5 300 "$ROOT/udpchains" --supervise \
 		"$BUILD/test_fidelity-static" "$ECHO1" "$ECHO2" "$ECHO6" supervised \
 		> "$TMP/svf.out" 2>&1
 	rc=$?

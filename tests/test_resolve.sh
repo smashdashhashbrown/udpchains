@@ -74,7 +74,7 @@ probe() {
 	# shellcheck disable=SC2046 # popts is split into words on purpose
 	env -u UDPCHAINS_DNS "$@" UDPCHAINS_HOSTS_FILE="$TMP/hosts" \
 		UDPCHAINS_DNS_SEARCH=search.test UDPCHAINS_DNS_TIMEOUT=2000 \
-		timeout 120 "$WRAPPER" $(popts "$proxy") "$PROBE" "$mode" \
+		timeout -k 5 120 "$WRAPPER" $(popts "$proxy") "$PROBE" "$mode" \
 		> "$TMP/$mode.tap" 2>&1
 	rc=$?
 	sed 's/^/#   /' "$TMP/$mode.tap"
@@ -130,7 +130,7 @@ fi
 	|| notok "dnsd saw no TCP query through the chain: the truncation fallback did not run"
 # shellcheck disable=SC2046
 UDPCHAINS_DNS="127.0.0.1:$DNS" UDPCHAINS_HOSTS_FILE="$TMP/hosts" \
-	timeout 60 "$WRAPPER" -v $(popts "$CHAIN") "$PROBE" one > "$TMP/one.tap" 2>&1
+	timeout -k 5 60 "$WRAPPER" -v $(popts "$CHAIN") "$PROBE" one > "$TMP/one.tap" 2>&1
 grep -q "resolver association up: dns 127.0.0.1:$DNS via relay .*, then " "$TMP/one.tap" &&
 	ok "the resolver's association line names both relays (FR-CH-12)" ||
 	notok "no resolver association line naming both relays"
@@ -180,7 +180,7 @@ if command -v strace > /dev/null 2>&1; then
 		env -u UDPCHAINS_DNS UDPCHAINS_DNS="127.0.0.1:$DNS" \
 			UDPCHAINS_HOSTS_FILE="$TMP/hosts" UDPCHAINS_DNS_SEARCH=search.test \
 			UDPCHAINS_DNS_TIMEOUT=2000 \
-			timeout 180 strace -f -qq -o "$TMP/strace.$m" \
+			timeout -k 5 180 strace -f -qq -o "$TMP/strace.$m" \
 			-e trace=connect,sendto,sendmsg,sendmmsg \
 			"$WRAPPER" $(popts "$p") "$PROBE" $mode > /dev/null 2>&1
 		direct=$(grep -cE "htons\((53|$DNS)\)" "$TMP/strace.$m" || true)

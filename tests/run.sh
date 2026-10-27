@@ -49,15 +49,37 @@ start_fixture() {
 
 want() { case " ${SELECT:-} " in *" $1 "*|"  ") return 0;; esac; [ -z "${SELECT:-}" ]; }
 
+# Each group's output goes to a file as well as the screen, so that its skipped
+# checks can be counted: a skip is not a pass, and the summary says how many
+# there were.  Not through a pipe, which a fixture or watchdog the group leaves
+# behind would hold open; tail(1) follows the file until the group has ended.
+NSKIP=0
+SKIPPED=""
 run_test() {
-	local name=$1; shift
+	local name=$1 out pid rc skips
+	shift
 	want "$name" || return 0
 	RAN=$((RAN + 1))
 	echo
 	echo "=============================================================="
 	echo "  $name"
 	echo "=============================================================="
-	if "$@"; then
+	out="$TMP/group.out"
+	: > "$out"
+	"$@" > "$out" &
+	pid=$!
+	tail -n +1 -s 0.2 -f --pid="$pid" "$out"
+	wait "$pid"
+	rc=$?
+	# TAP's "ok N - # SKIP", indented or not, and the scripts' "# SKIP".
+	skips=$(grep -cE '(^|- )# SKIP' "$out")
+	if [ "$skips" -gt 0 ]; then
+		NSKIP=$((NSKIP + skips))
+		SKIPPED="$SKIPPED $name ($skips)"
+	fi
+	if [ "$rc" -eq 0 ] && [ "$skips" -gt 0 ]; then
+		echo "--- $name: PASS, with $skips checks SKIPPED"
+	elif [ "$rc" -eq 0 ]; then
 		echo "--- $name: PASS"
 	else
 		echo "--- $name: FAIL" >&2
@@ -97,19 +119,19 @@ run_test unit-supervise "$BUILD/test_supervise_unit"
 # --- integration tests, under the shim ---------------------------------------
 
 run_test TST-01-matrix \
-	timeout 180 "$WRAPPER" "$BUILD/test_matrix" "$ECHO1" "$ECHO6"
+	timeout -k 5 180 "$WRAPPER" "$BUILD/test_matrix" "$ECHO1" "$ECHO6"
 
 run_test TST-05-fidelity \
-	timeout 120 "$WRAPPER" "$BUILD/test_fidelity" "$ECHO1" "$ECHO2" "$ECHO6"
+	timeout -k 5 120 "$WRAPPER" "$BUILD/test_fidelity" "$ECHO1" "$ECHO2" "$ECHO6"
 
 run_test portswitch \
-	timeout 60 "$WRAPPER" "$BUILD/test_portswitch" "$ECHOSW"
+	timeout -k 5 60 "$WRAPPER" "$BUILD/test_portswitch" "$ECHOSW"
 
 run_test TST-06-lifecycle \
-	timeout 120 "$WRAPPER" "$BUILD/test_lifecycle" "$ECHO1" "$ECHO2"
+	timeout -k 5 120 "$WRAPPER" "$BUILD/test_lifecycle" "$ECHO1" "$ECHO2"
 
 run_test TST-07-thread \
-	timeout 180 "$WRAPPER" "$BUILD/test_thread" "$ECHO1"
+	timeout -k 5 180 "$WRAPPER" "$BUILD/test_thread" "$ECHO1"
 
 # --- FR-CH-T2: the same tests through chains of fixture proxies --------------
 
@@ -119,15 +141,15 @@ run_test TST-07-thread \
 through_chain() {
 	local chain=$1 rc=0
 
-	UDPCHAINS_PROXY="$chain" timeout 180 "$WRAPPER" "$BUILD/test_matrix" \
+	UDPCHAINS_PROXY="$chain" timeout -k 5 180 "$WRAPPER" "$BUILD/test_matrix" \
 		"$ECHO1" "$ECHO6" || rc=1
-	UDPCHAINS_PROXY="$chain" timeout 120 "$WRAPPER" "$BUILD/test_fidelity" \
+	UDPCHAINS_PROXY="$chain" timeout -k 5 120 "$WRAPPER" "$BUILD/test_fidelity" \
 		"$ECHO1" "$ECHO2" "$ECHO6" || rc=1
-	UDPCHAINS_PROXY="$chain" timeout 60 "$WRAPPER" "$BUILD/test_portswitch" \
+	UDPCHAINS_PROXY="$chain" timeout -k 5 60 "$WRAPPER" "$BUILD/test_portswitch" \
 		"$ECHOSW" || rc=1
-	UDPCHAINS_PROXY="$chain" timeout 120 "$WRAPPER" "$BUILD/test_lifecycle" \
+	UDPCHAINS_PROXY="$chain" timeout -k 5 120 "$WRAPPER" "$BUILD/test_lifecycle" \
 		"$ECHO1" "$ECHO2" || rc=1
-	UDPCHAINS_PROXY="$chain" timeout 180 "$WRAPPER" "$BUILD/test_thread" \
+	UDPCHAINS_PROXY="$chain" timeout -k 5 180 "$WRAPPER" "$BUILD/test_thread" \
 		"$ECHO1" || rc=1
 	return $rc
 }
@@ -146,7 +168,7 @@ exit_hop_guard() {
 
 	out=$(UDPCHAINS_STRICT_LOOPBACK=yes \
 		UDPCHAINS_PROXY="127.0.0.1:$PROXY_PORT,127.0.0.1:$PROXY2_PORT" \
-		timeout 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO1" 2>&1)
+		timeout -k 5 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO1" 2>&1)
 	if printf '%s\n' "$out" | grep -q '^ok send failed: Network is unreachable$'; then
 		echo "ok - a chain refuses a loopback destination under strict_loopback"
 	else
@@ -154,7 +176,7 @@ exit_hop_guard() {
 		rc=1
 	fi
 	out=$(UDPCHAINS_STRICT_LOOPBACK=yes UDPCHAINS_PROXY="127.0.0.1:$PROXY_PORT" \
-		timeout 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO1" 2>&1)
+		timeout -k 5 60 "$WRAPPER" "$BUILD/leakclient" 127.0.0.1 "$ECHO1" 2>&1)
 	if printf '%s\n' "$out" | grep -q '^LEAK-RISK send reported success'; then
 		echo "ok - a single local proxy still sends to it, as in 0.1.0"
 	else
@@ -187,15 +209,15 @@ run_test FR-SV-supervise "$ROOT/tests/test_supervise.sh" "$WRAPPER" "$BUILD"
 # FR-SV-T1: the hook matrix, with the probe built -static, carried by the
 # supervisor -- directly, and through a chain of two.
 run_test FR-SV-T1-matrix \
-	timeout 180 "$WRAPPER" --supervise "$BUILD/test_matrix-static" "$ECHO1" "$ECHO6"
+	timeout -k 5 180 "$WRAPPER" --supervise "$BUILD/test_matrix-static" "$ECHO1" "$ECHO6"
 run_test FR-SV-T1-matrix-2hop \
 	env UDPCHAINS_PROXY="127.0.0.1:$PROXY_PORT,127.0.0.1:$PROXY2_PORT" \
-	timeout 180 "$WRAPPER" --supervise "$BUILD/test_matrix-static" "$ECHO1" "$ECHO6"
+	timeout -k 5 180 "$WRAPPER" --supervise "$BUILD/test_matrix-static" "$ECHO1" "$ECHO6"
 
 # TST-05 under the supervisor, with the two documented differences (D-51,
 # D-36) checked as such.
 run_test FR-SV-fidelity \
-	timeout 120 "$WRAPPER" --supervise "$BUILD/test_fidelity-static" \
+	timeout -k 5 120 "$WRAPPER" --supervise "$BUILD/test_fidelity-static" \
 	"$ECHO1" "$ECHO2" "$ECHO6" supervised
 
 # --- fault injection: FR-P-08, FR-P-04, D-12 ---------------------------------
@@ -220,9 +242,9 @@ if want NFR-04-bench; then
 	# server and the syscall path cancel, so the delta bounds what the shim
 	# adds.  The proxy hop is still inside that delta -- it is an upper
 	# bound, not the shim's share, and the output says so.
-	BENCH_DIRECT=$(timeout 120 "$BUILD/bench_latency" "$ECHO1" \
+	BENCH_DIRECT=$(timeout -k 5 120 "$BUILD/bench_latency" "$ECHO1" \
 		--tag direct 2>/dev/null | awk '/^NFR04/{print}') || true
-	BENCH_SHIM=$(timeout 120 "$WRAPPER" "$BUILD/bench_latency" "$ECHO1" \
+	BENCH_SHIM=$(timeout -k 5 120 "$WRAPPER" "$BUILD/bench_latency" "$ECHO1" \
 		--tag proxied 2>/dev/null | awk '/^NFR04/{print}') || true
 
 	d_med=$(printf '%s\n' "$BENCH_DIRECT" | sed -n 's/.*median=\([0-9.]*\).*/\1/p')
@@ -262,6 +284,12 @@ if [ "$FAILED" -eq 0 ]; then
 	echo "  ALL $RAN TEST GROUPS PASSED"
 else
 	echo "  $FAILED of $RAN TEST GROUPS FAILED" >&2
+fi
+if want NFR-04-bench; then
+	echo "  NFR-04-bench is among them: it reports a measurement, and cannot fail"
+fi
+if [ "$NSKIP" -gt 0 ]; then
+	echo "  $NSKIP checks SKIPPED, which is not a pass:$SKIPPED"
 fi
 echo "=============================================================="
 exit $((FAILED > 0))

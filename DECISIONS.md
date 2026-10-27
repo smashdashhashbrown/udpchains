@@ -68,6 +68,7 @@ entries:** Accepted. "Review" items are from the pre-release review, tracked in
 | [D-52](#d-52) | Queries to the system resolver are redirected to `dns`, through the proxy | FR-SV-12; revisits D-22 |
 | [D-53](#d-53) | What supervisor mode refuses, and Linux 5.14 as its floor | FR-SV-02, FR-SV-09; revisits D-29, D-36, NFR-01a |
 | [D-54](#d-54) | A supervised program's calls are handled while it is stopped, through `ptrace`; notification only installs descriptors | FR-SV-06, FR-SV-07, FR-SV-08, FR-SV-13; revises D-48, D-51 |
+| [D-55](#d-55) | A supervised program's connections to resolver daemons are refused, so its lookups fall through to DNS | FR-SV-12; closes a D-52 limitation |
 
 ---
 
