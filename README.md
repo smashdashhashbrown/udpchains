@@ -73,6 +73,8 @@ dns = 9.9.9.9
 | `dns_search` | `UDPCHAINS_DNS_SEARCH` | search domains for single-label names, space- or comma-separated | none |
 | `hosts_file` | `UDPCHAINS_HOSTS_FILE` | hosts file read before DNS | `/etc/hosts` |
 | `strict_loopback` | `UDPCHAINS_STRICT_LOOPBACK` | make the loopback warning an error | `no` |
+| `supervise` | `UDPCHAINS_SUPERVISE` | [supervisor mode](#supervisor-mode-static-and-go-programs), as `--supervise` | `no` |
+| `allow_resolver_daemons` | `UDPCHAINS_ALLOW_RESOLVER_DAEMONS` | supervised, let lookups reach systemd-resolved, nscd and avahi, which resolve outside the proxy | `no` |
 | `username` | `UDPCHAINS_USERNAME` | RFC 1929 username | none |
 | `password_file` | `UDPCHAINS_PASSWORD_FILE` | file holding the password; relative to the current directory | none |
 | `password` | `UDPCHAINS_PASSWORD` | the password itself (see below) | none |
@@ -325,10 +327,12 @@ The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/res
   the query goes nowhere.
 - A resolver configured elsewhere than `/etc/resolv.conf` on a non-loopback address is proxied as
   addressed. A local DNS server's own entries (dnsmasq) are not used; `/etc/hosts` is.
-- **Lookups made through an NSS module that asks a local daemon** — `nss-resolve` (systemd-resolved
-  over its Unix socket), `nscd`, `mdns` (avahi) — are not seen: the daemon resolves the name
-  itself, outside the proxy. Ubuntu's default `nsswitch.conf` uses `dns` for everything but
-  `.local`.
+- **Lookups handed to a local daemon** — systemd-resolved (`nss-resolve`), `nscd`, avahi
+  (`mdns`) — would be resolved by the daemon, outside the proxy. The daemons' sockets are refused,
+  as when a daemon is not running, so the lookup falls through to DNS and so to `dns`. This loses
+  what the daemon adds (resolved's per-VPN routing of names, its cache, `.local` by multicast).
+  `allow_resolver_daemons = yes` lets them through. Lookups resolved receives over D-Bus are not
+  refused.
 
 ### How supervisor mode differs from the shim
 

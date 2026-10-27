@@ -2295,7 +2295,8 @@ address, not this host's.
 
 It adds one limitation, found while building it:
 
-- **Lookups through an NSS module that asks a local daemon are not seen.** `nss-resolve` asks
+- **Lookups through an NSS module that asks a local daemon are not seen** (closed by D-55,
+  2026-10-26, which refuses those connections). `nss-resolve` asks
   systemd-resolved over its Unix socket (`/run/systemd/resolve/io.systemd.Resolve`), `nscd` and
   `mdns` (avahi) theirs, and the daemon resolves the name itself, outside the proxy. A static
   glibc program loads these modules too. Ubuntu's default `hosts:` line (`files mdns4_minimal
@@ -2629,3 +2630,68 @@ measured, not documented.
 
 **Revisit if:** Linux gains a way for a notification's reply to be committed to the program before
 a signal can take effect. Every call could then return to user notification.
+
+---
+
+## D-55
+### A supervised program's connections to resolver daemons are refused, so its lookups fall through to DNS
+
+**Date:** 2026-10-26 · **Status:** Accepted; built for x86-64 · FR-SV-12. Closes the limitation
+D-52 recorded. Chosen by the maintainer, on by default, with a setting to turn it off.
+
+**Context.** glibc's `getaddrinfo()` follows the `hosts:` line of `/etc/nsswitch.conf`, and some of
+its sources hand the name to a local daemon over a Unix socket: `resolve` (nss-resolve) to
+systemd-resolved, `mdns` and `mdns4_minimal` (nss-mdns) to avahi, and glibc itself to nscd before
+any source. The daemon looks the name up itself, outside the program, so the supervisor never sees
+a query: the name goes around the proxy. A static glibc program loads these modules too; Go
+without cgo and musl do not use them. Fedora and Arch list `resolve [!UNAVAIL=return]` before
+`dns`; Ubuntu hands only `.local` names to avahi.
+
+**Decision.**
+
+- **A `connect()` to a resolver daemon's socket fails with `ECONNREFUSED`,** as when the daemon is
+  not running, which every client handles: nss-resolve reports itself unavailable and the next
+  source, `dns`, is asked; glibc's nscd client falls back to the sources; nss-mdns reports itself
+  unavailable. The lookup then goes by DNS to the system resolver, which D-52 sends to `dns`
+  through the proxy.
+- **The sockets,** under `/run` or `/var/run`: `systemd/resolve/io.systemd.Resolve`,
+  `nscd/socket` and `avahi-daemon/socket`, matched exactly as the program names them. An abstract
+  address never matches.
+- **`allow_resolver_daemons = yes`** (`UDPCHAINS_ALLOW_RESOLVER_DAEMONS`) lets them through. Off by
+  default. It is the wrapper's, never passed to the program, and means nothing to the shim, which
+  answers lookups itself (D-22).
+- **A warning the first time in a run,** naming the daemon and the setting; later refusals at
+  debug level, since a program may look names up all the time.
+
+**Rejected.**
+
+- **Leaving it as a documented limitation,** as D-52 did. On Fedora or Arch every lookup of a
+  supervised glibc program would go around the proxy.
+- **Refusing the system D-Bus,** which systemd-resolved also answers on and older nss-resolve used.
+  Too many programs need the bus.
+
+**Consequences.**
+
+- **Lookups lose what the daemon adds:** systemd-resolved's per-interface and VPN routing of
+  names, LLMNR, its cache and its DNSSEC validation. They behave as in shim mode: `/etc/hosts`, then
+  `dns`. `.local` names reach `dns` by DNS, where they are usually not found, rather than being
+  asked for by multicast on the local network, which would itself be outside the proxy.
+- **A program that talks to these daemons for another reason,** `resolvectl` say, fails under
+  supervision unless the setting allows it.
+
+**Known limitations.**
+
+- **Lookups over D-Bus** (nss-resolve before systemd-resolved offered its socket) are not refused.
+- **A path written another way** (`/run//nscd/socket`, a relative path, a link of the program's
+  own) is not matched.
+- **The address is read before the kernel reads it.** A program that rewrites it from another
+  thread meanwhile could reach the daemon. The refusal is for the resolver libraries, not for a
+  program that sets out to get around it.
+
+**Built and tested** (2026-10-26): unit tests of the matching (12); a static probe connecting to
+each socket under both prefixes, all refused, with one warning, while a Unix socket elsewhere
+connects, and with the setting each connect doing what it does unsupervised; and, end to end on a
+host whose `nsswitch.conf` hands `.local` names to avahi, `getent ahostsv4 nss.local` under the
+supervisor found `dnsd`'s answer, refused, and was answered by avahi (not found), allowed.
+Mutations: the setting ignored, the warning repeated, `/var/run` not matched, and nothing refused,
+each caught.

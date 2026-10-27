@@ -66,8 +66,12 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   - **Tested** with a static Go client, through the seven interop proxies, and in `make compare`,
     where supervisor mode carried every combination and the static Go binary through the proxy.
   - **Documented** in the README, the man page and `udpchains -h`, with the limits of each mode.
-  - **Not yet:** aarch64. Lookups through an NSS module that asks a local daemon (`nss-resolve`,
-    `nscd`, `mdns`) are not seen.
+  - **Lookups handed to a resolver daemon** (D-55): under supervision, a connection to
+    systemd-resolved's, nscd's or avahi's socket is refused, as when the daemon is not running, so
+    the lookup falls through to DNS and so to `dns` rather than being resolved outside the proxy.
+    `allow_resolver_daemons = yes` (`UDPCHAINS_ALLOW_RESOLVER_DAEMONS`) lets them through.
+  - **Not yet:** aarch64 (deferred). Lookups a resolver daemon receives over D-Bus are not
+    refused.
 
 ### Changed
 
@@ -79,9 +83,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 2321 assertions across 26 groups. Supervisor mode adds `unit-supervise` (27), 6 to
-  unit-config, `FR-SV-supervise` (61 checks, with static programs making 18, 6, 37, 25, 4, 24, 26,
-  2, 4, 26, 4 and 5 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
+- 2346 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
+  unit-config, `FR-SV-supervise` (66 checks, with static programs making 18, 6, 37, 25, 4, 24, 26,
+  2, 4, 26, 4, 7 and 5 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
   through two hops), and the fidelity test built `-static` under it (172). The supervisor also
   runs under ASan and UBSan, with the static matrix and fidelity tests.
 

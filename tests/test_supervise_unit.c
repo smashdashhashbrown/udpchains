@@ -7,6 +7,7 @@
 #include "tap.h"
 
 #include <arpa/inet.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -95,9 +96,63 @@ static void system_resolver(void)
 	       "a different port is not");
 }
 
+/* The daemon a Unix address names, its length the path's own (with or
+ * without the terminating NUL) unless len is given. */
+static const char *daemon_at(const char *path, int len)
+{
+	struct sockaddr_un un;
+
+	memset(&un, 0, sizeof(un));
+	un.sun_family = AF_UNIX;
+	memcpy(un.sun_path, path, strlen(path));
+	if (len < 0)
+		len = (int)(offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1);
+	return svdns_resolver_daemon(&un, (socklen_t)len);
+}
+
+static void resolver_daemons(void)
+{
+	struct sockaddr_un un;
+	size_t base = offsetof(struct sockaddr_un, sun_path);
+	const char *d;
+
+	TAP_GROUP("D-55: which Unix sockets are a resolver daemon's");
+	d = daemon_at("/run/systemd/resolve/io.systemd.Resolve", -1);
+	TAP_OK(d != NULL && strstr(d, "systemd-resolved") != NULL,
+	       "systemd-resolved's, for nss-resolve (%s)", d ? d : "none");
+	d = daemon_at("/var/run/nscd/socket", -1);
+	TAP_OK(d != NULL && strcmp(d, "nscd") == 0, "nscd's, as glibc names it, under /var/run");
+	TAP_OK(daemon_at("/run/nscd/socket", -1) != NULL, "and under /run");
+	TAP_OK(daemon_at("/run/avahi-daemon/socket", -1) != NULL &&
+	               daemon_at("/var/run/avahi-daemon/socket", -1) != NULL,
+	       "avahi's, for nss-mdns, under either");
+	TAP_OK(daemon_at("/run/nscd/socket",
+	                 (int)(base + strlen("/run/nscd/socket"))) != NULL,
+	       "a path given without its NUL, its length exact");
+	TAP_OK(daemon_at("/run/nscd/socket2", -1) == NULL, "not a longer path");
+	TAP_OK(daemon_at("/run/nscd/socket", (int)(base + 5)) == NULL,
+	       "nor one cut short by its length");
+	TAP_OK(daemon_at("/run/systemd/resolve/io.systemd.Resolve.Monitor", -1) == NULL,
+	       "nor resolved's monitor socket, which answers no lookups");
+	TAP_OK(daemon_at("/tmp/socket", -1) == NULL && daemon_at("/var/run/dbus/system_bus_socket",
+	                                                         -1) == NULL,
+	       "nor any other, the system bus included");
+	memset(&un, 0, sizeof(un));
+	un.sun_family = AF_UNIX;
+	memcpy(un.sun_path + 1, "/run/nscd/socket", 16);
+	TAP_OK(svdns_resolver_daemon(&un, (socklen_t)(base + 17)) == NULL,
+	       "nor an abstract address of the same name");
+	TAP_OK(svdns_resolver_daemon(&un, (socklen_t)base) == NULL, "nor an unnamed one");
+	un.sun_family = AF_INET;
+	memcpy(un.sun_path, "/run/nscd/socket", 17);
+	TAP_OK(svdns_resolver_daemon(&un, (socklen_t)sizeof(un)) == NULL,
+	       "nor another family's address");
+}
+
 int main(void)
 {
 	system_resolver();
+	resolver_daemons();
 
 	TAP_GROUP("D-53: the kernel floor, from uname's release string");
 	TAP_OK(udpc_kernel_at_least("5.14.0", 5, 14), "5.14.0 meets 5.14");

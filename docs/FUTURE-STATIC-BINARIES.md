@@ -233,7 +233,8 @@ needed in the program), D-31 (fork), NFR-01a (a higher kernel floor for this mod
      mode (FR-SV-19).
 
    Found: lookups through an NSS module that asks a local daemon (`nss-resolve`, `nscd`, `mdns`)
-   are not seen (D-52).
+   are not seen (D-52). *Closed 2026-10-26 by D-55:* their sockets are refused, so the lookup
+   falls through to DNS, unless `allow_resolver_daemons` is set.
 
    *Added 2026-10-24:* TCP to the system resolver's port 53, refused until then, is carried to
    `dns` by SOCKS5 `CONNECT` on the program's own socket (D-52). aarch64 (FR-SV-16) is deferred by

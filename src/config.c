@@ -57,6 +57,8 @@ void udpc_config_merge(struct udpc_config *dst, const struct udpc_config *src)
 	}
 	if (m & UDPC_SET_SUPERVISE)
 		dst->supervise = src->supervise;
+	if (m & UDPC_SET_RESOLVER_DAEMONS)
+		dst->allow_resolver_daemons = src->allow_resolver_daemons;
 	if (m & UDPC_SET_USERNAME) {
 		memcpy(dst->username, src->username, sizeof(dst->username));
 		dst->have_credentials = true;
@@ -327,6 +329,14 @@ int udpc_config_set(struct udpc_config *cfg, const char *key, const char *value,
 			return -1;
 		}
 		cfg->set_mask |= UDPC_SET_SUPERVISE;
+		return 0;
+	}
+	if (strcmp(key, "allow_resolver_daemons") == 0) {
+		if (parse_bool(value, &cfg->allow_resolver_daemons) != 0) {
+			*err = "allow_resolver_daemons must be a boolean";
+			return -1;
+		}
+		cfg->set_mask |= UDPC_SET_RESOLVER_DAEMONS;
 		return 0;
 	}
 	if (strcmp(key, "dns") == 0) {
@@ -860,6 +870,7 @@ static const struct env_key g_env_keys[] = {
 	{ "UDPCHAINS_CONNECT_TIMEOUT", "connect_timeout" },
 	{ "UDPCHAINS_CHAIN_TIMEOUT", "chain_timeout" },
 	{ "UDPCHAINS_SUPERVISE", "supervise" },
+	{ "UDPCHAINS_ALLOW_RESOLVER_DAEMONS", "allow_resolver_daemons" },
 	{ "UDPCHAINS_USERNAME", "username" },
 	{ "UDPCHAINS_PASSWORD_FILE", "password_file" },
 	{ "UDPCHAINS_DNS", "dns" },
@@ -1289,8 +1300,9 @@ int udpc_config_export(const struct udpc_config *cfg)
 	if (setenv("UDPCHAINS_STRICT_LOOPBACK", cfg->strict_loopback ? "1" : "0",
 	           1) != 0)
 		return -1;
-	/* D-49: the wrapper's setting alone; the program is not told. */
+	/* D-49, D-55: the wrapper's settings alone; the program is not told. */
 	unsetenv("UDPCHAINS_SUPERVISE");
+	unsetenv("UDPCHAINS_ALLOW_RESOLVER_DAEMONS");
 
 	/* D-22 resolver settings.  An unset dns is exported as unset, never as
 	 * a default: the shim must fail lookups rather than pick a resolver. */

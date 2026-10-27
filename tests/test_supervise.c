@@ -44,6 +44,13 @@
  *                                        proxy: a signal while a TCP query's
  *                                        tunnel is set up is handled at once,
  *                                        and the connect made again (D-52, D-54)
+ *   test_supervise daemons [refused]     connect() to each resolver daemon's
+ *                                        socket (D-55): with "refused", under
+ *                                        the supervisor, each fails with
+ *                                        ECONNREFUSED and a socket elsewhere
+ *                                        connects; without, prints each
+ *                                        result, to compare a supervised run
+ *                                        with an unsupervised one
  *   test_supervise threadexit            under the supervisor: two threads make
  *                                        and close sockets, and exit before
  *                                        the program does
@@ -1568,6 +1575,56 @@ static int tcpabandon(void)
 	TAP_DONE();
 }
 
+/* D-55: the sockets a lookup can be handed to, as their clients name them. */
+static const char *const g_daemon_paths[] = {
+	"/run/systemd/resolve/io.systemd.Resolve", "/var/run/systemd/resolve/io.systemd.Resolve",
+	"/var/run/nscd/socket", "/run/nscd/socket",
+	"/run/avahi-daemon/socket", "/var/run/avahi-daemon/socket",
+};
+
+/* connect() to path: 0, or the errno. */
+static int connect_unix(const char *path)
+{
+	struct sockaddr_un un;
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0), rc;
+
+	memset(&un, 0, sizeof(un));
+	un.sun_family = AF_UNIX;
+	snprintf(un.sun_path, sizeof(un.sun_path), "%s", path);
+	rc = connect(fd, (struct sockaddr *)&un, sizeof(un)) == 0 ? 0 : errno;
+	close(fd);
+	return rc;
+}
+
+static int daemons(int refused)
+{
+	struct sockaddr_un un;
+	unsigned k;
+	int lfd;
+
+	if (!refused) {
+		for (k = 0; k < sizeof(g_daemon_paths) / sizeof(g_daemon_paths[0]); k++)
+			printf("%s %d\n", g_daemon_paths[k], connect_unix(g_daemon_paths[k]));
+		return 0;
+	}
+	TAP_GROUP("D-55: a resolver daemon's socket is refused");
+	for (k = 0; k < sizeof(g_daemon_paths) / sizeof(g_daemon_paths[0]); k++)
+		TAP_EQ_INT(connect_unix(g_daemon_paths[k]), ECONNREFUSED, "connect() to %s: "
+		                                                          "ECONNREFUSED",
+		           g_daemon_paths[k]);
+	memset(&un, 0, sizeof(un));
+	un.sun_family = AF_UNIX;
+	snprintf(un.sun_path, sizeof(un.sun_path), "/tmp/test_supervise.%d", (int)getpid());
+	lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+	unlink(un.sun_path);
+	if (bind(lfd, (struct sockaddr *)&un, sizeof(un)) != 0 || listen(lfd, 1) != 0)
+		perror("listen");
+	TAP_EQ_INT(connect_unix(un.sun_path), 0, "a Unix socket elsewhere still connects");
+	close(lfd);
+	unlink(un.sun_path);
+	TAP_DONE();
+}
+
 /* For the wire capture (FR-SV-T2): a datagram to ip:port every 5 ms for secs
  * seconds, a line for each one sent, so a run killed part way still says how
  * far it got. */
@@ -1769,6 +1826,10 @@ int main(int argc, char **argv)
 		return dns(atoi(argv[2]));
 	if (argc == 2 && strcmp(argv[1], "nodns") == 0)
 		return nodns();
+	if (argc == 2 && strcmp(argv[1], "daemons") == 0)
+		return daemons(0);
+	if (argc == 3 && strcmp(argv[1], "daemons") == 0 && strcmp(argv[2], "refused") == 0)
+		return daemons(1);
 	if (argc == 3 && strcmp(argv[1], "dnsrefused") == 0)
 		return dnsrefused(atoi(argv[2]));
 	if (argc == 2 && strcmp(argv[1], "tcpabandon") == 0)
@@ -1798,7 +1859,7 @@ int main(int argc, char **argv)
 	                "signals <delayed echo port> <echo port> | silent | "
 	                "abandon <echo port> | lifecycle <echo port> | "
 	                "spray <ip> <port> <secs> | threadexit | dns <dnsd port> | nodns | "
-	                "dnsrefused <dnsd port> | tcpabandon | "
+	                "dnsrefused <dnsd port> | tcpabandon | daemons [refused] | "
 	                "nodump <tcp port> | "
 	                "churn <echo port> <n> <secs> | "
 	                "pass <path> <port> | "

@@ -1496,6 +1496,39 @@ static enum sv_outcome dns_over_tcp(struct call *c, int copy)
 	return sent < 0 ? answer(c, 0, (int)-sent) : answer(c, sent, 0);
 }
 
+/* D-55: the resolver daemon a connect() would reach, or NULL; never one when
+ * allow_resolver_daemons is set. */
+static const char *resolver_daemon(const struct call *c)
+{
+	const __u64 *a = c->req->data.args;
+	struct sockaddr_un un;
+	socklen_t len = (socklen_t)a[2];
+
+	if (c->sv->cfg->allow_resolver_daemons || len > sizeof(un))
+		return NULL; /* too long, the kernel fails it */
+	memset(&un, 0, sizeof(un));
+	if (mem_read(c, a[1], &un, len) != 0)
+		return NULL;
+	return svdns_resolver_daemon(&un, len);
+}
+
+/* D-55: once a run at the normal level, since a program may look names up
+ * all the time, and every time at debug. */
+static void refused_daemon(const struct call *c, const char *daemon)
+{
+	static bool told;
+
+	if (told) {
+		udpc_debug("process %u: connect refused: %s (D-55)", c->req->pid, daemon);
+		return;
+	}
+	told = true;
+	udpc_warn("process %u: connect refused: %s, which would look names up outside "
+	          "the proxy; lookups fall through to DNS, and so to dns (D-55). "
+	          "allow_resolver_daemons = yes allows it",
+	          c->req->pid, daemon);
+}
+
 static enum sv_outcome decide_other(struct call *c, int copy)
 {
 	int nr = c->req->data.nr;
@@ -1507,6 +1540,18 @@ static enum sv_outcome decide_other(struct call *c, int copy)
 	if ((nr == SYS_connect || nr == SYS_sendto || nr == SYS_sendmsg) &&
 	    stream_to_system_resolver(c, copy))
 		return dns_over_tcp(c, copy);
+	/* D-55: a daemon the lookup was handed to would resolve it outside the
+	 * proxy.  Refused as a daemon not running is, so the lookup falls
+	 * through to DNS. */
+	if (nr == SYS_connect) {
+		const char *daemon = resolver_daemon(c);
+
+		if (daemon != NULL) {
+			close(copy);
+			refused_daemon(c, daemon);
+			return answer(c, 0, ECONNREFUSED);
+		}
+	}
 	if (moves_data && sv_uncarriable(copy)) {
 		close(copy);
 		refused(c, WHY_RECEIVED_FD, "a UDP, raw or packet socket the supervisor did "

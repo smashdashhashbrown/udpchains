@@ -9,13 +9,17 @@
  * resolv.conf is read again whenever it changes, so a nameserver a VPN or DHCP
  * puts there while the program runs is recognised too.  Wrapper-only.
  *
- * Written from resolv.conf(5) (D-01).
+ * Also which Unix sockets are a resolver daemon's (D-55).
+ *
+ * Written from resolv.conf(5) and nsswitch.conf(5) (D-01); the daemons'
+ * socket paths from what their clients were seen to connect to.
  */
 #include "svint.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 #include <sys/stat.h>
 
 #include "addr.h"
@@ -123,4 +127,40 @@ bool svdns_system_resolver(const struct sockaddr *dst)
 		if (svdns_same(dst, (const struct sockaddr *)&g_server[k]))
 			return true;
 	return false;
+}
+
+/* --- resolver daemons (D-55) ------------------------------------------------*/
+
+/* The sockets of the daemons a lookup is handed to, by an NSS module or by
+ * glibc itself, each resolving it outside the proxy. */
+static const struct {
+	const char *path; /* under /run, which /var/run is a link to */
+	const char *name;
+} g_daemons[] = {
+	{ "/run/systemd/resolve/io.systemd.Resolve", "systemd-resolved (nss-resolve)" },
+	{ "/run/nscd/socket", "nscd" },
+	{ "/run/avahi-daemon/socket", "avahi (nss-mdns)" },
+};
+
+const char *svdns_resolver_daemon(const struct sockaddr_un *un, socklen_t len)
+{
+	char path[sizeof(un->sun_path) + 1];
+	const char *p = path;
+	size_t n;
+	unsigned k;
+
+	if (len <= offsetof(struct sockaddr_un, sun_path) || un->sun_family != AF_UNIX ||
+	    un->sun_path[0] == '\0')
+		return NULL;
+	n = len - offsetof(struct sockaddr_un, sun_path);
+	if (n > sizeof(un->sun_path))
+		n = sizeof(un->sun_path);
+	memcpy(path, un->sun_path, n);
+	path[n] = '\0';
+	if (strncmp(p, "/var/run/", 9) == 0)
+		p += 4;
+	for (k = 0; k < sizeof(g_daemons) / sizeof(g_daemons[0]); k++)
+		if (strcmp(p, g_daemons[k].path) == 0)
+			return g_daemons[k].name;
+	return NULL;
 }

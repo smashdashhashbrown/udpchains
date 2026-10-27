@@ -85,8 +85,9 @@ env -u UDPCHAINS_PROXY -u UDPCHAINS_CONFIG HOME="$TMP" timeout 20 "$W" --supervi
 check "no proxy configured: refused, as in shim mode" "$?" 1
 # udpchains' own stderr is a pipe whose reader has gone: its next diagnostic,
 # the association line, must not kill it and the program with it.  The
-# program writes nothing there.
-timeout 20 "${SV[@]}" sh -c "exec > /dev/null 2>&1; sleep 0.5; \"$P\" spray 127.0.0.1 $ECHO 1;
+# program writes nothing there.  -v: run.sh's UDPCHAINS_QUIET would hide the
+# line, and with it the write that matters.
+timeout 20 "${SV[@]}" -v sh -c "exec > /dev/null 2>&1; sleep 0.5; \"$P\" spray 127.0.0.1 $ECHO 1;
 	exit 7" 2>&1 | true
 check "udpchains' stderr closed: no SIGPIPE kills it, the program exits 7" "${PIPESTATUS[0]}" 7
 timeout 20 "${SV[@]}" sh -c 'sleep 0.3; while :; do echo x; done' | true
@@ -354,6 +355,36 @@ sed 's/^/#   /' "$TMP/nodns.tap"
 check "test_supervise nodns passes, -static" "$rc" 0
 grep -q "with no dns configured" "$TMP/nodns.err" &&
 	ok "the refused query says to set dns" || notok "no diagnostic for the refused query"
+
+echo "# resolver daemons are refused, so lookups fall through to DNS (D-55)"
+# -v: the warning is hidden by run.sh's UDPCHAINS_QUIET.
+timeout 20 "${SV[@]}" -v "$P" daemons refused > "$TMP/daemons.tap" 2> "$TMP/daemons.err"
+rc=$?
+sed 's/^/#   /' "$TMP/daemons.tap"
+check "test_supervise daemons refused passes, -static" "$rc" 0
+check "one warning for the six refusals, not one each" \
+	"$(grep -c 'warning: .*(D-55)' "$TMP/daemons.err")" 1
+"$P" daemons > "$TMP/daemons.native" 2>&1
+UDPCHAINS_ALLOW_RESOLVER_DAEMONS=yes timeout 20 "${SV[@]}" "$P" daemons \
+	> "$TMP/daemons.allowed" 2> /dev/null
+cmp -s "$TMP/daemons.native" "$TMP/daemons.allowed" &&
+	ok "with allow_resolver_daemons, each connect() does what it does unsupervised" ||
+	notok "allow_resolver_daemons did not let the connects through"
+# End to end where this host hands .local names to avahi through nss-mdns: dnsd
+# knows nss.local, so only a lookup that fell through to DNS finds it.
+if grep -qE '^hosts:.*mdns[^ ]* \[NOTFOUND=return\]' /etc/nsswitch.conf 2> /dev/null &&
+	[ -S /run/avahi-daemon/socket ] && command -v getent > /dev/null; then
+	out=$(UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 20 "${SV[@]}" getent ahostsv4 nss.local \
+		2> /dev/null | awk 'NR == 1 { print $1 }')
+	check "nss-mdns refused avahi: getent ahostsv4 nss.local falls through to dns" \
+		"$out" 192.0.2.77
+	UDPCHAINS_ALLOW_RESOLVER_DAEMONS=yes UDPCHAINS_DNS="127.0.0.1:$DNSD" timeout 20 \
+		"${SV[@]}" getent ahostsv4 nss.local > /dev/null 2>&1
+	check "allowed, avahi answers instead: nss.local is not found" "$?" 2
+else
+	skip "nss-mdns refused avahi (no mdns with [NOTFOUND=return], or no avahi)"
+	skip "allowed, avahi answers instead"
+fi
 
 echo "# a static Go program (FR-SV-T5)"
 # Built here, only when a Go toolchain is installed: make itself needs only a

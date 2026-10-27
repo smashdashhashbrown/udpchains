@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/types.h>
 
 #include "config.h"
@@ -185,5 +186,10 @@ bool svdns_same(const struct sockaddr *a, const struct sockaddr *b);
 
 /* Reads the nameservers from path instead of /etc/resolv.conf: for tests. */
 void svdns_set_path(const char *path);
+
+/* D-55: if un, len bytes of it, names the Unix socket of a daemon a lookup
+ * can be handed to, which would resolve it outside the proxy, that daemon's
+ * name; else NULL.  /var/run and /run alike; an abstract address never. */
+const char *svdns_resolver_daemon(const struct sockaddr_un *un, socklen_t len);
 
 #endif /* UDPCHAINS_SVINT_H */

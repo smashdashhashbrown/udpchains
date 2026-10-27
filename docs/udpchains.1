@@ -165,6 +165,12 @@ or
 A boolean, as
 .BR \-\-supervise .
 It is not passed to the program.
+.TP
+.B UDPCHAINS_ALLOW_RESOLVER_DAEMONS
+A boolean: under supervision, let the program reach systemd\-resolved, nscd and
+avahi, which look names up outside the proxy.
+Off by default.
+It is not passed to the program.
 .PP
 .B udpchains
 sets
@@ -204,9 +210,10 @@ Keys:
 .B password
 (inline; the file must then not be readable by others),
 .BR quiet ,
-.B debug
+.BR debug ,
+.B supervise
 and
-.BR supervise .
+.BR allow_resolver_daemons .
 Each matches the environment variable of the same name.
 An unknown key is an error.
 .IP
@@ -404,6 +411,24 @@ too, by SOCKS5 CONNECT through the proxy, on the program's own socket;
 .BR getpeername (2)
 on it names the proxy.
 If the proxy refuses CONNECT, the connection fails.
+A connection to a daemon that a lookup is handed to, which would resolve it
+outside the proxy \- systemd\-resolved
+.RI ( /run/systemd/resolve/io.systemd.Resolve ),
+nscd
+.RI ( /run/nscd/socket )
+and avahi
+.RI ( /run/avahi\-daemon/socket ),
+under
+.I /run
+or
+.I /var/run
+\- is refused with
+.BR ECONNREFUSED ,
+as when the daemon is not running, so the lookup falls through to DNS, and so
+to
+.BR dns .
+.B allow_resolver_daemons = yes
+lets them through.
 .PP
 .B Refused:
 .BR io_uring_setup (2)

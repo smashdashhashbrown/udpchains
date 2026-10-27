@@ -12,6 +12,9 @@
  *   alias.test          CNAME a.test
  *   v4only.test         A 192.0.2.4            (AAAA: NOERROR, no data)
  *   host.search.test    A 192.0.2.20           (for dns_search)
+ *   nss.local           A 192.0.2.77           (found only if a lookup that
+ *                                               mDNS would answer reaches DNS,
+ *                                               D-55)
  *   big.test            100 x A 198.51.100.x   (truncated over UDP; whole over TCP)
  *   loop.test           CNAME loop2.test, which CNAMEs back to loop.test
  *   1.2.0.192.in-addr.arpa and the ip6.arpa name of 2001:db8::1   PTR a.test
@@ -158,6 +161,11 @@ static int answer(struct msg *m, const char *name, uint16_t type, unsigned *an)
 	if (strcmp(q, "host.search.test") == 0) {
 		if (type == T_A)
 			ANS(put_a(m, name, "192.0.2.20"));
+		return 0;
+	}
+	if (strcmp(q, "nss.local") == 0) {
+		if (type == T_A)
+			ANS(put_a(m, name, "192.0.2.77"));
 		return 0;
 	}
 	if (strcmp(q, "big.test") == 0) {

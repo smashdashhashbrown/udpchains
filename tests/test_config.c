@@ -829,6 +829,34 @@ int main(void)
 		       "the export does not pass it on to the program");
 	}
 
+	TAP_GROUP("D-55: allow_resolver_daemons");
+	{
+		udpc_config_defaults(&cfg);
+		TAP_OK(!cfg.allow_resolver_daemons, "off by default: resolver daemons are refused");
+		udpc_config_init(&layer);
+		err = NULL;
+		TAP_EQ_INT(udpc_config_set(&layer, "allow_resolver_daemons", "yes", &err), 0,
+		           "allow_resolver_daemons = yes is accepted");
+		TAP_OK(layer.allow_resolver_daemons &&
+		               (layer.set_mask & UDPC_SET_RESOLVER_DAEMONS),
+		       "and set");
+		err = NULL;
+		TAP_EQ_INT(udpc_config_set(&layer, "allow_resolver_daemons", "maybe", &err), -1,
+		           "a non-boolean is rejected");
+		setenv("UDPCHAINS_ALLOW_RESOLVER_DAEMONS", "1", 1);
+		udpc_config_init(&layer);
+		TAP_EQ_INT(udpc_config_from_env(&layer, &err), 0,
+		           "UDPCHAINS_ALLOW_RESOLVER_DAEMONS is read");
+		TAP_OK(layer.allow_resolver_daemons, "and allows them");
+		udpc_config_merge(&cfg, &layer);
+		TAP_OK(cfg.allow_resolver_daemons, "a layer that sets it overrides the default");
+		udpc_config_set(&cfg, "proxy", "127.0.0.1:1080", &err);
+		udpc_config_finalize(&cfg, &err);
+		udpc_config_export(&cfg);
+		TAP_OK(getenv("UDPCHAINS_ALLOW_RESOLVER_DAEMONS") == NULL,
+		       "the export does not pass it on to the program");
+	}
+
 	{
 		char cmd[600];
 		snprintf(cmd, sizeof(cmd), "rm -rf %s", g_tmpdir);

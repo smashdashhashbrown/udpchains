@@ -723,7 +723,7 @@ Linked into the wrapper only, never into the shim:
 | `svtrace.c` | the program's threads under `ptrace`: each stop, the native wait of a receive, signals handed back, group-stops (D-54) |
 | `svcall.c` | answering each call, notified or traced: `socket()`, sends, receives, names, the `dup` family, refusals |
 | `svsock.c` | the sockets the supervisor carries, their associations, and the sweep for closed ones |
-| `svdns.c` | which addresses are the system resolver: loopback, and `/etc/resolv.conf`'s nameservers (D-52) |
+| `svdns.c` | which addresses are the system resolver: loopback, and `/etc/resolv.conf`'s nameservers (D-52); which Unix sockets are a resolver daemon's (D-55) |
 | `svint.h` | what the four share |
 
 The supervisor reuses the SOCKS5 client and chain codec (`socks5.c`), and the datagram rules both
@@ -909,6 +909,11 @@ with the socket. With `dns` unset the send fails with `ENETUNREACH`.
   signal does the same, and the call is made again (D-54). A socket in any other state goes to the
   kernel. A stream socket that is not TCP is refused with `ECONNREFUSED`; with `dns` unset,
   `ENETUNREACH`.
+- Also in `decide_other`, a `connect()` whose address `svdns_resolver_daemon()` says is a resolver
+  daemon's socket (systemd-resolved, nscd, avahi, under `/run` or `/var/run`) is refused with
+  `ECONNREFUSED` unless `allow_resolver_daemons` is set (D-55), so the lookup falls through to DNS.
+  The address is read from the program's memory, at most a `sockaddr_un`. A warning the first time
+  in a run, then debug lines.
 
 ### 13.6 Exit and signals
 
@@ -973,7 +978,10 @@ with the socket. With `dns` unset the send fails with `ENETUNREACH`.
   showing the redirected queries arrived, by UDP and by TCP, and the one to port 53 elsewhere did
   not. The same probe through a chain of two, whose second hop logs the `CONNECT`s;
   `dnsrefused`, through a proxy that refuses `CONNECT`, with no TCP query reaching `dnsd`; and
-  `tcpabandon`, a signal during the tunnel's setup with the silent proxy. A static Go client
+  `tcpabandon`, a signal during the tunnel's setup with the silent proxy. `daemons`, each
+  resolver daemon's socket refused (D-55), and with `allow_resolver_daemons` each connect as
+  unsupervised; where avahi answers `.local` names, `getent ahostsv4 nss.local` finding `dnsd`'s
+  answer only when refused. A static Go client
   (`tests/goclient`, built when Go is installed), its own resolver included, by UDP and by TCP.
 - `make interop`: the static matrix, fidelity, DNS and Go programs supervised, through each of the
   seven proxies.
