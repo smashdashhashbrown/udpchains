@@ -21,7 +21,7 @@ None found.
 
 ## High
 
-- [ ] **H5** — *Reproduced.* A carried UDP socket received below the range, over `SCM_RIGHTS`, is
+- [x] **H5** — *Reproduced.* A carried UDP socket received below the range, over `SCM_RIGHTS`, is
   carried for `sendto`, `sendmsg`, `sendmmsg` and `connect`, which are trapped on every
   descriptor, but not for `recvfrom`, `recv`, `recvmsg`, `recvmmsg`, `read`, `readv`, `write` or
   `splice`, which are trapped only in the range. A static program that passed its own socket to
@@ -37,20 +37,20 @@ None found.
   *Suggested:* refuse every call but `close`, `getsockname` and `getpeername` on a carried
   socket below the range with `EPERM`, as FR-SV-18 does for a socket the supervisor did not make,
   and add the case to `test_supervise received`.
-  **Fixed, not yet committed:** refused at the pass instead (D-50 amended): a `sendmsg` or
+  **Fixed (6570c74):** refused at the pass instead (D-50 amended): a `sendmsg` or
   `sendmmsg` passing a carried socket over `SCM_RIGHTS` fails with `EPERM`; a carried socket
   below the range by any other route is refused too. New probe `test_supervise passing`.
 
 ## Medium
 
-- [ ] **M11** — *Reproduced.* A TCP query to the system resolver sent with
+- [x] **M11** — *Reproduced.* A TCP query to the system resolver sent with
   `sendmmsg(..., MSG_FASTOPEN)` reaches it directly. `decide_other` checks only `connect`,
   `sendto` and `sendmsg` (`src/svcall.c:1540`, `stream_to_system_resolver` at `:1349`). A
   static probe supervised with `dns` unset sent a TCP query for `example.com` to
   `127.0.0.53:53` by `sendmmsg`, was connected to `127.0.0.53:53`, and got a 63-byte answer
   from systemd-resolved, which resolved it outside the proxy. FR-SV-12 (M): "never made
   directly". The call is unusual, but closing the gap means adding one case.
-  **Fixed, not yet committed:** `sendmmsg` is checked and carried as `sendmsg` is (D-52); tested
+  **Fixed (6570c74):** `sendmmsg` is checked and carried as `sendmsg` is (D-52); tested
   in the `dns` and `nodns` probes.
 - [ ] **M12** — *Reproduced.* Every `read`, `write`, `readv`, `writev`, `close`, `bind` and
   name call on any descriptor at 768 and up is traced, whatever it is (`g_in_range`,
@@ -131,8 +131,8 @@ None found.
   too", is not true of stdio (`fdopen`), which the shim refuses and the supervisor carries, nor,
   per L8, of protocols other than UDP.
 - [ ] **D9** — The decision index at the top of `DECISIONS.md` stops at D-54; D-55 is missing.
-- [ ] **D10** — `docs/TRACEABILITY.md`: the TST-02 row says 71 symbol checks; the run, and the
-  paragraph above the table, say 91. **Fixed, not yet committed,** with the totals regenerated
+- [x] **D10** — `docs/TRACEABILITY.md`: the TST-02 row says 71 symbol checks; the run, and the
+  paragraph above the table, say 91. **Fixed (6570c74),** with the totals regenerated
   for H5 and M11.
 - [ ] **D11** — The man page's EXIT STATUS lists only 0, 1, 126 and 127. It does not say that
   otherwise `udpchains` exits with the program's status, or, supervised, dies of the signal that
