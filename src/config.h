@@ -186,6 +186,11 @@ int udpc_config_load_layers(struct udpc_config *cfg, const char *cli_path,
  * shim inherits it without re-parsing.  Used by the wrapper before exec. */
 int udpc_config_export(const struct udpc_config *cfg);
 
+/* Removes the settings that are the wrapper's alone (D-49, D-55) from the
+ * environment.  udpc_config_export does this too; a supervised program, which
+ * is given nothing else, has only this (release review L14). */
+void udpc_config_hide_wrapper_settings(void);
+
 /* Loads configuration inside the shim.  Launched by the wrapper -- which sets
  * UDPCHAINS_RESOLVED -- only the environment is read; under a bare LD_PRELOAD
  * the config files are read too (D-27).  Returns 0 on success. */

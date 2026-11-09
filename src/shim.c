@@ -55,11 +55,6 @@ const struct udpc_config *udpc_shim_config(void)
 	return &g_cfg;
 }
 
-bool udpc_shim_ready(void)
-{
-	return udpc_shim_config() != NULL;
-}
-
 int udpc_shim_failure_errno(void)
 {
 	/* The shim is loaded but cannot reach a proxy configuration.  The

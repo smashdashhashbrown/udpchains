@@ -40,7 +40,7 @@ struct sv_sock {
 	struct udpc_socks_chain chain;
 	long last_used;      /* CLOCK_MONOTONIC seconds, for FR-P-08 */
 
-	bool dns_redirected; /* its last query to the system resolver went to dns */
+	bool dns_redirected; /* its last send to dns was a query to the system resolver */
 	struct sockaddr_storage dns_asked; /* that query's address, its reply's sender */
 
 	bool seen;           /* by the sweep in progress */

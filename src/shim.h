@@ -19,10 +19,6 @@
  * if configuration failed, in which case the caller must fail closed. */
 const struct udpc_config *udpc_shim_config(void);
 
-/* True when the shim is configured and may intercept.  False means every
- * intercepted call fails closed. */
-bool udpc_shim_ready(void);
-
 /* errno to report when the shim is unusable.  Kept in one place so the failure
  * is consistent across every hooked entry point. */
 int udpc_shim_failure_errno(void);

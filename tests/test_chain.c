@@ -215,6 +215,23 @@ static bool same_addr(const struct sockaddr_storage *a,
 	                       (const struct sockaddr *)&y);
 }
 
+/* A layer naming a relay known by name, ATYP 0x03 (RFC 1928 section 7),
+ * built here rather than by the code under test. */
+static ssize_t named_layer(uint8_t *buf, size_t buflen, const char *host, uint16_t port)
+{
+	size_t hlen = strlen(host);
+
+	if (hlen > 255 || buflen < 7 + hlen)
+		return -1;
+	buf[0] = buf[1] = buf[2] = 0;
+	buf[3] = UDPC_ATYP_DOMAIN;
+	buf[4] = (uint8_t)hlen;
+	memcpy(buf + 5, host, hlen);
+	buf[5 + hlen] = (uint8_t)(port >> 8);
+	buf[6 + hlen] = (uint8_t)port;
+	return (ssize_t)(7 + hlen);
+}
+
 /* Wraps payload in one header per hop -- the target innermost, then each
  * later hop's relay outwards -- sends it to hop 1's relay, and unwraps the
  * echo, checking every layer's source: the relay of the next hop (its port
@@ -237,8 +254,7 @@ static int round_trip(const struct udpc_socks_chain *ch,
 	for (k = 1; k < ch->n; k++) {
 		const struct udpc_socks_addr *r = &ch->relay[k];
 
-		n = r->named ? udpc_socks_encode_domain(pkt + off, sizeof(pkt) - off,
-		                                        r->host, r->port)
+		n = r->named ? named_layer(pkt + off, sizeof(pkt) - off, r->host, r->port)
 		             : udpc_socks_encode(pkt + off, sizeof(pkt) - off,
 		                                 (const struct sockaddr *)&r->sa);
 		if (n < 0)
@@ -837,7 +853,6 @@ int main(int argc, char **argv)
 	TAP_GROUP("FR-CH-01: a chain of one is 0.1.0's association");
 	{
 		const char *const one[] = { a };
-		struct udpc_socks_conn conn;
 
 		cfg = chain_cfg(one, 1);
 		e = 0;
@@ -849,12 +864,6 @@ int main(int argc, char **argv)
 		TAP_EQ_INT(round_trip(&ch, (struct sockaddr *)&echo_sa), 1,
 		           "a datagram goes to the target and back");
 
-		TAP_EQ_INT(udpc_socks_associate(cfg, NULL, &conn, &e), 0,
-		           "udpc_socks_associate still associates");
-		TAP_OK(conn.relay.ss_family == ch.relay[0].sa.ss_family &&
-		       udpc_addr_is_loopback((struct sockaddr *)&conn.relay),
-		       "with a relay of the same form");
-		udpc_socks_disconnect(&conn);
 		udpc_socks_disconnect_chain(&ch);
 		TAP_OK(chain_is_empty(&ch), "disconnecting empties the chain");
 
@@ -872,22 +881,6 @@ int main(int argc, char **argv)
 			TAP_EQ_INT(e, ECONNREFUSED, "with ECONNREFUSED");
 			TAP_EQ_STR(g_stderr, "", "and no hop is named");
 		}
-	}
-
-	/* ------------------------------------------------------------------ */
-	TAP_GROUP("D-37: udpc_socks_associate never runs a chain as its first hop");
-	{
-		const char *const two[] = { a, c };
-		struct udpc_socks_conn conn;
-
-		cfg = chain_cfg(two, 2);
-		before = lowest_free_fd();
-		e = 0;
-		TAP_EQ_INT(udpc_socks_associate(cfg, NULL, &conn, &e), -1,
-		           "given a chain of two, it fails");
-		TAP_EQ_INT(e, EINVAL, "with EINVAL");
-		TAP_EQ_INT(conn.control_fd, -1, "with no control connection");
-		TAP_EQ_INT(lowest_free_fd(), before, "and nothing opened");
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -1274,11 +1267,10 @@ int main(int argc, char **argv)
 		TAP_OK(!udpc_socks_chain_alive(&ch),
 		       "once hop 2 expires it, the chain is not alive");
 		{
-			struct udpc_socks_conn first;
+			struct pollfd p = { ch.control_fd[0], POLLIN, 0 };
 
-			first.control_fd = ch.control_fd[0];
-			TAP_OK(udpc_socks_control_alive(&first),
-			       "although hop 1's own association is still up");
+			TAP_EQ_INT(poll(&p, 1, 0), 0,
+			           "although hop 1's own control connection is still open");
 		}
 		udpc_socks_disconnect_chain(&ch);
 		TAP_OK(!udpc_socks_chain_alive(&ch), "an empty chain is not alive");

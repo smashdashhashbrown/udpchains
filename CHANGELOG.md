@@ -30,7 +30,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     waits in the program's own kernel, so `SO_RCVTIMEO`, `EINTR` and `SA_RESTART` behave exactly
     as natively. A signal arriving while an association is set up is handled at once, one sent
     to `udpchains` included (release review M14). If
-    `udpchains` is killed, so is the program.
+    `udpchains` is killed, so is the program. Once the program has exited, a signal sent to
+    `udpchains` goes to the descendants it left running, which `udpchains` stays for; before, it
+    was dropped, and only `SIGKILL` ended them (release review L9).
   - **Threads, `fork`, `vfork`, `clone` and `exec`** (step 5): followed and tested. A thread with
     a descriptor table of its own is reached through a thread pidfd (Linux 6.9), and the sweep
     for closed sockets reads its table too; an `exec` prompts a sweep. Fixed: a traced program
@@ -40,7 +42,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     install a descriptor, with the thread's signals blocked meanwhile. So `socket()`, `dup`,
     `close_range` and TCP sends no longer fail with `EINTR` under signals, and an interrupted
     `close_range` no longer leaves descriptors open.
-  - **Refused, as decided:** raw, packet, ICMP and UDP-Lite sockets; `io_uring_setup`;
+  - **Refused, as decided:** raw and packet sockets, and datagram sockets for any IP protocol but
+    UDP, as the shim refuses them (before the release review, L8, only ICMP and UDP-Lite were, and
+    another protocol, L2TP/IP say, was handled as UDP); `io_uring_setup`;
     `pidfd_getfd`; sends, connects, `sendfile` and `splice` on a UDP socket received from another
     process; `dup2` of a carried socket below the range; passing a carried socket to another
     process over `SCM_RIGHTS`, where its receives would have returned its headers as data
@@ -69,6 +73,11 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     longer kills it and the program with it. The program keeps its own disposition.
   - **Tested** with a static Go client, through the seven interop proxies, and in `make compare`,
     where supervisor mode carried every combination and the static Go binary through the proxy.
+  - **The program is given none of the configuration** in its environment, which the supervisor
+    alone uses (release review L14); before, it had the shim's variables, the proxy and the
+    credentials' locations among them.
+  - **A query to `dns` by its own address** is reported as from `dns`, on a socket that asked the
+    system resolver before (release review L15).
   - **Documented** in the README, the man page and `udpchains -h`, with the limits of each mode.
   - **Lookups handed to a resolver daemon** (D-55): under supervision, a connection to
     systemd-resolved's, nscd's or avahi's socket is refused, as when the daemon is not running, so
@@ -87,16 +96,22 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 - **Documented:** in supervisor mode, every read, write and close on a descriptor at 768 and up
   costs a round trip to the supervisor, files and TCP included, about 40 µs against about 1 µs
   (release review M12).
+- **The shim's `sendmmsg` sends at most 1024 messages a call,** as the kernel does (release
+  review L13). Its `recvmmsg` was right already: the kernel does not cap it.
+- **Removed unused code** (release review L12): `udpc_shim_ready()`, and the single-hop
+  `udpc_socks_associate`, `udpc_socks_disconnect`, `udpc_socks_control_alive` and
+  `udpc_socks_encode_domain`, which only the unit tests called; their tests now use the chain
+  functions, ATYP 0x03 included.
 - The checks both front ends apply to a datagram (multicast and broadcast, `MSG_MORE`, GSO, the
   loopback guard, and a received datagram's headers) moved from the shim's `core.c`, `assoc.c`
   and `hooks.c` into `dgram.c`, unchanged, so the supervisor applies the same ones.
 
 ### Verification
 
-- 2350 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
-  unit-config, `FR-SV-supervise` (70 checks, with static programs making 25, 4, 18, 6, 37, 4, 24,
-  29, 2, 4, 29, 5, 7, 5, 10 and 18 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
-  through two hops), and the fidelity test built `-static` under it (172). The supervisor also
+- 2361 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
+  unit-config, `FR-SV-supervise` (75 checks, with static programs making 25, 4, 19, 6, 37, 4, 24,
+  31, 2, 4, 31, 5, 7, 5, 10 and 18 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
+  through two hops), and the fidelity test built `-static` under it (175). The supervisor also
   runs under ASan and UBSan, with the static matrix and fidelity tests.
 
 ## [0.2.0] — 2026-10-21

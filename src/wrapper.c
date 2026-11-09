@@ -525,13 +525,10 @@ int main(int argc, char **argv)
 			        strerror(errno), argv[i]);
 			return 1;
 		}
-		if (udpc_config_export(&cfg) != 0) {
-			fprintf(stderr, "udpchains: cannot set up the environment: %s\n",
-			        strerror(errno));
-			return 1;
-		}
-		/* The supervisor keeps the password: it, not the program,
-		 * speaks to the proxy. */
+		/* The supervisor, not the program, speaks to the proxy, and
+		 * keeps the configuration and the password: the program is
+		 * given none of it (release review L14). */
+		udpc_config_hide_wrapper_settings();
 		explicit_bzero(cli.password, sizeof(cli.password));
 		return udpc_supervise(&cfg, program, &argv[i]);
 	}

@@ -2024,6 +2024,12 @@ program.
 **Known limitation.** A user must know to ask: a static or Go program run without `--supervise`
 still sends directly, as in 0.2.0, which the README already says.
 
+**Amended in the release review** (2026-10-27, L14): a supervised program is given none of the
+configuration. The shim's variables (`UDPCHAINS_PROXY`, the credentials' locations and the rest)
+were exported to it as to a program under the shim, though the supervisor, not the program,
+speaks to the proxy. Only the wrapper's own settings are still removed, as before. Variables the
+user set are left as they were, as a program run without `udpchains` would see them.
+
 **Built in step 3** (2026-10-22): an inherited `LD_PRELOAD` naming `libudpchains.so` has already
 loaded the shim into `udpchains` itself by the time it reads its configuration. There the shim
 would wrap the supervisor's own datagrams a second time. So `udpchains` removes the shim from
@@ -2356,6 +2362,10 @@ address, not this host's.
   resolver that knows them and that the proxy can reach.
 - **DNS over TCP to other servers, DNS over TLS and DNS over HTTPS** are TCP, which udpchains does
   not proxy (§8), in either mode.
+- **One socket asking both the system resolver and `dns` by its own address,** with replies from
+  both in flight, has `dns`'s replies reported as from whichever it asked last. A send to `dns`
+  itself ends the relabelling until the next query to the system resolver (release review L15);
+  before, it lasted for the socket's life. glibc's resolver opens a socket for each lookup.
 
 **Built in step 6** (2026-10-23), as decided:
 
@@ -2454,8 +2464,11 @@ this mode only).
   - `sendfile` and `splice` onto a UDP socket, with `EINVAL` (D-36, D-50).
   - `pidfd_getfd`, with `EPERM`: a copy of another process's descriptor would arrive outside the
     range.
-  - Raw and packet sockets with `EPERM` (D-36), and ICMP and UDP-Lite sockets with
-    `EPROTONOSUPPORT` (D-29), at `socket()`.
+  - Raw and packet sockets with `EPERM` (D-36), and datagram sockets for any IP protocol but
+    UDP, ICMP and UDP-Lite among them, with `EPROTONOSUPPORT` (D-29), at `socket()`. Until the
+    release review (L8) only ICMP, ICMPv6 and UDP-Lite were refused, and a datagram socket for
+    another protocol the kernel accepts was made and handled as UDP; the shim allowed only `0`
+    and `IPPROTO_UDP` from the start.
   - UDP sends and connects outside the range, with `EPERM` (D-50).
 - **The floor is Linux 5.14,** for `SECCOMP_ADDFD_FLAG_SEND`, which installs a socket and answers
   the call in one step so none is leaked into the program (5.9 for `ADDFD`, 5.6 for

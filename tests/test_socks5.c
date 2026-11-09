@@ -35,6 +35,23 @@ static void make_v6(struct sockaddr_in6 *sa, const char *ip, uint16_t port)
 	inet_pton(AF_INET6, ip, &sa->sin6_addr);
 }
 
+/* A datagram's headers through a chain of two whose second hop's relay is
+ * known by name: its layer is the ATYP 0x03 header (FR-P-07), the target's
+ * follows. */
+static ssize_t encode_named(uint8_t *buf, size_t buflen, const char *host, uint16_t port)
+{
+	struct udpc_socks_chain ch;
+	struct sockaddr_in dst;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.n = 2;
+	ch.relay[1].named = true;
+	snprintf(ch.relay[1].host, sizeof(ch.relay[1].host), "%s", host);
+	ch.relay[1].port = port;
+	make_v4(&dst, "127.0.0.1", 1);
+	return udpc_socks_encode_chain(buf, buflen, &ch, (struct sockaddr *)&dst, NULL);
+}
+
 int main(void)
 {
 	uint8_t buf[UDPC_SOCKS_HDR_MAX];
@@ -91,8 +108,9 @@ int main(void)
 	/* --- ATYP 0x03, domain (FR-P-07) --------------------------------- */
 	TAP_GROUP("ATYP 0x03 (domain)");
 	{
-		n = udpc_socks_encode_domain(buf, sizeof(buf), "example.com", 443);
-		TAP_EQ_INT(n, 7 + 11, "domain header is 7 + strlen bytes");
+		n = encode_named(buf, sizeof(buf), "example.com", 443);
+		TAP_EQ_INT(n, 7 + 11 + 10, "domain header is 7 + strlen bytes, before the "
+		                           "target's");
 		TAP_EQ_INT(buf[3], UDPC_ATYP_DOMAIN, "ATYP is 0x03");
 		TAP_EQ_INT(buf[4], 11, "length prefix is the domain length");
 		TAP_EQ_MEM(buf + 5, "example.com", 11, "domain bytes are verbatim");
@@ -110,12 +128,14 @@ int main(void)
 		 * UDPC_SOCKS_HDR_MAX. */
 		{
 			char big[256];
+			uint8_t wide[UDPC_SOCKS_HDR_MAX + 10];
+
 			memset(big, 'a', 255);
 			big[255] = '\0';
-			n = udpc_socks_encode_domain(buf, sizeof(buf), big, 1);
-			TAP_EQ_INT(n, UDPC_SOCKS_HDR_MAX,
+			n = encode_named(wide, sizeof(wide), big, 1);
+			TAP_EQ_INT(n, UDPC_SOCKS_HDR_MAX + 10,
 			           "255-byte domain fills the header exactly");
-			n = udpc_socks_decode(buf, UDPC_SOCKS_HDR_MAX, &hdr);
+			n = udpc_socks_decode(wide, UDPC_SOCKS_HDR_MAX, &hdr);
 			TAP_EQ_INT(n, UDPC_SOCKS_HDR_MAX,
 			           "255-byte domain decodes");
 			TAP_EQ_STR(hdr.domain, big, "255-byte domain round-trips");
@@ -229,7 +249,7 @@ int main(void)
 		           "IPv4 encode into 9 bytes fails");
 		TAP_EQ_INT(udpc_socks_encode(buf, 21, (struct sockaddr *)&sa6), -1,
 		           "IPv6 encode into 21 bytes fails");
-		TAP_EQ_INT(udpc_socks_encode_domain(buf, 10, "example.com", 1), -1,
+		TAP_EQ_INT(encode_named(buf, 10, "example.com", 1), -1,
 		           "domain encode into a short buffer fails");
 
 		memset(&weird, 0, sizeof(weird));
@@ -401,7 +421,7 @@ int main(void)
 		 * back as ECONNRESET rather than what SO_ERROR held (DESIGN.md
 		 * 6.4).  Found against real proxies, INTEROP-CHECKLIST 12. */
 		struct udpc_config cfg;
-		struct udpc_socks_conn conn;
+		struct udpc_socks_chain ch;
 		struct sockaddr_in held;
 		socklen_t hlen = sizeof(held);
 		int hold, e = 0;
@@ -417,7 +437,7 @@ int main(void)
 		memcpy(&cfg.proxy, &held, sizeof(held));
 		cfg.proxy_is_local = true;
 
-		TAP_EQ_INT(udpc_socks_associate(&cfg, NULL, &conn, &e), -1,
+		TAP_EQ_INT(udpc_socks_associate_chain(&cfg, NULL, &ch, &e), -1,
 		           "UDP ASSOCIATE to it fails");
 		TAP_EQ_INT(e, ECONNREFUSED, "with ECONNREFUSED, not ECONNRESET");
 

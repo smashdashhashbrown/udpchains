@@ -100,10 +100,15 @@ None found.
   protocol the kernel accepts (L2TP/IP, for one) is made and "carried" as if it were UDP. Nothing
   goes direct, but it fails strangely instead of with `EPROTONOSUPPORT`. DESIGN §13.5 describes
   the denylist.
+  **Fixed, not yet committed:** the supervisor allows only `0` and `IPPROTO_UDP`, as the shim does,
+  and names the protocol in its diagnostic. This host's kernel makes an L2TP/IP datagram socket
+  for an unprivileged program, so the new checks are not vacuous.
 - [ ] **L9** — *Reproduced.* Once the program has exited, a signal sent to `udpchains` by another
   process is no longer forwarded (`!sv->child_done`, `src/supervise.c:364`), yet the
   supervisor goes on waiting for the descendants left running. `udpchains --supervise sh -c
   'sleep 30 & exit 0'` was still running 2 s after `kill -TERM`; only `SIGKILL` ended it.
+  **Fixed, not yet committed:** once the program has gone, a forwarded signal goes to each process
+  the supervisor still traces, from M13's task table. That case now ends in about 330 ms.
 - [ ] **L10** — *Inspection.* On a full send buffer, `send_via` (`src/svcall.c:569`) blocks the
   whole supervisor for up to 1 s, then returns `EAGAIN` to a socket the program made blocking,
   which never returns `EAGAIN` natively.
@@ -115,25 +120,42 @@ None found.
   (`src/shim.c:58`) has had no caller since the first commit. `udpc_socks_associate`,
   `udpc_socks_disconnect`, `udpc_socks_control_alive` and `udpc_socks_encode_domain` are called
   only by the unit tests; production uses the chain versions.
+  **Fixed, not yet committed:** all five removed. Their tests use the chain functions, ATYP 0x03
+  through the chain encoder; the two that checked only the removed function (D-37's refusal of a
+  chain, and the single association's relay) went with it.
 - [ ] **L13** — *Inspection.* The shim's `sendmmsg` and `recvmmsg` (`src/hooks.c:853`, `:1012`) do
   not cap `vlen` at 1024 (`UIO_MAXIOV`) as the kernel does, so a blocking `recvmmsg` with a
   larger `vlen` waits for more datagrams than the kernel would return, and `sendmmsg` sends more
   than it would. The supervisor caps both (`MMSG_MAX`), so the two modes differ. FR-F-09:
   partial success "as the kernel does".
+  **Fixed, not yet committed, and half wrong:** measured natively, the kernel caps `sendmmsg` at
+  1024 but not `recvmmsg`, which returned all 1,100 datagrams queued. The shim's `sendmmsg` is now
+  capped and its `recvmmsg` left as it was. The supervisor keeps its `recvmmsg` cap, now with its
+  reason recorded: one call must not hold the supervisor while datagrams keep arriving, and
+  returning fewer than are queued is a result a program already handles.
 - [ ] **L14** — *Reproduced.* A supervised program is given the full shim environment
   (`udpc_config_export`, `src/wrapper.c:528`): `UDPCHAINS_PROXY`, `UDPCHAINS_USERNAME`, the
   password file's path (or `UDPCHAINS_PASSWORD_CONFIG`) and the rest. The supervisor, not the
   program, talks to the proxy, so none of it is needed. This is no worse than shim mode (D-25),
   but it is exposure that serves no purpose.
+  **Fixed, not yet committed:** a supervised program is given none of it; the wrapper's own
+  settings are still removed. Variables the user set are left alone.
 - [ ] **L15** — *Inspection.* `dns_redirected` (`src/svcall.c:669`) stays set on a socket for good.
   If the same socket later sends to the configured `dns` address itself, replies from it are
   relabelled as coming from the system resolver it once asked.
+  **Fixed, not yet committed:** a send to `dns` itself clears it. One socket asking both at once
+  remains ambiguous, recorded in D-52.
 - [ ] **L16** — *Inspection, not reproduced.* seccomp(2) ranks `SECCOMP_RET_USER_NOTIF` above
   `SECCOMP_RET_TRACE`. A supervised program that installs its own filter with a listener and
   answers with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` has those calls run without the supervisor
   seeing them. This is deliberate evasion, covered by "not a sandbox" (D-48), but a program that
   uses seccomp notification itself would bypass the supervisor without meaning to. Worth one line
   in the limitations.
+  **Not reproduced (2026-10-27):** a static probe under the supervisor installing its own filter
+  with `SECCOMP_FILTER_FLAG_NEW_LISTENER`, to answer `sendto` with `CONTINUE`, was refused with
+  `EBUSY`: seccomp(2) allows one listener in a filter chain, and the supervisor's filter has it.
+  The `sendto` then failed closed (`ECONNREFUSED`, the proxy down) and nothing arrived. A
+  supervised program holds no listener descriptor of its own (`/proc/self/fd`). No change made.
 - [x] **L17** — *Inspection.* Test harness:
   - 37 supervised runs in the test scripts use `timeout` without `-k`, which CLAUDE.md asks for
     because the supervisor passes `SIGTERM` on to its program;

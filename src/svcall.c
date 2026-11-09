@@ -59,8 +59,11 @@
 #define IOV_MAX 1024
 #endif
 
-/* The calls sendmmsg and recvmmsg take at most this many messages, as the
- * kernel caps them (UIO_MAXIOV). */
+/* sendmmsg sends at most this many messages, as the kernel caps it
+ * (UIO_MAXIOV).  The kernel does not cap recvmmsg, but it is capped here so
+ * that one call cannot hold the supervisor while datagrams keep arriving: the
+ * program has the rest from its next call, as if they had arrived later
+ * (release review L13). */
 #define MMSG_MAX 1024
 
 /* Control data read from a send, to look for UDP_SEGMENT; more than this is
@@ -128,7 +131,7 @@ static enum sv_outcome let_through(struct call *c)
 /* D-33: once a second for each reason, so that one kind of refusal never hides
  * another: a refused raw socket does not silence a refused io_uring. */
 enum {
-	WHY_RAW, WHY_ICMP, WHY_URING, WHY_PIDFD, WHY_UNKNOWN_FD, WHY_RECEIVED_FD,
+	WHY_RAW, WHY_NOT_UDP, WHY_URING, WHY_PIDFD, WHY_UNKNOWN_FD, WHY_RECEIVED_FD,
 	WHY_DUP_OUT, WHY_NOT_INSPECTABLE, WHY_OWN_TABLE, WHY_NO_DNS, WHY_DNS_TCP,
 	WHY_PASS_CARRIED, WHY_CARRIED_BELOW, WHY_COUNT
 };
@@ -676,6 +679,11 @@ static int send_one(struct call *c, struct sv_sock *s, int copy, int fd,
 		s->dns_asked = dst;
 		s->dns_redirected = true;
 		dst = c->sv->cfg->dns;
+	} else if (c->sv->cfg->dns_set &&
+	           svdns_same((const struct sockaddr *)&dst,
+	                      (const struct sockaddr *)&c->sv->cfg->dns)) {
+		/* Sent to dns itself: its replies are its own again. */
+		s->dns_redirected = false;
 	}
 
 	/* FR-F-07 / D-12: the limit is configured; above it is EMSGSIZE, never
@@ -1262,10 +1270,14 @@ static enum sv_outcome decide_socket(struct call *c)
 		refused(c, WHY_RAW, "raw and packet sockets cannot be carried by SOCKS5 (D-36)");
 		return answer(c, 0, EPERM);
 	}
-	if (kind == SOCK_DGRAM && (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6 ||
-	                           proto == IPPROTO_UDPLITE)) {
-		refused(c, WHY_ICMP, "ICMP and UDP-Lite sockets cannot be carried by SOCKS5 "
-		                     "(D-29)");
+	/* D-29, as in the shim: a datagram socket for any IP protocol but UDP
+	 * -- ICMP, UDP-Lite, L2TP -- carries what SOCKS5 cannot relay. */
+	if (kind == SOCK_DGRAM && proto != 0 && proto != IPPROTO_UDP) {
+		char why[96];
+
+		snprintf(why, sizeof(why), "a datagram socket for IP protocol %d: SOCKS5 "
+		                           "carries only UDP (D-29)", proto);
+		refused(c, WHY_NOT_UDP, why);
 		return answer(c, 0, EPROTONOSUPPORT);
 	}
 	if (kind != SOCK_DGRAM)

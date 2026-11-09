@@ -379,6 +379,28 @@ static void t_mmsg(void)
 	close(fd);
 }
 
+/* The kernel sends at most UIO_MAXIOV (1024) messages a sendmmsg (release
+ * review L13). */
+static void t_mmsg_cap(void)
+{
+	static struct mmsghdr m[1025];
+	char payload[] = "cap";
+	struct iovec iov = { payload, 3 };
+	int fd = udp4(), i;
+
+	TAP_GROUP("FR-F-09: sendmmsg sends at most 1024 messages, as the kernel does");
+	memset(m, 0, sizeof(m));
+	for (i = 0; i < 1025; i++) {
+		m[i].msg_hdr.msg_name = &g_echo1;
+		m[i].msg_hdr.msg_namelen = sizeof(g_echo1);
+		m[i].msg_hdr.msg_iov = &iov;
+		m[i].msg_hdr.msg_iovlen = 1;
+	}
+	TAP_EQ_INT(sendmmsg(fd, m, 1025, 0), 1024, "sendmmsg of 1025 returns 1024");
+	TAP_EQ_INT(m[1024].msg_len, 0, "and the 1025th was not sent");
+	close(fd);
+}
+
 static void t_scatter_gather(void)
 {
 	int fd = udp4();
@@ -820,6 +842,11 @@ static void t_non_udp_refused(void)
 	errno = 0;
 	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDPLITE);
 	TAP_OK(fd < 0 && errno == EPROTONOSUPPORT, "and a UDP-Lite one");
+	/* One the kernel makes for an unprivileged program, where its module
+	 * is loaded: supervised, it was carried as UDP (release review L8). */
+	errno = 0;
+	fd = socket(AF_INET, SOCK_DGRAM, 115 /* L2TP/IP */);
+	TAP_OK(fd < 0 && errno == EPROTONOSUPPORT, "and one for any other IP protocol, L2TP/IP");
 
 	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	TAP_OK(fd >= 0, "IPPROTO_UDP named explicitly is still accepted");
@@ -1167,6 +1194,7 @@ int main(int argc, char **argv)
 	t_emsgsize();
 	t_connect_semantics();
 	t_mmsg();
+	t_mmsg_cap();
 	t_scatter_gather();
 	t_ancillary();
 	t_getsockname();

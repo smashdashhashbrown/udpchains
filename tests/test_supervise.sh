@@ -232,12 +232,48 @@ elapsed=$((($(date +%s%N) - start) / 1000000))
 check "and the descendant was supervised" "$(cat "$TMP/late" 2> /dev/null)" \
 	"$(printf 'Seccomp:\t2')"
 
+echo "# then a signal sent to udpchains reaches those descendants (release review L9)"
+start=$(date +%s%N)
+"${SV[@]}" sh -c 'sleep 30 & echo $! > "$0"' "$TMP/left.pid" 2> /dev/null &
+pid=$!
+(sleep 20; kill -KILL "$pid") 2> /dev/null &
+dog=$!
+for ((i = 0; i < 100; i++)); do
+	[ -s "$TMP/left.pid" ] && break
+	sleep 0.02
+done
+sleep 0.3 # the shell has exited; its sleep is left running
+kill -TERM "$pid"
+wait "$pid"
+rc=$?
+kill "$dog" 2> /dev/null
+elapsed=$((($(date +%s%N) - start) / 1000000))
+check "udpchains still exits with the program's status" "$rc" 0
+[ "$elapsed" -lt 2000 ] && ok "SIGTERM ended the descendant at once (${elapsed} ms)" ||
+	notok "udpchains ran on for ${elapsed} ms after SIGTERM"
+left=$(cat "$TMP/left.pid" 2> /dev/null)
+[ -n "$left" ] && ! kill -0 "$left" 2> /dev/null && ok "and the descendant has gone" ||
+	notok "the descendant (${left:-no pid}) is still running"
+
+echo "# the program is given none of the configuration (release review L14)"
+printf 'secret\n' > "$TMP/l14.pw"
+chmod 600 "$TMP/l14.pw"
+printf 'proxy = 127.0.0.1:%s\nusername = alice\npassword_file = %s\n' "$PROXY" \
+	"$TMP/l14.pw" > "$TMP/l14.conf"
+chmod 600 "$TMP/l14.conf"
+out=$(env -i PATH="$PATH" UDPCHAINS_SUPERVISE=1 timeout -k 5 30 "$W" -f "$TMP/l14.conf" \
+	env 2> /dev/null)
+rc=$?
+check "a supervised env(1) runs, and sees PATH" "$rc:$(grep -c '^PATH=' <<< "$out")" "0:1"
+check "and no UDPCHAINS_ variable: no proxy, username or password file" \
+	"$(grep '^UDPCHAINS_' <<< "$out" | tr '\n' ' ')" ""
+
 echo "# a static program: refusals, and what still runs (D-48, D-50, D-53)"
 timeout -k 5 30 "${SV[@]}" "$P" refusals "$PROXY" > "$TMP/refusals.tap" 2> "$TMP/refusals.err"
 rc=$?
 sed 's/^/#   /' "$TMP/refusals.tap"
 check "test_supervise refusals passes, -static" "$rc" 0
-for what in "ICMP" "raw and packet" "io_uring" "pidfd_getfd"; do
+for what in "IP protocol 115" "raw and packet" "io_uring" "pidfd_getfd"; do
 	grep -q "$what" "$TMP/refusals.err" && ok "a diagnostic for $what, not hidden by another" ||
 		notok "no diagnostic mentioning $what"
 done

@@ -861,6 +861,10 @@ int sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
 		errno = EFAULT;
 		return -1;
 	}
+	/* The kernel sends at most UIO_MAXIOV messages a call, IOV_MAX here
+	 * (release review L13).  It does not cap recvmmsg. */
+	if (vlen > IOV_MAX)
+		vlen = IOV_MAX;
 
 	/* FR-F-09: each message is handled independently and partial success is
 	 * reported as the kernel does -- if message k fails after k succeeded,

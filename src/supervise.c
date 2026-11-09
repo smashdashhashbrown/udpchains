@@ -352,8 +352,28 @@ static const int g_forwarded[] = {
 
 static void forward(const struct sv *sv, int signo, int code)
 {
-	if (code <= 0 && !sv->child_done)
+	struct sv_task *t;
+	size_t n, i, j;
+
+	if (code > 0)
+		return;
+	if (!sv->child_done) {
 		kill(sv->child, signo);
+		return;
+	}
+	/* The program has gone, and the supervisor stays for the descendants
+	 * it left running (FR-SV-11): they have the signal instead, each
+	 * process once (release review L9). */
+	t = svtrace_tasks(&n);
+	if (t == NULL)
+		return;
+	for (i = 0; i < n; i++) {
+		for (j = 0; j < i && t[j].tgid != t[i].tgid; j++)
+			;
+		if (j == i)
+			kill(t[i].tgid, signo);
+	}
+	free(t);
 }
 
 bool sv_forward_pending(struct sv *sv)

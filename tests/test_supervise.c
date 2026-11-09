@@ -171,6 +171,10 @@ static int refusals(int tcp_port)
 
 	TAP_GROUP("sockets SOCKS5 cannot carry are refused (D-29, D-36)");
 	errno = 0;
+	/* First, so that its diagnostic is the one shown (D-33). */
+	TAP_OK(fails_with(socket(AF_INET, SOCK_DGRAM, 115 /* L2TP/IP */), EPROTONOSUPPORT),
+	       "an L2TP/IP datagram socket: EPROTONOSUPPORT (%s)", strerror(errno));
+	errno = 0;
 	TAP_OK(fails_with(socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP), EPROTONOSUPPORT),
 	       "an ICMP datagram socket: EPROTONOSUPPORT (%s)", strerror(errno));
 	TAP_OK(fails_with(socket(AF_INET, SOCK_RAW, IPPROTO_UDP), EPERM),
@@ -1367,6 +1371,31 @@ static int dns(int dnsd_port)
 	TAP_OK(getpeername(fd, (struct sockaddr *)&peer, &plen) == 0 &&
 	               memcmp(&peer, &to, len_of(&to)) == 0,
 	       "getpeername() still says 127.0.0.53:53");
+	close(fd);
+
+	/* Release review L15: dns asked by its own address, on a socket that
+	 * once asked the system resolver, answers as itself. */
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	qn = dns_query(q, 0x1205, "a.test");
+	n = sendto(fd, q, qn, 0, (struct sockaddr *)&to, len_of(&to)) == (ssize_t)qn
+	            ? recv(fd, r, sizeof(r), 0) : -1;
+	TAP_OK(dns_answers(r, n, 0x1205, "192.0.2.1"), "a socket asks 127.0.0.53:53");
+	{
+		struct sockaddr_in from;
+		socklen_t flen = sizeof(from);
+
+		qn = dns_query(q, 0x1206, "a.test");
+		n = sendto(fd, q, qn, 0, (struct sockaddr *)&direct, sizeof(direct)) ==
+		                    (ssize_t)qn
+		            ? recvfrom(fd, r, sizeof(r), 0, (struct sockaddr *)&from, &flen)
+		            : -1;
+		TAP_OK(dns_answers(r, n, 0x1206, "192.0.2.1") && flen == sizeof(direct) &&
+		               from.sin_addr.s_addr == direct.sin_addr.s_addr &&
+		               from.sin_port == direct.sin_port,
+		       "then asks dns at its own address: the answer is reported from there, "
+		       "not from 127.0.0.53");
+	}
 	close(fd);
 
 	memset(&hints, 0, sizeof(hints));

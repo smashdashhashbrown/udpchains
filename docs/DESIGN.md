@@ -877,8 +877,9 @@ to the supervisor itself, which the loop cannot read until the setup ends, is ta
 (`sv_forward_pending`, `sigtimedwait` with no wait) and passed on to the program as the loop
 would pass it, so that it too abandons the setup (release review M14).
 
-- **`socket()`:** raw and packet sockets `EPERM`, ICMP and UDP-Lite `EPROTONOSUPPORT`; UDP as
-  above; anything else continues. Its arguments are values, so continuing cannot be raced.
+- **`socket()`:** raw and packet sockets `EPERM`; a datagram socket for any IP protocol but UDP
+  (ICMP, UDP-Lite) `EPROTONOSUPPORT`, as in the shim (release review L8); UDP as above; anything
+  else continues. Its arguments are values, so continuing cannot be raced.
 - **Sends** on a carried socket: the message header, iovecs, address and control data are read
   with `process_vm_readv`, checked as in shim mode (`EMSGSIZE`, `EDESTADDRREQ`, multicast,
   `MSG_MORE`, GSO), wrapped, and sent on the supervisor's copy to the relay, never blocking the
@@ -956,7 +957,8 @@ with the socket. With `dns` unset the send fails with `ENETUNREACH`.
   instead of killing both.
 - **Descendants.** The supervisor is a child subreaper, so a descendant the program leaves running
   becomes its child, and stays supervised. It serves until the listener reports end of file, or
-  no child is left.
+  no child is left. Once the program has gone, a signal forwarded as above goes to each process
+  it still traces instead, once each (release review L9).
 - **Status.** It exits with the program's status; if the program was killed by a signal, the
   supervisor dies of the same one, with core dumps off, so a shell sees what it would have seen.
   Waiting for that status, it reaps every traced thread (`waitpid(-1, __WALL)`), since a traced

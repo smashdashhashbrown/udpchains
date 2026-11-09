@@ -361,6 +361,10 @@ or
 .BR UDPCHAINS_SUPERVISE=1 ,
 .B udpchains
 stays running as the program's parent, the supervisor.
+It passes on the signals sent to it, exits with the program's status, and stays
+for any descendant the program leaves running, which is supervised too and is
+sent those signals once the program has gone.
+The program is given none of the configuration in its environment.
 The program runs under a
 .BR seccomp (2)
 filter, and the supervisor, attached as its tracer with
@@ -504,10 +508,7 @@ another thread, open one at the number a new UDP socket is about to be given,
 in the instant before it is; that descriptor would be replaced.
 Stdio on a UDP socket
 .RB ( fdopen (3)),
-which the shim refuses, is carried, and a datagram socket for an IP protocol
-other than UDP, ICMP and UDP\-Lite, which the shim refuses, is made and handled
-as UDP: what it sends goes to the proxy's relay in that protocol, and arrives
-nowhere.
+which the shim refuses, is carried.
 .SH EXIT STATUS
 .TP
 .B 0

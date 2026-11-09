@@ -293,8 +293,12 @@ other, under a supervisor instead:
 UDPCHAINS_DNS=9.9.9.9 udpchains --supervise -p 127.0.0.1:1080 ./static-client
 ```
 
-- **It is never chosen automatically.** The same configuration, chains and credentials apply, and
-  the program is not given the shim.
+- **It is never chosen automatically.** The same configuration, chains and credentials apply. The
+  program is not given the shim, nor any of the configuration in its environment: `udpchains`,
+  not the program, speaks to the proxy.
+- **Signals and exit:** a signal sent to `udpchains` is passed to the program, and `udpchains`
+  exits with the program's status. It stays for any descendant the program leaves running, which
+  is supervised too, and passes such signals to those descendants once the program has gone.
 - **Requirements:** Linux 5.14 or later, x86-64, Yama `ptrace_scope` of 1 or less (the default),
   a container runtime that allows a seccomp filter and `ptrace`, and a program not already being
   traced. Otherwise `udpchains` refuses to run the program; it never runs it unsupervised.
@@ -379,12 +383,10 @@ The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/res
 - **Before Linux 6.9,** a thread with a descriptor table of its own (`unshare(CLONE_FILES)`) is
   refused its UDP calls.
 - **x86-64 only** so far.
-- **The shim's refusals apply here too:** raw, packet, ICMP and UDP-Lite sockets, multicast and
-  broadcast, `MSG_MORE` and GSO, `sendfile` and `splice` onto a UDP socket, and setuid and setgid
-  programs. Two differ. Stdio on a UDP socket (`fdopen`), which the shim refuses, is carried. A
-  datagram socket for an IP protocol other than UDP, ICMP and UDP-Lite, which the shim refuses,
-  is made and handled as UDP: what it sends goes to the proxy's relay in that protocol, and
-  arrives nowhere.
+- **The shim's refusals apply here too:** raw and packet sockets, datagram sockets for any IP
+  protocol but UDP (ICMP and UDP-Lite among them), multicast and broadcast, `MSG_MORE` and GSO,
+  `sendfile` and `splice` onto a UDP socket, and setuid and setgid programs. One differs: stdio on
+  a UDP socket (`fdopen`), which the shim refuses, is carried.
 
 ## Security considerations
 

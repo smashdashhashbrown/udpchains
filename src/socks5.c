@@ -153,32 +153,6 @@ static ssize_t encode_target(uint8_t *buf, size_t buflen,
 	return encode_addr(buf, buflen, (const struct sockaddr *)&a->sa);
 }
 
-ssize_t udpc_socks_encode_domain(uint8_t *buf, size_t buflen, const char *host,
-                                 uint16_t port)
-{
-	ssize_t n;
-
-	if (host == NULL) {
-		errno = EDESTADDRREQ;
-		return -1;
-	}
-	if (buflen < 3) {
-		errno = ENOBUFS;
-		return -1;
-	}
-
-	buf[0] = 0;
-	buf[1] = 0;
-	buf[2] = 0; /* FRAG */
-
-	n = encode_name(buf + 3, buflen - 3, host, port);
-	if (n < 0)
-		return -1;
-
-	return n + 3;
-}
-
-
 /* RFC 1929 username/password sub-negotiation request:
  *
  *   +----+------+----------+------+----------+
@@ -1223,29 +1197,6 @@ fail:
 	return -1;
 }
 
-int udpc_socks_associate(const struct udpc_config *cfg,
-                         const struct sockaddr *bind_addr,
-                         struct udpc_socks_conn *conn, int *out_errno)
-{
-	struct udpc_socks_addr relay;
-	struct budget b;
-
-	memset(conn, 0, sizeof(*conn));
-	conn->control_fd = -1;
-
-	if (cfg->nextra != 0) {
-		*out_errno = EINVAL;
-		return -1;
-	}
-	b = budget_for(cfg);
-	if (associate_hop(cfg, &b, 0, bind_addr, &conn->control_fd, &relay) != 0) {
-		*out_errno = errno;
-		return -1;
-	}
-	conn->relay = relay.sa;
-	return 0;
-}
-
 int udpc_socks_associate_chain(const struct udpc_config *cfg,
                                const struct sockaddr *bind_addr,
                                struct udpc_socks_chain *chain, int *out_errno)
@@ -1350,16 +1301,6 @@ int udpc_socks_connect_on(const struct udpc_config *cfg, int fd,
 	return rc;
 }
 
-void udpc_socks_disconnect(struct udpc_socks_conn *conn)
-{
-	if (conn == NULL || conn->control_fd < 0)
-		return;
-	/* Closing the control connection is what tells the proxy to release the
-	 * association (baseline §0.5, FR-P-02). */
-	close(conn->control_fd);
-	conn->control_fd = -1;
-}
-
 void udpc_socks_disconnect_chain(struct udpc_socks_chain *chain)
 {
 	unsigned k;
@@ -1374,6 +1315,9 @@ void udpc_socks_disconnect_chain(struct udpc_socks_chain *chain)
 	chain->n = 0;
 }
 
+/* True while a control connection is still open: closed, the proxy has
+ * expired the association (FR-P-08).  Takes nothing from it, which carries no
+ * data after the reply. */
 static bool control_alive(int fd)
 {
 	struct pollfd pfd;
@@ -1414,11 +1358,6 @@ static bool control_alive(int fd)
 	if (pfd.revents & (POLLRDHUP | POLLERR | POLLHUP | POLLNVAL))
 		return false;
 	return true;
-}
-
-bool udpc_socks_control_alive(const struct udpc_socks_conn *conn)
-{
-	return conn != NULL && control_alive(conn->control_fd);
 }
 
 bool udpc_socks_chain_alive(const struct udpc_socks_chain *chain)

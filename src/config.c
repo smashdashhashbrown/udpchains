@@ -1254,6 +1254,13 @@ static int export_hop_creds(const struct udpc_config *cfg, unsigned n)
 	return 0;
 }
 
+void udpc_config_hide_wrapper_settings(void)
+{
+	/* D-49, D-55: the wrapper's settings alone; the program is not told. */
+	unsetenv("UDPCHAINS_SUPERVISE");
+	unsetenv("UDPCHAINS_ALLOW_RESOLVER_DAEMONS");
+}
+
 int udpc_config_export(const struct udpc_config *cfg)
 {
 	char buf[64], proxy[NI_MAXHOST + NI_MAXSERV + 4];
@@ -1300,9 +1307,7 @@ int udpc_config_export(const struct udpc_config *cfg)
 	if (setenv("UDPCHAINS_STRICT_LOOPBACK", cfg->strict_loopback ? "1" : "0",
 	           1) != 0)
 		return -1;
-	/* D-49, D-55: the wrapper's settings alone; the program is not told. */
-	unsetenv("UDPCHAINS_SUPERVISE");
-	unsetenv("UDPCHAINS_ALLOW_RESOLVER_DAEMONS");
+	udpc_config_hide_wrapper_settings();
 
 	/* D-22 resolver settings.  An unset dns is exported as unset, never as
 	 * a default: the shim must fail lookups rather than pick a resolver. */

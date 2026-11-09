@@ -41,17 +41,6 @@
  * FRAG is always emitted as 0 (FR-P-04). */
 ssize_t udpc_socks_encode(uint8_t *buf, size_t buflen, const struct sockaddr *dst);
 
-/* Encodes a header addressed to a hostname, for proxy-side resolution
- * (FR-P-07, ATYP 0x03).
- *
- * Note: no libc UDP entry point accepts a hostname -- sendto and friends take a
- * sockaddr -- so this form is not reachable from the hook path.  It exists
- * because the requirement calls for it and because a future non-socket entry
- * point (or a caller of this library) may have a name in hand.  It is covered
- * by unit tests rather than by the hook matrix. */
-ssize_t udpc_socks_encode_domain(uint8_t *buf, size_t buflen, const char *host,
-                                 uint16_t port);
-
 struct udpc_socks_hdr {
 	uint8_t frag;
 	uint8_t atyp;
@@ -72,20 +61,6 @@ ssize_t udpc_socks_decode(const uint8_t *buf, size_t len,
 
 /* --- association (FR-P-01, FR-P-02, FR-P-05) ------------------------------- */
 
-struct udpc_socks_conn {
-	int control_fd;                /* TCP, FD_CLOEXEC (FR-L-05) */
-	struct sockaddr_storage relay; /* BND.ADDR/BND.PORT from the reply */
-};
-
-/* Opens the control connection, negotiates method 0x00, and issues UDP
- * ASSOCIATE.  On success fills conn and returns 0.  On failure returns -1 and
- * sets *out_errno to what the application's send call should report -- there is
- * no fallback to a direct send (SEC-01).
- *
- * bind_addr is the concrete address the application bound, or NULL.  FR-P-05:
- * the request declares 0.0.0.0:0 unless the application bound a concrete
- * address, because proxies pin the association to a declared address and
- * declaring one the shim will not send from breaks the association. */
 /* Encodes an RFC 1929 username/password sub-negotiation request into buf.
  * Returns its length, or -1 with errno set: EINVAL for an empty or over-long
  * username, or an over-long password; ENOBUFS if buf is too small.
@@ -95,14 +70,8 @@ struct udpc_socks_conn {
 ssize_t udpc_socks_encode_userpass(uint8_t *buf, size_t buflen, const char *user,
                                    const char *pass);
 
-/* A chain of one only.  Given a chain it fails with EINVAL, rather than
- * associate with the first hop alone (D-37); use udpc_socks_associate_chain. */
-int udpc_socks_associate(const struct udpc_config *cfg,
-                         const struct sockaddr *bind_addr,
-                         struct udpc_socks_conn *conn, int *out_errno);
-
 /* Opens a TCP tunnel to dst through the proxy with SOCKS5 CONNECT (CMD 0x01),
- * negotiating and authenticating exactly as udpc_socks_associate does.  Through
+ * negotiating and authenticating exactly as udpc_socks_associate_chain does.  Through
  * a chain, the tunnel runs through every hop and the last one connects to dst.
  * Returns a connected, non-blocking, close-on-exec descriptor whose byte stream
  * is now dst's, or -1 with *out_errno set.
@@ -125,8 +94,6 @@ int udpc_socks_connect(const struct udpc_config *cfg, const struct sockaddr *dst
 int udpc_socks_connect_on(const struct udpc_config *cfg, int fd,
                           const struct sockaddr *dst, int *out_errno);
 
-/* Closes the control connection, which is what tells the proxy to release the
- * association (baseline §0.5). */
 /* Rewrites a BND.ADDR that cannot be taken literally.
  *
  * A wildcard relay (0.0.0.0 / ::) always means "the address you already reached
@@ -134,19 +101,11 @@ int udpc_socks_connect_on(const struct udpc_config *cfg, int fd,
  * this host -- the proxy can only describe its own local view of the socket it
  * bound.  Both are replaced by the configured proxy address, keeping the port.
  *
- * Exposed separately from udpc_socks_associate so it can be tested: the
+ * Exposed separately from udpc_socks_associate_chain so it can be tested: the
  * loopback case only arises with a non-local proxy, which no single-host
  * fixture run can produce. */
 void udpc_socks_fixup_relay(struct sockaddr_storage *relay,
                             const struct udpc_config *cfg);
-
-void udpc_socks_disconnect(struct udpc_socks_conn *conn);
-
-/* True while the control connection is still open.  Used to detect an
- * association the proxy has expired, so the next send can transparently
- * re-associate (FR-P-08).  Does not consume application data: the control
- * connection carries none after the reply. */
-bool udpc_socks_control_alive(const struct udpc_socks_conn *conn);
 
 /* --- chains (D-37 to D-42) ------------------------------------------------- */
 
@@ -176,18 +135,24 @@ struct udpc_socks_chain {
 };
 
 /* Associates with every hop of cfg's chain, first to last (D-37: all of them or
- * none).  bind_addr is declared to hop 1 as udpc_socks_associate declares it;
- * later hops are declared the unspecified address, since datagrams reach them
- * from the previous hop's relay, whose port is not known (FR-P-05).
+ * none): for each, a control connection, method negotiation, and UDP
+ * ASSOCIATE.  bind_addr is the concrete address the application bound, or
+ * NULL; it is declared to hop 1, and 0.0.0.0:0 otherwise, because proxies pin
+ * the association to a declared address and declaring one the shim will not
+ * send from breaks it.  Later hops are declared the unspecified address, since
+ * datagrams reach them from the previous hop's relay, whose port is not known
+ * (FR-P-05).
  *
- * Returns 0, or -1 with *out_errno set and nothing left open.  With a chain of
- * more than one, a failure is reported naming the hop (FR-CH-12).  A chain of
- * one does exactly what udpc_socks_associate does (FR-CH-01). */
+ * Returns 0, or -1 with *out_errno set to what the application's send should
+ * report, and nothing left open: there is no fallback to a direct send
+ * (SEC-01).  With a chain of more than one, a failure is reported naming the
+ * hop (FR-CH-12); a chain of one is 0.1.0's single association (FR-CH-01). */
 int udpc_socks_associate_chain(const struct udpc_config *cfg,
                                const struct sockaddr *bind_addr,
                                struct udpc_socks_chain *chain, int *out_errno);
 
-/* Closes every control connection.  The chain is empty afterwards. */
+/* Closes every control connection, which is what tells each proxy to release
+ * its association (baseline §0.5, FR-P-02).  The chain is empty afterwards. */
 void udpc_socks_disconnect_chain(struct udpc_socks_chain *chain);
 
 /* Supervisor mode (D-54): while cancelled is set, every wait of a handshake is
@@ -237,8 +202,9 @@ int udpc_socks_declared_family(const struct udpc_socks_addr *hop,
 
 /* Encodes the headers a datagram to dst needs through ch: one per hop, the
  * layer hop 1 reads outermost and naming hop 2's relay, and so on inwards,
- * with dst in the innermost (FR-CH-05).  For a chain of one this is exactly
- * udpc_socks_encode.  Returns the total length, or -1 with errno set; with
+ * with dst in the innermost (FR-CH-05).  A relay known by name is sent as
+ * ATYP 0x03, for the hop before it to resolve (FR-P-07, D-39).  For a chain of
+ * one this is exactly udpc_socks_encode.  Returns the total length, or -1 with errno set; with
  * inner_off non-NULL, stores where the innermost header starts. */
 ssize_t udpc_socks_encode_chain(uint8_t *buf, size_t buflen,
                                 const struct udpc_socks_chain *ch,
