@@ -2043,8 +2043,8 @@ cannot, it refuses to supervise.
 ## D-50
 ### UDP sockets live in a reserved range; outside it, UDP sends and connects are refused
 
-**Date:** 2026-10-22, amended 2026-10-26 · **Status:** Accepted; built (steps 2, 3 and 5, and the
-amendment) · FR-SV-04, FR-SV-18. Chosen by the
+**Date:** 2026-10-22, amended 2026-10-26 and 2026-11-09 · **Status:** Accepted; built (steps 2, 3
+and 5, and the amendments) · FR-SV-04, FR-SV-18. Chosen by the
 maintainer: trap sends on every descriptor and check its type, with three additions, over
 trapping `recvmsg` everywhere and over documenting the gap.
 
@@ -2225,6 +2225,33 @@ traces.
 - **Limitation:** on a kernel without `CONFIG_PROC_CHILDREN`, a child made in the instant a sweep
   runs, before its parent's stop is reported, could have the sockets it inherited forgotten: they
   would then be refused with `EPERM`, never sent directly.
+
+**Amended 2026-11-09** (release review, L11): a socket's number is found from a map of the numbers
+in use, not by probing every number from the range's start.
+
+- **Found.** With *n* sockets held, placing one more cost *n* + 1 `pidfd_getfd` calls and as many
+  `close`s, while the supervisor answered nothing else: 4,000 sockets took 9.9 to 12.6 s,
+  against 27 ms natively, the last ones 4.9 to 6.6 ms each.
+- **Decision.** For each descriptor table, keyed by its process, or by a thread with a table of
+  its own, a bit for each number in the range known to be in use: set when the supervisor places
+  a descriptor there, or a probe finds the number taken; cleared by a traced `close`, or a
+  `close_range` reaching it without `CLOSE_RANGE_CLOEXEC`. A table's map is dropped when its
+  process exits or execs. The first number the map does not show in use is still probed before
+  it is used, so a wrong "free" costs a probe. A wrong "in use", from a number freed where the
+  supervisor cannot see it (a process sharing the table through `clone(CLONE_FILES)` closing it),
+  leaves a gap; should the map show every number to the limit in use, it is cleared and every
+  number probed once more, so `EMFILE` is never answered while a number is free.
+- **Rejected.** Remembering only where to start probing: a close followed by two sockets probes
+  past every socket held again. Reading `/proc/<pid>/fd` costs as much as probing. Placing
+  sockets ever higher without tracking closes would grow the numbers, and the kernel's table,
+  without bound.
+- **Limitation.** A socket goes at the lowest free number unless a sharer's close left a gap.
+- **Tested.** `test_supervise placement`: a number freed by `close` and by `close_range` is given
+  again; after an `exec`, the number its close-on-exec closed is given, not an inherited one's;
+  with the limit lowered so the range is full, a number a `clone(CLONE_FILES)` process closes is
+  still found. Mutations: no bit cleared on close (it, the range probe, the lifecycle probe and
+  the shim-in-`LD_PRELOAD` check failed); the map kept across an `exec` (1 check); no second
+  search (`EMFILE`, 1 check).
 
 **Found in the release review (M12):** every call the filter traces in the range is traced on any
 descriptor there, as the filter cannot tell what one is. A program with 768 or more descriptors

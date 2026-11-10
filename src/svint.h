@@ -180,6 +180,14 @@ struct sv_task *svtrace_tasks(size_t *n);
  * a sweep must not take it for the whole. */
 bool svtrace_complete(void);
 
+/* The process tid is a thread of, as recorded; 0 if it is not. */
+pid_t svtrace_tgid(pid_t tid);
+
+/* Forgets which numbers in the range key's descriptor table holds: key, a
+ * process or a thread with a table of its own, has exited or exec'd (release
+ * review L11). */
+void svcall_forget_table(pid_t key);
+
 /* The process of a thread, from /proc/<tid>/status; -1 if it has gone. */
 pid_t sv_tgid_of(pid_t tid);
 

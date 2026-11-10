@@ -375,7 +375,8 @@ The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/res
   40 µs a call, against about 1 µs natively.
 - **The range is fixed before the program runs,** at 768, or half the file limit when that is
   below 1024. A program that raises its own limit later, as Go does at start-up, keeps it there.
-- **A narrow race in placing a socket.** A UDP socket goes at the lowest free number in the range.
+- **A narrow race in placing a socket.** A UDP socket goes at the lowest free number in the range,
+  unless one was freed by a process sharing the table through `clone(CLONE_FILES)`.
   A program that already has that many descriptors open could, from another thread, open one at
   that number in the instant before the socket is put there; that descriptor would be replaced.
 - **A blocking `recvmmsg`** returns the datagrams already queued, at least one, rather than waiting

@@ -298,6 +298,12 @@ grep -q "association up: process [0-9]* fd 768 " "$TMP/range.err" &&
 grep -q "dup2 refused" "$TMP/range.err" && ok "the refused dup2 says why" ||
 	notok "no diagnostic for the refused dup2"
 
+echo "# where a new socket goes once numbers are freed (release review L11)"
+timeout -k 5 30 "${SV[@]}" "$P" placement > "$TMP/placement.tap" 2> /dev/null
+rc=$?
+sed 's/^/#   /' "$TMP/placement.tap"
+check "test_supervise placement passes, -static" "$rc" 0
+
 echo "# the supervisor lets go of sockets the program has closed"
 # -v: the sweep's line, which says how many process tables it read, is debug.
 timeout -k 5 60 "${SV[@]}" -v "$P" churn "$ECHO" 40 6 > "$TMP/churn.out" 2> "$TMP/churn.err" &

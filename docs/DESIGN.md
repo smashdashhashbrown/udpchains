@@ -796,9 +796,16 @@ gets the kernel's own `EBADF`.
 ### 13.4 The sockets it carries
 
 A UDP `socket()` is made by the supervisor, in its own process, keeping `SOCK_NONBLOCK`. The
-supervisor finds the lowest free number at or above the range's start in the caller's process,
-asking for each in turn with `pidfd_getfd`, and installs the socket there while answering the call
-(`SECCOMP_ADDFD_FLAG_SETFD | SECCOMP_ADDFD_FLAG_SEND`). Its own descriptor is then closed: the
+supervisor finds a free number at or above the range's start in the caller's process, and installs
+the socket there while answering the call (`SECCOMP_ADDFD_FLAG_SETFD | SECCOMP_ADDFD_FLAG_SEND`).
+To find it, it keeps a map of each descriptor table's numbers in the range known to be in use:
+those it placed, and those a probe found in use. A traced `close` or `close_range` frees numbers
+in the map, and a table's map is dropped when its process exits or execs. The first number the map
+does not show in use is checked with `pidfd_getfd`, and passed over if taken. A process sharing
+the table through `clone(CLONE_FILES)` can free a number unseen, which only leaves a gap; should
+the map show every number to the limit in use, it is cleared and every number checked once more,
+so `EMFILE` is never answered falsely (release review L11). Probing every number from the range's
+start, as before, cost one system call for each socket already held. Its own descriptor is then closed: the
 program's is the only one kept open (FR-SV-05), so closing it frees the port as natively.
 
 Each socket's entry (`struct sv_sock`) is keyed by the kernel's socket cookie. It holds the family,

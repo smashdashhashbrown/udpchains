@@ -236,6 +236,13 @@ struct sv_task *svtrace_tasks(size_t *n)
 	return out;
 }
 
+pid_t svtrace_tgid(pid_t tid)
+{
+	struct task *k = *task_slot(tid);
+
+	return k != NULL ? k->t.tgid : 0;
+}
+
 bool svtrace_complete(void)
 {
 	return !g_task_lost;
@@ -474,9 +481,12 @@ static void on_stop(struct sv *sv, pid_t tid, int st)
 		 * as exiting; and it closes the close-on-exec descriptors,
 		 * which the sweep notices (FR-SV-11). */
 		if (event == PTRACE_EVENT_EXEC) {
-			if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &msg) == 0 && (pid_t)msg != tid)
+			if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &msg) == 0 && (pid_t)msg != tid) {
 				task_remove((pid_t)msg);
+				svcall_forget_table((pid_t)msg);
+			}
 			task_add(tid, tid);
+			svcall_forget_table(tid);
 			forget(tid);
 			sv_sweep_soon(sv);
 		}
@@ -517,6 +527,7 @@ void svtrace_reap(struct sv *sv, bool *none_left)
 			continue;
 		}
 		task_remove(p);
+		svcall_forget_table(p);
 		forget(p);
 		sv_sweep_soon(sv);
 		if (p == sv->child) {

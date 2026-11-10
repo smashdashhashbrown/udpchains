@@ -93,6 +93,10 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 - **The supervisor's sweep for closed sockets reads only the processes it traces** (D-50,
   release review M13), which it records as the kernel reports them, rather than every process on
   the host: with 889 processes, the worst supervised round trip fell from 11–18 ms to 3–5 ms.
+- **Placing a supervised UDP socket no longer slows with the number held** (D-50, release review
+  L11). The supervisor probed every number from the range's start: 4,000 sockets took 10.9 s,
+  the last ones 5.3 ms each, while it answered nothing else. It now keeps a map of each
+  descriptor table's numbers in use: 150–232 ms, each socket 28–115 µs.
 - **Documented:** in supervisor mode, a send on a blocking socket whose send buffer is full waits
   up to 1 s, holding up the program's other calls, then fails with `EAGAIN` (release review L10).
 - **Documented:** in supervisor mode, every read, write and close on a descriptor at 768 and up
@@ -110,9 +114,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 2361 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
-  unit-config, `FR-SV-supervise` (75 checks, with static programs making 25, 4, 19, 6, 37, 4, 24,
-  31, 2, 4, 31, 5, 7, 5, 10 and 18 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
+- 2362 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
+  unit-config, `FR-SV-supervise` (76 checks, with static programs making 25, 4, 19, 6, 37, 8, 4,
+  24, 31, 2, 4, 31, 5, 7, 5, 10 and 18 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
   through two hops), and the fidelity test built `-static` under it (175). The supervisor also
   runs under ASan and UBSan, with the static matrix and fidelity tests.
 

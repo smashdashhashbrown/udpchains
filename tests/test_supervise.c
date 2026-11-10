@@ -82,6 +82,10 @@
  *   test_supervise hang <echo port>      under the supervisor, with the silent
  *                                        proxy: one send, whose setup only a
  *                                        signal sent to udpchains can end
+ *   test_supervise placement             under the supervisor: where a new
+ *                                        socket goes once numbers in the range
+ *                                        are freed (release review L11); runs
+ *                                        itself again as "placed"
  */
 #include "tap.h"
 
@@ -102,6 +106,7 @@
 #include <linux/close_range.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/resource.h>
 #include <sys/epoll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
@@ -2085,6 +2090,99 @@ static int passing(int echo_port)
 	TAP_DONE();
 }
 
+/* --- placing sockets (release review L11) -------------------------------- */
+
+static int udp(void)
+{
+	return socket(AF_INET, SOCK_DGRAM, 0);
+}
+
+/* Run by exec from placement: 0 if a new socket goes at freed, the number the
+ * exec closed, 1 if at kept, still inherited, 2 otherwise. */
+static int placed(int freed, int kept)
+{
+	int fd = udp();
+
+	return fd == freed ? 0 : fd == kept ? 1 : 2;
+}
+
+/* clone(CLONE_FILES): closes a number in the table it shares with its parent,
+ * where the parent's process cannot see it. */
+static int close_shared(void *arg)
+{
+	return close(*(int *)arg) == 0 ? 0 : 1;
+}
+
+static int placement(void)
+{
+	static char stack[64 * 1024];
+	int a, b, c, d, e, st = 0, full = -1, last = -1, got;
+	struct rlimit rl;
+	pid_t pid;
+
+	TAP_GROUP("a number freed by close() is the next one given (release review L11)");
+	a = udp();
+	b = udp();
+	c = udp();
+	TAP_OK(a >= RANGE && b == a + 1 && c == a + 2, "three sockets, at %d, %d and %d", a, b, c);
+	close(b);
+	d = udp();
+	TAP_EQ_INT(d, b, "after close(), a new socket goes at the number freed");
+
+	TAP_GROUP("and by close_range()");
+	TAP_EQ_INT((int)syscall(SYS_close_range, a, d, 0), 0, "close_range() closes the first two");
+	d = udp();
+	e = udp();
+	TAP_OK(d == a && e == a + 1, "two new sockets go at their numbers, %d and %d", d, e);
+
+	TAP_GROUP("after exec, a number the exec closed is given again");
+	pid = fork();
+	if (pid == 0) {
+		char x[16], y[16];
+		int cx = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0), cy = udp();
+
+		snprintf(x, sizeof(x), "%d", cx);
+		snprintf(y, sizeof(y), "%d", cy);
+		execl("/proc/self/exe", "test_supervise", "placed", x, y, (char *)NULL);
+		_exit(3);
+	}
+	TAP_OK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+	       "a child's close-on-exec socket's number, not its inherited one's, goes to "
+	       "the exec'd program's first socket (%d)",
+	       WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+
+	TAP_GROUP("a number freed where the supervisor cannot see is still found");
+	/* Every number in the range up to a lowered limit in use, then one
+	 * closed by a process sharing the table: the parent's own process
+	 * never sees that close. */
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+		struct rlimit low = { (rlim_t)(c + 4), rl.rlim_max };
+
+		if (setrlimit(RLIMIT_NOFILE, &low) == 0) {
+			for (got = udp(); got >= 0; got = udp()) {
+				if (full < 0)
+					full = got;
+				last = got;
+			}
+			TAP_OK(errno == EMFILE && last == c + 3,
+			       "with the limit at %d, the range is full: EMFILE (%s)", c + 4,
+			       strerror(errno));
+			pid = clone(close_shared, stack + sizeof(stack), CLONE_FILES | SIGCHLD,
+			            &full);
+			TAP_OK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) &&
+			               WEXITSTATUS(st) == 0,
+			       "a process sharing the table closes %d", full);
+			got = udp();
+			TAP_EQ_INT(got, full, "a new socket still goes there, not EMFILE (%s)",
+			           got < 0 ? strerror(errno) : "made");
+			setrlimit(RLIMIT_NOFILE, &rl);
+		} else {
+			TAP_OK(0, "the limit could not be lowered (%s)", strerror(errno));
+		}
+	}
+	TAP_DONE();
+}
+
 int main(int argc, char **argv)
 {
 	if (argc == 3 && strcmp(argv[1], "refusals") == 0)
@@ -2134,6 +2232,10 @@ int main(int argc, char **argv)
 		return orphan(atoi(argv[2]));
 	if (argc == 3 && strcmp(argv[1], "hang") == 0)
 		return hang(atoi(argv[2]));
+	if (argc == 2 && strcmp(argv[1], "placement") == 0)
+		return placement();
+	if (argc == 4 && strcmp(argv[1], "placed") == 0)
+		return placed(atoi(argv[2]), atoi(argv[3]));
 	fprintf(stderr, "usage: test_supervise refusals <tcp port> | range <echo port> | "
 	                "signals <delayed echo port> <echo port> | silent | "
 	                "abandon <echo port> | lifecycle <echo port> | "
@@ -2143,6 +2245,6 @@ int main(int argc, char **argv)
 	                "churn <echo port> <n> <secs> | "
 	                "pass <path> <port> | "
 	                "received <path> | passing <echo port> | orphan <echo port> | "
-	                "hang <echo port>\n");
+	                "hang <echo port> | placement\n");
 	return 2;
 }

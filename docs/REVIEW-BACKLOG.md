@@ -125,8 +125,12 @@ None found.
   system-call time. 4,000 sockets took 9.9–12.6 s supervised against 27 ms natively; each new one
   cost 0.25–0.31 ms with fewer than 500 held, and 4.9–6.6 ms with 3,000 to 4,000, during which the
   supervisor answers none of the program's other calls. With none held, a socket costs 42 µs
-  against 3.2 µs. Recorded in FR-SV-15. The fix proposed, a hint per descriptor table, would make
-  each placement a probe or two.
+  against 3.2 µs. Recorded in FR-SV-15.
+  **Fixed, not yet committed:** a map per descriptor table of the numbers in the range in use,
+  cleared by traced closes and dropped at exit and `exec`, with a second search if it shows the
+  range full (D-50 amended). The hint first proposed was dropped: a close followed by two sockets
+  probes past every socket held again. 4,000 sockets now take 150–232 ms, against 10.9 s before
+  in the same window; each socket 28–115 µs however many are held.
 - [x] **L12** — *Inspection.* Dead code in the shipped library and wrapper: `udpc_shim_ready()`
   (`src/shim.c:58`) has had no caller since the first commit. `udpc_socks_associate`,
   `udpc_socks_disconnect`, `udpc_socks_control_alive` and `udpc_socks_encode_domain` are called
@@ -180,6 +184,15 @@ None found.
   `make compare`'s included, has `-k 5`; `run.sh` counts each group's skipped checks, reports them
   on the group's line and in the summary as not a pass, and says that `NFR-04-bench` cannot fail.
   The third was covered by H5's `test_supervise passing`.
+- [ ] **L18** — *Reproduced, found while testing L11.* `test_supervise signals` fails under load:
+  on 2026-11-09, with another job keeping this 2-CPU host's load at 8 to 14, its 120 s timeout
+  ended it once in `make test`. Its group "a datagram delivered just as a signal interrupts its
+  receive" sets up an association under a signal every 100 µs, and a setup is abandoned and made
+  again whenever a signal is pending (D-54), so it completes only when a handshake fits between
+  two signals. That group took 2 to 28 s with the build before L11 and 7 to 60 s after, varying
+  with the load, against about 2 s on a quiet host: the old build varied as much, so L11 did not
+  cause it. *Suggested:*
+  set the association up before the storm starts, so the group tests what it names.
 
 ## Documentation
 

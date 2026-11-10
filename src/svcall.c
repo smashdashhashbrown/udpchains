@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/close_range.h>
 #include <linux/kcmp.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -390,33 +391,164 @@ static uint64_t cookie_of(int fd)
 	return cookie;
 }
 
-/* The lowest free descriptor number at or above from in the caller's process,
- * below its RLIMIT_NOFILE.  The range is not shared with the program's own
- * lowest-free allocations unless it has the range's start of descriptors
- * open; D-50 records the narrow race that leaves.  Returns the number, or
- * -errno. */
+/* --- placing descriptors in the range (release review L11) -----------------
+ *
+ * Each descriptor table's numbers in the range known to be in use: placed
+ * there by the supervisor, or found in use by a probe.  A number is let go
+ * when a close or close_range the filter sends frees it.  Free numbers are
+ * still probed before one is used, so a stale "free" costs a probe and no
+ * more; a stale "in use", from a number freed where the supervisor cannot
+ * see (a process sharing the table by clone(CLONE_FILES) closing it), only
+ * leaves a gap, and the search starts again without the map rather than fail
+ * with EMFILE.  So placing a socket costs a probe or two, where probing every
+ * number from the range's start cost one for each socket held. */
+
+struct table {
+	pid_t key;       /* the process; a thread, for a thread with its own table */
+	uint64_t *used;  /* bit k: the range's start + k is in use */
+	size_t words;
+	struct table *next;
+};
+
+#define NTABLE 64
+static struct table *g_table[NTABLE];
+
+static struct table **table_slot(pid_t key)
+{
+	struct table **pp = &g_table[(unsigned)key % NTABLE];
+
+	while (*pp != NULL && (*pp)->key != key)
+		pp = &(*pp)->next;
+	return pp;
+}
+
+/* The table the call's descriptors are in, made if need be; NULL if out of
+ * memory, when every number is probed, as before. */
+static struct table *table_of(const struct call *c)
+{
+	pid_t key = c->own_pidfd ? (pid_t)c->req->pid : c->tgid;
+	struct table **pp = table_slot(key);
+
+	if (*pp == NULL && (*pp = calloc(1, sizeof(**pp))) != NULL)
+		(*pp)->key = key;
+	return *pp;
+}
+
+static void mark_used(struct table *t, unsigned k)
+{
+	if (k / 64 >= t->words) {
+		size_t words = t->words ? t->words : 16;
+		uint64_t *used;
+
+		while (words <= k / 64)
+			words *= 2;
+		used = realloc(t->used, words * sizeof(*used));
+		if (used == NULL)
+			return; /* left unmarked: probed again next time */
+		memset(used + t->words, 0, (words - t->words) * sizeof(*used));
+		t->used = used;
+		t->words = words;
+	}
+	t->used[k / 64] |= 1ULL << (k % 64);
+}
+
+/* The first index into the range at or above k not known to be in use. */
+static unsigned next_unknown(const struct table *t, unsigned k)
+{
+	while (k / 64 < t->words) {
+		uint64_t unknown = ~t->used[k / 64] >> (k % 64);
+
+		if (unknown != 0)
+			return k + (unsigned)__builtin_ctzll(unknown);
+		k = (k / 64 + 1) * 64;
+	}
+	return k;
+}
+
+/* Numbers first to last of key's table freed. */
+static void table_free(pid_t key, unsigned long first, unsigned long last, unsigned range)
+{
+	struct table *t = *table_slot(key);
+	unsigned long n;
+
+	if (t == NULL || last < range)
+		return;
+	if (first < range)
+		first = range;
+	for (n = first; n <= last && (n - range) / 64 < t->words; n++)
+		t->used[(n - range) / 64] &= ~(1ULL << ((n - range) % 64));
+}
+
+/* A close or close_range that may free numbers in the range: let go in the
+ * calling thread's table, whichever of its own or its process's that is.
+ * Letting go of a number still in use costs only a probe. */
+static void freed(const struct call *c, unsigned long first, unsigned long last)
+{
+	pid_t tid = (pid_t)c->req->pid, tgid = svtrace_tgid(tid);
+
+	table_free(tid, first, last, c->sv->range);
+	if (tgid > 0 && tgid != tid)
+		table_free(tgid, first, last, c->sv->range);
+}
+
+void svcall_forget_table(pid_t key)
+{
+	struct table **pp = table_slot(key), *t = *pp;
+
+	if (t == NULL)
+		return;
+	*pp = t->next;
+	free(t->used);
+	free(t);
+}
+
+/* A free descriptor number at or above from in the caller's process, below
+ * its RLIMIT_NOFILE: the lowest, unless one was freed where the supervisor
+ * cannot see.  The range is not shared with the program's own lowest-free
+ * allocations unless it has the range's start of descriptors open; D-50
+ * records the narrow race that leaves.  Returns the number, or -errno. */
 static int free_number(struct call *c, unsigned from)
 {
+	const unsigned range = c->sv->range;
 	struct rlimit rl;
 	unsigned long n, limit = 1u << 20;
-	int pidfd = process_of(c);
+	int pidfd = process_of(c), again;
+	struct table *t;
 
 	if (pidfd < 0)
 		return c->own_table ? -EPERM : -ESRCH;
 	if (prlimit(c->tgid, RLIMIT_NOFILE, NULL, &rl) == 0 && rl.rlim_cur < limit)
 		limit = (unsigned long)rl.rlim_cur;
-	if (from < c->sv->range)
-		from = c->sv->range;
-	for (n = from; n < limit; n++) {
-		int probe = (int)syscall(SYS_pidfd_getfd, pidfd, (int)n, 0);
+	if (from < range)
+		from = range;
+	t = table_of(c);
+	for (again = 0; again < 2; again++) {
+		for (n = from; n < limit; n++) {
+			int probe;
 
-		if (probe >= 0) {
-			close(probe);
-			continue;
+			if (t != NULL) {
+				n = range + next_unknown(t, (unsigned)(n - range));
+				if (n >= limit)
+					break;
+			}
+			probe = (int)syscall(SYS_pidfd_getfd, pidfd, (int)n, 0);
+			if (probe >= 0) {
+				close(probe);
+				if (t != NULL)
+					mark_used(t, (unsigned)(n - range));
+				continue;
+			}
+			if (errno == EBADF)
+				return (int)n;
+			return -errno;
 		}
-		if (errno == EBADF)
-			return (int)n;
-		return -errno;
+		/* Full, as far as the map says: it may be stale, so once more
+		 * probing every number. */
+		if (t == NULL || again)
+			break;
+		free(t->used);
+		t->used = NULL;
+		t->words = 0;
 	}
 	return -EMFILE;
 }
@@ -429,6 +561,7 @@ static int free_number(struct call *c, unsigned from)
 static int install(struct call *c, int src, int newfd, bool cloexec)
 {
 	struct seccomp_notif_addfd a;
+	struct table *t;
 
 	memset(&a, 0, sizeof(a));
 	a.id = c->req->id;
@@ -438,6 +571,9 @@ static int install(struct call *c, int src, int newfd, bool cloexec)
 	a.newfd_flags = cloexec ? O_CLOEXEC : 0;
 	if (ioctl(c->sv->listener, SECCOMP_IOCTL_NOTIF_ADDFD, &a) < 0)
 		return errno == ESRCH ? -ENOENT : -errno;
+	t = table_of(c);
+	if (t != NULL && (unsigned)newfd >= c->sv->range)
+		mark_used(t, (unsigned)newfd - c->sv->range);
 	return 0;
 }
 
@@ -1721,9 +1857,14 @@ static enum sv_outcome decide(struct call *c)
 		return answer(c, 0, EPERM);
 	case SYS_close:
 	case SYS_close_range:
-		/* The kernel closes; the sweep notices what went.  A traced
-		 * close runs only once its thread is resumed, so a signal can
-		 * no longer leave the descriptor open (D-54). */
+		/* The kernel closes; the sweep notices what went, and the
+		 * numbers it frees are let go of here.  A traced close runs
+		 * only once its thread is resumed, so a signal can no longer
+		 * leave the descriptor open (D-54). */
+		if (nr == SYS_close)
+			freed(c, (unsigned)a[0], (unsigned)a[0]);
+		else if (!(a[2] & CLOSE_RANGE_CLOEXEC))
+			freed(c, (unsigned)a[0], (unsigned)a[1]);
 		sv_sweep_soon(sv);
 		return let_through(c);
 	case SYS_dup2:
