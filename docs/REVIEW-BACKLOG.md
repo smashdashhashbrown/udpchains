@@ -109,14 +109,14 @@ None found.
   'sleep 30 & exit 0'` was still running 2 s after `kill -TERM`; only `SIGKILL` ended it.
   **Fixed (b86f0d1):** once the program has gone, a forwarded signal goes to each process
   the supervisor still traces, from M13's task table. That case now ends in about 330 ms.
-- [ ] **L10** — *Inspection.* On a full send buffer, `send_via` (`src/svcall.c:569`) blocks the
+- [x] **L10** — *Inspection.* On a full send buffer, `send_via` (`src/svcall.c:569`) blocks the
   whole supervisor for up to 1 s, then returns `EAGAIN` to a socket the program made blocking,
   which never returns `EAGAIN` natively.
-  **Documented, not yet committed:** as a known limitation of D-54, with the parked send considered
+  **Documented (ae8a110):** as a known limitation of D-54, with the parked send considered
   and not built, and in the README, the man page, DESIGN §13.5 and FUTURE-STATIC-BINARIES §9. Not
   reproduced: it needs a slow queue on an interface, so root, and this host refuses unprivileged
   user namespaces.
-- [ ] **L11** — *Inspection.* `free_number` (`src/svcall.c:388`) probes every number from the
+- [x] **L11** — *Inspection.* `free_number` (`src/svcall.c:388`) probes every number from the
   range's start with `pidfd_getfd` until it finds a free one, so a program holding *n* sockets
   pays *n* + 1 system calls for each new `socket()` or `dup`: quadratic for a program that keeps
   many.
@@ -126,7 +126,7 @@ None found.
   cost 0.25–0.31 ms with fewer than 500 held, and 4.9–6.6 ms with 3,000 to 4,000, during which the
   supervisor answers none of the program's other calls. With none held, a socket costs 42 µs
   against 3.2 µs. Recorded in FR-SV-15.
-  **Fixed, not yet committed:** a map per descriptor table of the numbers in the range in use,
+  **Fixed (814789c):** a map per descriptor table of the numbers in the range in use,
   cleared by traced closes and dropped at exit and `exec`, with a second search if it shows the
   range full (D-50 amended). The hint first proposed was dropped: a close followed by two sockets
   probes past every socket held again. 4,000 sockets now take 150–232 ms, against 10.9 s before
