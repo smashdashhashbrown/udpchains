@@ -2686,6 +2686,15 @@ one thread.
 - **A blocking `recvmmsg` without `MSG_WAITFORONE`** returns the datagrams already queued, at least
   one, where a native socket waits until `vlen` have arrived. `recvmmsg` may always return fewer
   than asked.
+- **A full send buffer** (release review L10). A send on a blocking socket whose send buffer is
+  full waits up to 1 s for room, in the supervisor, which meanwhile answers none of the program's
+  other calls; still full, the send fails with `EAGAIN`, which a blocking socket never returns
+  natively. A UDP send buffer fills only when a program sends faster than the network takes its
+  datagrams. Found by inspection; not reproduced, since that needs a slow queue on an interface,
+  and so root. Considered and not built: leaving the thread stopped while the supervisor's loop
+  waits for room. That removes both, at about 120 lines, the datagram held meanwhile, a check of
+  the thread for signals every 10 ms, and a signal making the send again rather than failing it.
+  Revisit if a program is found that fills the buffer.
 - **A program built with LeakSanitizer** cannot run its leak check under supervision: it stops its
   own threads with `ptrace`, and it reports a fatal error at exit. AddressSanitizer itself works.
 - **aarch64** (FR-SV-16) reads and rewrites registers differently (`PTRACE_GETREGSET`, with

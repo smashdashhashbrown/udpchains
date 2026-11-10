@@ -499,6 +499,10 @@ A blocking
 .BR recvmmsg (2)
 returns the datagrams already queued, at least one, rather than waiting until
 it has as many as asked.
+A send on a blocking socket whose send buffer is full waits up to a second,
+while the program's other supervised calls wait too, then fails with
+.BR EAGAIN ,
+which a blocking socket never does natively.
 A signal arriving while an association is set up is handled at once, and the
 call made again.
 The range of descriptors is fixed before the program runs; a program that

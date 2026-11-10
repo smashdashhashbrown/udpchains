@@ -882,8 +882,10 @@ would pass it, so that it too abandons the setup (release review M14).
   else continues. Its arguments are values, so continuing cannot be raced.
 - **Sends** on a carried socket: the message header, iovecs, address and control data are read
   with `process_vm_readv`, checked as in shim mode (`EMSGSIZE`, `EDESTADDRREQ`, multicast,
-  `MSG_MORE`, GSO), wrapped, and sent on the supervisor's copy to the relay, never blocking the
-  supervisor for long. `sendmmsg` reports partial success as the kernel does.
+  `MSG_MORE`, GSO), wrapped, and sent on the supervisor's copy to the relay without blocking. On
+  a blocking socket whose send buffer is full, the supervisor polls for room for up to 1 s and
+  tries once more, then answers `EAGAIN`, a limitation D-54 records (release review L10).
+  `sendmmsg` reports partial success as the kernel does.
 - **Receives** on a carried socket (D-54), while the thread is stopped: peek, check and strip
   every layer, write the payload, sender and message fields into the program, and consume.
   `recvmmsg` takes as many as are queued, up to its `vlen`. With nothing queued, a non-blocking

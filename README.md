@@ -380,6 +380,10 @@ The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/res
   that number in the instant before the socket is put there; that descriptor would be replaced.
 - **A blocking `recvmmsg`** returns the datagrams already queued, at least one, rather than waiting
   for as many as asked.
+- **A send on a blocking socket whose send buffer is full** waits up to 1 s, while the program's
+  other supervised calls wait too, then fails with `EAGAIN`, which a blocking socket never does
+  natively. The buffer fills only when a program sends faster than the network takes its
+  datagrams.
 - **Before Linux 6.9,** a thread with a descriptor table of its own (`unshare(CLONE_FILES)`) is
   refused its UDP calls.
 - **x86-64 only** so far.

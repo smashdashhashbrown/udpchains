@@ -93,6 +93,8 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 - **The supervisor's sweep for closed sockets reads only the processes it traces** (D-50,
   release review M13), which it records as the kernel reports them, rather than every process on
   the host: with 889 processes, the worst supervised round trip fell from 11–18 ms to 3–5 ms.
+- **Documented:** in supervisor mode, a send on a blocking socket whose send buffer is full waits
+  up to 1 s, holding up the program's other calls, then fails with `EAGAIN` (release review L10).
 - **Documented:** in supervisor mode, every read, write and close on a descriptor at 768 and up
   costs a round trip to the supervisor, files and TCP included, about 40 µs against about 1 µs
   (release review M12).

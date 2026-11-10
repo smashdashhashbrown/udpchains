@@ -112,10 +112,21 @@ None found.
 - [ ] **L10** — *Inspection.* On a full send buffer, `send_via` (`src/svcall.c:569`) blocks the
   whole supervisor for up to 1 s, then returns `EAGAIN` to a socket the program made blocking,
   which never returns `EAGAIN` natively.
+  **Documented, not yet committed:** as a known limitation of D-54, with the parked send considered
+  and not built, and in the README, the man page, DESIGN §13.5 and FUTURE-STATIC-BINARIES §9. Not
+  reproduced: it needs a slow queue on an interface, so root, and this host refuses unprivileged
+  user namespaces.
 - [ ] **L11** — *Inspection.* `free_number` (`src/svcall.c:388`) probes every number from the
   range's start with `pidfd_getfd` until it finds a free one, so a program holding *n* sockets
   pays *n* + 1 system calls for each new `socket()` or `dup`: quadratic for a program that keeps
   many.
+  **Measured (2026-11-09), still open:** confirmed, and dearer than estimated. With 1,000 sockets
+  made and kept, the supervisor made 500,501 `pidfd_getfd` calls and as many `close`s, 95% of its
+  system-call time. 4,000 sockets took 9.9–12.6 s supervised against 27 ms natively; each new one
+  cost 0.25–0.31 ms with fewer than 500 held, and 4.9–6.6 ms with 3,000 to 4,000, during which the
+  supervisor answers none of the program's other calls. With none held, a socket costs 42 µs
+  against 3.2 µs. Recorded in FR-SV-15. The fix proposed, a hint per descriptor table, would make
+  each placement a probe or two.
 - [x] **L12** — *Inspection.* Dead code in the shipped library and wrapper: `udpc_shim_ready()`
   (`src/shim.c:58`) has had no caller since the first commit. `udpc_socks_associate`,
   `udpc_socks_disconnect`, `udpc_socks_control_alive` and `udpc_socks_encode_domain` are called

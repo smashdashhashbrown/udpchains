@@ -304,6 +304,8 @@ the mode is built (FR-SV-19). Each is explained in its record.
   socket by its service manager cannot be supervised.
 - **A blocking `recvmmsg` without `MSG_WAITFORONE` returns the datagrams already queued,** at
   least one, rather than waiting until `vlen` have arrived (D-54).
+- **A send on a blocking socket whose send buffer is full** waits up to 1 s in the supervisor,
+  holding up the program's other calls, then fails with `EAGAIN` (D-54, release review L10).
 - **DNS** (D-52), none of it a leak:
   - only queries to the system resolver (loopback, or `/etc/resolv.conf`, re-read when it changes)
     are redirected to `dns`; other port-53 traffic is proxied as addressed, so a private resolver
