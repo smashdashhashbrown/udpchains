@@ -214,7 +214,7 @@ None found.
   can be run, as `execvp` does.
   **Fixed (0596890)** as suggested, D-28 amended; all eight cases measured now match bash in
   both modes, and five checks in each mode test them.
-- [ ] **L20** — *Reproduced, found by `make interop` on 2026-11-12.* `t_mmsg_cap` in
+- [x] **L20** — *Reproduced, found by `make interop` on 2026-11-12.* `t_mmsg_cap` in
   `tests/test_fidelity.c`, added for L13 (b86f0d1), sends 1,024 datagrams to the shared echo
   server `echo1` and closes its socket. `t_scatter_gather`, next, sends one datagram to the same
   server at once. Through a fast proxy the burst arrives faster than the server reads it, its
@@ -226,6 +226,11 @@ None found.
   Not a defect in udpchains or the proxies. *Suggested:* send the burst where nothing reads it,
   a loopback port found free by binding a socket and closing it, since only `sendmmsg`'s count
   is checked.
+  **Fixed (5503d54), not as suggested:** a closed port's ICMP error ended Dante's association, which
+  connects to its destination, part way through the burst (82 of 1,024 sent). The burst goes to
+  a socket of the test's own, open and never read, and one round trip, retried up to ten times,
+  shows the path clear before the next test: through xray, 2 in 32 next datagrams were still
+  lost straight after the burst. `make interop` then gave every fidelity result as recorded.
 - [ ] **L21** — *Found by `make interop` on 2026-11-12, after the L20 fix.* The harness's
   `failclosed` check passes only if nothing arrives while the hop is dead, traffic recovers, and
   at least one send fails. Through Xray > sing-box, with sing-box killed, Xray keeps the client's
