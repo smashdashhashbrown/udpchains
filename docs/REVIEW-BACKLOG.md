@@ -198,7 +198,7 @@ None found.
   setup did not complete in 400 s in 4 runs of 4; with the fix the probe passed in 20 to 45 s,
   and `make test` passed. The wait is documented as a D-54 limitation. Left as it is: the
   probe's install group, which must run under its storm, took 8 to 29 s of that.
-- [ ] **L19** — *Reproduced, found while checking D11.* `udpchains`' status when the program
+- [x] **L19** — *Reproduced, found while checking D11.* `udpchains`' status when the program
   cannot be run differs between the modes, and from the shell's convention (127 when not found,
   126 when found but it cannot be run; bash agrees for each case below). Measured on 2026-11-12:
 
@@ -212,6 +212,8 @@ None found.
   Neither 126 nor 127 is tested. *Suggested:* 127 for `ENOENT`, 126 for any other error, in
   both modes; a non-executable file found in `PATH` gives 126 only if nothing later in `PATH`
   can be run, as `execvp` does.
+  **Fixed (0596890)** as suggested, D-28 amended; all eight cases measured now match bash in
+  both modes, and five checks in each mode test them.
 
 ## Documentation
 
@@ -229,11 +231,13 @@ None found.
 - [x] **D10** — `docs/TRACEABILITY.md`: the TST-02 row says 71 symbol checks; the run, and the
   paragraph above the table, say 91. **Fixed (6570c74),** with the totals regenerated
   for H5 and M11.
-- [ ] **D11** — The man page's EXIT STATUS lists only 0, 1, 126 and 127. It does not say that
+- [x] **D11** — The man page's EXIT STATUS lists only 0, 1, 126 and 127. It does not say that
   otherwise `udpchains` exits with the program's status, or, supervised, dies of the signal that
   killed it, nor that 1 can be the program's own status as well as a refusal.
-- [ ] **D12** — `UDP-PRELOAD-REQUIREMENTS.md`: the header still describes an `LD_PRELOAD` shim for
+  **Fixed (0596890),** with 126 and 127 made consistent first (L19).
+- [x] **D12** — `UDP-PRELOAD-REQUIREMENTS.md`: the header still describes an `LD_PRELOAD` shim for
   dynamically linked programs only, and is marked "Draft for implementation, 2026-08-17".
+  **Fixed (0596890):** it describes both front ends and chains, and the document's history.
 - [ ] **D13** — Release steps not yet done: `VERSION` in the `Makefile` is still `0.2.0`, and the
   CHANGELOG entry is `[Unreleased]`.
 
