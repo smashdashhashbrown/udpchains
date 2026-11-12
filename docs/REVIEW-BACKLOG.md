@@ -184,7 +184,7 @@ None found.
   `make compare`'s included, has `-k 5`; `run.sh` counts each group's skipped checks, reports them
   on the group's line and in the summary as not a pass, and says that `NFR-04-bench` cannot fail.
   The third was covered by H5's `test_supervise passing`.
-- [ ] **L18** — *Reproduced, found while testing L11.* `test_supervise signals` fails under load:
+- [x] **L18** — *Reproduced, found while testing L11.* `test_supervise signals` fails under load:
   on 2026-11-09, with another job keeping this 2-CPU host's load at 8 to 14, its 120 s timeout
   ended it once in `make test`. Its group "a datagram delivered just as a signal interrupts its
   receive" sets up an association under a signal every 100 µs, and a setup is abandoned and made
@@ -193,6 +193,11 @@ None found.
   with the load, against about 2 s on a quiet host: the old build varied as much, so L11 did not
   cause it. *Suggested:*
   set the association up before the storm starts, so the group tests what it names.
+  **Fixed (97804f9):** the group sends one datagram before its storm, and checks that its
+  receives were interrupted. Measured with two busy loops added: set up under the storm, the
+  setup did not complete in 400 s in 4 runs of 4; with the fix the probe passed in 20 to 45 s,
+  and `make test` passed. The wait is documented as a D-54 limitation. Left as it is: the
+  probe's install group, which must run under its storm, took 8 to 29 s of that.
 
 ## Documentation
 
