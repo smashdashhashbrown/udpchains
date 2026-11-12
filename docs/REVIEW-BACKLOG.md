@@ -231,7 +231,7 @@ None found.
   a socket of the test's own, open and never read, and one round trip, retried up to ten times,
   shows the path clear before the next test: through xray, 2 in 32 next datagrams were still
   lost straight after the burst. `make interop` then gave every fidelity result as recorded.
-- [ ] **L21** — *Found by `make interop` on 2026-11-12, after the L20 fix.* The harness's
+- [x] **L21** — *Found by `make interop` on 2026-11-12, after the L20 fix.* The harness's
   `failclosed` check passes only if nothing arrives while the hop is dead, traffic recovers, and
   at least one send fails. Through Xray > sing-box, with sing-box killed, Xray keeps the client's
   tunnel open for 1 to 2 s (INTEROP-CHECKLIST §13), so only udpchains' failed re-association
@@ -240,6 +240,11 @@ None found.
   exactly 1 failed send. *Suggested:* for a dead hop behind Xray, accept no failed send, since
   the leak and the recovery are what the check is for; or keep requiring one and record the
   chain as one that can fail on timing.
+  **Fixed (2d07d5d), as the first suggestion:** a `HOLDS` table in `tests/interop/run.sh` marks
+  Xray; for a hop behind it, no failed send is accepted if nothing arrives while it is dead and
+  traffic recovers. Any other hop must still fail a send. With the failed-send count forced to 0,
+  only the hop behind Xray passed; with the sender run directly, every hop failed with 28 leaked.
+  `make interop` then gave 153 ok and 28 expected.
 
 ## Documentation
 
