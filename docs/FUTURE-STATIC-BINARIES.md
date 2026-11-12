@@ -336,6 +336,9 @@ the mode is built (FR-SV-19). Each is explained in its record.
     inside the supervision, a program that uses `ptrace` itself gets `EPERM`, and `udpchains`
     under `strace -f` refuses to start (accepted by the maintainer);
   - a program built with LeakSanitizer cannot run its leak check, which uses `ptrace`;
+  - setting up a socket's association waits until a proxy handshake fits between two signals: under
+    a signal every 100 µs on a loaded host, the setup did not complete in 400 s (release review
+    L18);
   - a send or receive whose association setup is abandoned for a signal is made again once the
     signal is handled, never failing with `EINTR`;
   - an install interrupted by `SIGSTOP`, or by a signal pending before its mask was set, is made

@@ -2531,7 +2531,7 @@ that touch sockets would need inspecting each submission, which a seccomp filter
 ## D-54
 ### A supervised program's calls on its UDP sockets are carried while it is stopped, through `ptrace`
 
-**Date:** 2026-10-23, amended the same day (step 5) · **Status:** Accepted; built for x86-64
+**Date:** 2026-10-23, amended the same day (step 5) and 2026-11-12 (L18) · **Status:** Accepted; built for x86-64
 (steps 4 and 5) · FR-SV-06, FR-SV-07, FR-SV-08, FR-SV-13, FR-SV-T4. Revises D-48 (which
 rejected `ptrace`) and D-51 (peek, deliver, commit), for the calls below. Chosen by the
 maintainer over accepting a rare lost datagram, over checking for a pending signal before each
@@ -2710,6 +2710,15 @@ one thread.
 - **An abandoned setup is made again, never reported.** A program that relies on a signal to get
   `EINTR` out of a send, while the proxy hangs in the handshake, has the send made again instead.
   A native UDP send never waits for a proxy, so programs have no reason to do this.
+- **A setup under a fast stream of signals waits for a gap** (release review L18). A setup is
+  abandoned whenever a signal is pending, so it completes only once a whole proxy handshake fits
+  between two signals, and the send or receive that set it off waits until then. Measured with
+  the `signals` probe and a signal every 100 µs, on a 2-CPU host: with two busy loops added
+  (load 5.4 to 6.8), the setup did not complete in 400 s, in 4 runs of 4; under another job's load
+  of 8 to 14, the setup and 1,000 datagrams after it took 2 to 60 s; on a quiet host, about 2 s.
+  At a signal every 2 ms, under the same busy loops, it completed within 25 ms. An association
+  is set up once per socket, and again only after it expires; few programs take signals that
+  fast.
 - **A blocking `recvmmsg` without `MSG_WAITFORONE`** returns the datagrams already queued, at least
   one, where a native socket waits until `vlen` have arrived. `recvmmsg` may always return fewer
   than asked.

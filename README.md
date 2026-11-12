@@ -369,6 +369,10 @@ The program runs its own resolver (glibc's, musl's, Go's), which reads `/etc/res
   `EPERM`. A program built with LeakSanitizer cannot run its leak check.
 - **Every send and connect, UDP or not,** and every call on a UDP socket, costs a round trip to the
   supervisor. While an association is set up, the program's other supervised calls wait.
+- **Setting up a socket's association waits for a gap between signals.** A signal during the
+  proxy handshake abandons it, to be made again once the signal is handled, and the program's
+  send or receive waits. Under a signal every 100 µs on a loaded host, the setup did not complete
+  in 400 s; at one every 2 ms, it completed within 25 ms.
 - **Descriptors at 768 and up are all treated as possible UDP sockets,** since the filter cannot
   tell a file from a socket. A program with that many descriptors open, a busy server say, pays
   the round trip on every read, write and close of its files and TCP connections there: about

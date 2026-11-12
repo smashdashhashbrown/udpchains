@@ -504,7 +504,8 @@ while the program's other supervised calls wait too, then fails with
 .BR EAGAIN ,
 which a blocking socket never does natively.
 A signal arriving while an association is set up is handled at once, and the
-call made again.
+call made again, so the setup waits for a gap between signals: under a signal
+every 100 microseconds on a loaded host, it did not complete in 400 seconds.
 The range of descriptors is fixed before the program runs; a program that
 raises its own file limit later, as Go does, keeps it where it was.
 A program that already has the range's start of descriptors open could, from

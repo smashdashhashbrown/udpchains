@@ -571,6 +571,12 @@ static int signals(int delayed_port, int echo_port)
 	 * instant; traced, none can be lost. */
 	g_echo = loopback(echo_port);
 	fd = udp_timed(500);
+	/* The association is set up before the storm: a setup is abandoned
+	 * whenever a signal is pending, so under one every 100 us it waits
+	 * for a gap that may not come on a loaded host (release review L18).
+	 * The groups above set up under signals. */
+	t = ping_pong(fd, 1);
+	TAP_EQ_INT(t.lost + t.dups, 0, "one datagram, before the signals, sets up the association");
 	g_signals = 0;
 	storm(100, 0);
 	t = ping_pong(fd, 1000);
@@ -578,6 +584,7 @@ static int signals(int delayed_port, int echo_port)
 	TAP_EQ_INT(t.lost, 0, "1000 datagrams under a signal every 100 us: none lost (%d EINTR, "
 	                      "%d signals)",
 	           t.recv_eintr, (int)g_signals);
+	TAP_OK(t.recv_eintr > 0, "the receives were interrupted: %d EINTR", t.recv_eintr);
 	TAP_EQ_INT(t.dups + t.send_eintr, 0, "no send interrupted or repeated");
 	close(fd);
 	g_echo = loopback(delayed_port);

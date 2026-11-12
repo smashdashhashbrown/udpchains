@@ -99,6 +99,10 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
   descriptor table's numbers in use: 150–232 ms, each socket 28–115 µs.
 - **Documented:** in supervisor mode, a send on a blocking socket whose send buffer is full waits
   up to 1 s, holding up the program's other calls, then fails with `EAGAIN` (release review L10).
+- **Documented:** in supervisor mode, setting up a socket's association waits for a gap between
+  signals: under a signal every 100 µs on a loaded host, it did not complete in 400 s (D-54,
+  release review L18). The `signals` probe now sets its association up before its 100 µs storm,
+  which it had waited for, so it timed out under load.
 - **Documented:** in supervisor mode, every read, write and close on a descriptor at 768 and up
   costs a round trip to the supervisor, files and TCP included, about 40 µs against about 1 µs
   (release review M12).
@@ -115,7 +119,7 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 ### Verification
 
 - 2362 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
-  unit-config, `FR-SV-supervise` (76 checks, with static programs making 25, 4, 19, 6, 37, 8, 4,
+  unit-config, `FR-SV-supervise` (76 checks, with static programs making 27, 4, 19, 6, 37, 8, 4,
   24, 31, 2, 4, 31, 5, 7, 5, 10 and 18 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
   through two hops), and the fidelity test built `-static` under it (175). The supervisor also
   runs under ASan and UBSan, with the static matrix and fidelity tests.
