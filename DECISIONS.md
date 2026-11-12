@@ -1199,7 +1199,7 @@ what makes it checkable.
 ## D-28
 ### The wrapper runs the file it checked
 
-**Date:** 2026-09-24 · **Status:** Accepted · Review item M6.
+**Date:** 2026-09-24, amended 2026-11-12 · **Status:** Accepted · Review item M6.
 
 **Context.** SEC-06 refuses setuid, setgid and capability-endowed targets, by inspecting the file
 `resolve_program()` finds on `PATH`. The wrapper then called `execvp()`, which searches `PATH` again.
@@ -1213,6 +1213,16 @@ the checked path.
 **Consequences.** The check and the exec now name one file. A race on the file's *contents* between
 check and exec remains, as it does for any check followed by an exec; SEC-06 was about which file,
 not about that.
+
+**Amended 2026-11-12 (release review L19): the status when the program cannot be run.** As a
+shell reports it, in both modes: 127 when it is not found, 126 when it is found but cannot be
+run. `resolve_program()` gave 127 for both, a file without execute permission included, and a
+failed `execv` gave 126 in shim mode and 127 supervised when a script's `#!` interpreter was
+missing. Now `ENOENT`, from the search or from the exec, gives 127, and any other error 126; a
+file on `PATH` that cannot be run gives 126 only when nothing after it on `PATH` can, as
+`execvp()` does. Tested in both modes, each case expecting the status bash gives it: not found,
+no execute permission, a missing interpreter, and a file on `PATH` that cannot be run, with and
+without one after it that can.
 
 ---
 

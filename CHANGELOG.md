@@ -88,6 +88,12 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Changed
 
+- **`udpchains` exits as a shell would when the program cannot be run** (D-28, release review
+  L19): 127 when it is not found, 126 when it is found but cannot be run, in both modes. A file
+  without execute permission gave 127; a script whose `#!` interpreter is missing gave 126 in
+  shim mode and 127 supervised. The man page's EXIT STATUS now also says that once the program
+  runs, its status, or the signal that killed it, is passed on, and that 1 can be the program's
+  own (D11).
 - **Under supervision, `fcntl` is trapped only for `F_DUPFD` and `F_DUPFD_CLOEXEC`** (D-54). Every
   other command runs in the kernel, so `fcntl(F_GETFD)` and its like are never interrupted.
 - **The supervisor's sweep for closed sockets reads only the processes it traces** (D-50,
@@ -118,8 +124,8 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 
 ### Verification
 
-- 2362 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
-  unit-config, `FR-SV-supervise` (76 checks, with static programs making 27, 4, 19, 6, 37, 8, 4,
+- 2372 assertions across 26 groups. Supervisor mode adds `unit-supervise` (39), 14 to
+  unit-config, `FR-SV-supervise` (81 checks, with static programs making 27, 4, 19, 6, 37, 8, 4,
   24, 31, 2, 4, 31, 5, 7, 5, 10 and 18 assertions), the hook matrix built `-static` under the supervisor (108, and 108 more
   through two hops), and the fidelity test built `-static` under it (175). The supervisor also
   runs under ASan and UBSan, with the static matrix and fidelity tests.

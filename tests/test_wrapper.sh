@@ -124,6 +124,30 @@ out=$(PATH="$TMP/bin:$PATH" UDPCHAINS_LIB="$SHIM" "$WRAPPER" -q \
 	-p 127.0.0.1:1080 noshebang arg1 2>&1) || true
 check "$out" "NOSHEBANG-RAN arg1" "a script with no #! line still runs, with its arguments"
 
+# --- L19: a program that cannot be run ----------------------------------------
+
+echo "# a program that cannot be run: 127 if not found, else 126, as a shell (L19)"
+
+# Runs the wrapper on $1 with $2 ahead of PATH, and prints its exit status.
+status_of() {
+	rc=0
+	PATH="$2$PATH" UDPCHAINS_LIB="$SHIM" "$WRAPPER" -q -p 127.0.0.1:1080 "$1" \
+		> /dev/null 2>&1 || rc=$?
+	echo "$rc"
+}
+mkdir -p "$TMP/x/a" "$TMP/x/b"
+printf 'echo RAN\n' > "$TMP/x/noexec"
+printf '#!/nonexistent/interpreter\n' > "$TMP/x/badinterp"
+chmod 755 "$TMP/x/badinterp"
+printf 'echo RAN\n' > "$TMP/x/a/onpath"
+cp /bin/true "$TMP/x/b/onpath"
+check "$(status_of udpchains-no-such-program "")" "127" "not found: 127"
+check "$(status_of "$TMP/x/noexec" "")" "126" "a file without execute permission: 126"
+check "$(status_of "$TMP/x/badinterp" "")" "127" "a script whose #! interpreter is missing: 127"
+check "$(status_of onpath "$TMP/x/a:")" "126" \
+	"on PATH, a file that cannot be run, and nothing after it that can: 126"
+check "$(status_of onpath "$TMP/x/a:$TMP/x/b:")" "0" "and with one after it that can, that one runs"
+
 # --- D-38: a chain is handed to the program whole ------------------------------
 
 echo "# a chain of proxies is run as a chain, and handed on whole (D-38)"

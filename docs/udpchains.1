@@ -515,18 +515,42 @@ Stdio on a UDP socket
 .RB ( fdopen (3)),
 which the shim refuses, is carried.
 .SH EXIT STATUS
+Once the program runs,
+.B udpchains
+exits with its status.
+Without
+.BR \-\-supervise ,
+.B udpchains
+replaces itself with the program, so the status, or the signal that killed it,
+is the program's own.
+Supervised,
+.B udpchains
+passes on the program's status, and if a signal killed the program,
+.B udpchains
+dies of the same signal.
+.PP
+Before the program runs:
 .TP
 .B 0
-The program ran and exited successfully.
+.B \-h
+or
+.BR \-\-version .
 .TP
 .B 1
-Configuration, proxy or shim\-loading failure. The program was not run.
+A bad option, configuration or proxy address; no program given; a shim that
+cannot be loaded; or a refusal, such as of a setuid program, or of one that
+cannot be supervised.
+The program was not run, and a diagnostic says why.
+A program can exit with 1 itself; the diagnostic tells the two apart.
 .TP
 .B 126
-The program could not be executed.
+The program was found but could not be run: it lacks execute permission, is a
+directory, or its \fB#!\fP interpreter cannot be run.
 .TP
 .B 127
-The program was not found.
+The program was not found, on
+.B PATH
+or at the path given, or its \fB#!\fP interpreter was not found.
 .SH SECURITY
 .B udpchains
 keeps a program's UDP from bypassing the proxy.

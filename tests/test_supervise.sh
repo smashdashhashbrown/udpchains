@@ -94,6 +94,24 @@ timeout -k 5 20 "${SV[@]}" sh -c 'sleep 0.3; while :; do echo x; done' | true
 check "a program writing to a closed pipe still dies of SIGPIPE, as natively" \
 	"${PIPESTATUS[0]}" 141
 
+echo "# a program that cannot be run: 127 if not found, else 126, as a shell (L19)"
+mkdir -p "$TMP/x/a" "$TMP/x/b"
+printf 'echo RAN\n' > "$TMP/x/noexec"
+printf '#!/nonexistent/interpreter\n' > "$TMP/x/badinterp"
+chmod 755 "$TMP/x/badinterp"
+printf 'echo RAN\n' > "$TMP/x/a/onpath"
+cp /bin/true "$TMP/x/b/onpath"
+timeout -k 5 20 "${SV[@]}" udpchains-no-such-program 2> /dev/null
+check "not found: 127" "$?" 127
+timeout -k 5 20 "${SV[@]}" "$TMP/x/noexec" 2> /dev/null
+check "a file without execute permission: 126" "$?" 126
+timeout -k 5 20 "${SV[@]}" "$TMP/x/badinterp" 2> /dev/null
+check "a script whose #! interpreter is missing: 127" "$?" 127
+PATH="$TMP/x/a:$PATH" timeout -k 5 20 "${SV[@]}" onpath 2> /dev/null
+check "on PATH, a file that cannot be run, and nothing after it that can: 126" "$?" 126
+PATH="$TMP/x/a:$TMP/x/b:$PATH" timeout -k 5 20 "${SV[@]}" onpath 2> /dev/null
+check "and with one after it that can, that one runs" "$?" 0
+
 echo "# the program is supervised, and given no shim (D-49)"
 out=$(timeout -k 5 20 "${SV[@]}" sh -c 'grep "^Seccomp:" /proc/self/status')
 check "the program runs under a seccomp filter" "$out" "$(printf 'Seccomp:\t2')"

@@ -198,6 +198,20 @@ None found.
   setup did not complete in 400 s in 4 runs of 4; with the fix the probe passed in 20 to 45 s,
   and `make test` passed. The wait is documented as a D-54 limitation. Left as it is: the
   probe's install group, which must run under its storm, took 8 to 29 s of that.
+- [ ] **L19** — *Reproduced, found while checking D11.* `udpchains`' status when the program
+  cannot be run differs between the modes, and from the shell's convention (127 when not found,
+  126 when found but it cannot be run; bash agrees for each case below). Measured on 2026-11-12:
+
+  | Case | Shim | Supervised | bash |
+  |---|---|---|---|
+  | file without execute permission | 127 | 127 | 126 |
+  | script whose `#!` interpreter is missing | 126 | 127 | 127 |
+
+  `resolve_program()` reports every failure as "not found or not executable", 127; the shim
+  path's failed `execv` returns 126 whatever the error, and the supervisor 127 for `ENOENT`.
+  Neither 126 nor 127 is tested. *Suggested:* 127 for `ENOENT`, 126 for any other error, in
+  both modes; a non-executable file found in `PATH` gives 126 only if nothing later in `PATH`
+  can be run, as `execvp` does.
 
 ## Documentation
 

@@ -1,9 +1,12 @@
 # Requirements Specification — `udpchains`
 
-**Project:** An `LD_PRELOAD` shim that routes a dynamically-linked program's **UDP** traffic through a
-SOCKS5 proxy that supports `UDP ASSOCIATE`, transparently and without modifying the program.
-**Status:** Draft for implementation · **Date:** 2026-08-17
-**Working name:** `udpchains` — rename freely.
+**Project:** Route an unmodified program's **UDP** traffic through a SOCKS5 proxy, or a chain of
+them, that supports `UDP ASSOCIATE`, failing closed. Two front ends share one SOCKS5 client: an
+`LD_PRELOAD` shim for dynamically linked programs, and a seccomp and `ptrace` supervisor for
+static and Go ones (§2b).
+**Status:** Baseline 2026-08-17, released as 0.1.0; extended by §2a, multi-hop chains
+(2026-10-20, released in 0.2.0), and §2b, supervisor mode (2026-10-22, not yet released). Each
+requirement's status is in [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
 
 Priority: **M** = MUST (v1 is not done without it) · **S** = SHOULD (v1 unless it endangers the
 schedule) · **C** = COULD (post-v1 if cheap).
@@ -11,6 +14,8 @@ schedule) · **C** = COULD (post-v1 if cheap).
 Each requirement is testable. "Verify" states how it is demonstrated: `unit`, `integration`,
 `inspection`, or `manual`.
 
+> §0 is the original brief, kept as it was written for the first implementation.
+>
 > **This document is self-contained by design.** It is written to be handed to an implementer with no
 > prior context. §0.3 records the evidence behind the design decisions, because two existing tools
 > already attempt this and both fail in instructive ways. **§0.4 must be read before writing or

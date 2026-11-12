@@ -84,15 +84,18 @@ static void usage(FILE *out)
 }
 
 /* Resolves what execvp() would actually run, so the SEC-06 check inspects the
- * real file rather than a name. */
+ * real file rather than a name.  Returns 0, or the error to report: ENOENT
+ * when nothing by that name exists, and, as execvp() does, EACCES when a file
+ * on PATH was found but none could be run (L19). */
 static int resolve_program(const char *name, char *out, size_t outlen)
 {
 	const char *path, *p;
+	int err = ENOENT;
 
 	if (strchr(name, '/') != NULL) {
 		if (snprintf(out, outlen, "%s", name) >= (int)outlen)
-			return -1;
-		return access(out, X_OK) == 0 ? 0 : -1;
+			return ENAMETOOLONG;
+		return access(out, X_OK) == 0 ? 0 : errno;
 	}
 
 	path = getenv("PATH");
@@ -105,21 +108,27 @@ static int resolve_program(const char *name, char *out, size_t outlen)
 
 		if (len == 0) {
 			/* An empty PATH element means the current directory. */
-			if (snprintf(out, outlen, "./%s", name) < (int)outlen &&
-			    access(out, X_OK) == 0)
-				return 0;
+			if (snprintf(out, outlen, "./%s", name) < (int)outlen) {
+				if (access(out, X_OK) == 0)
+					return 0;
+				if (errno == EACCES)
+					err = EACCES;
+			}
 		} else if (len < outlen) {
 			if (snprintf(out, outlen, "%.*s/%s", (int)len, p, name) <
-			        (int)outlen &&
-			    access(out, X_OK) == 0)
-				return 0;
+			    (int)outlen) {
+				if (access(out, X_OK) == 0)
+					return 0;
+				if (errno == EACCES)
+					err = EACCES;
+			}
 		}
 
 		if (end == NULL)
 			break;
 		p = end + 1;
 	}
-	return -1;
+	return err;
 }
 
 /* SEC-06.  The loader ignores LD_PRELOAD for AT_SECURE binaries, so such a
@@ -395,7 +404,7 @@ int main(int argc, char **argv)
 	char program[4096];
 	char shim[4096];
 	char addrbuf[UDPC_ADDRSTRLEN];
-	int i;
+	int i, exec_err;
 
 	udpc_config_init(&cli);
 
@@ -496,10 +505,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (resolve_program(argv[i], program, sizeof(program)) != 0) {
-		fprintf(stderr, "udpchains: %s: not found or not executable\n",
-		        argv[i]);
-		return 127;
+	/* L19: as a shell reports it, 127 when the program is not found and
+	 * 126 when it is but cannot be run, in both modes. */
+	exec_err = resolve_program(argv[i], program, sizeof(program));
+	if (exec_err != 0) {
+		fprintf(stderr, "udpchains: %s: %s\n", argv[i],
+		        exec_err == ENOENT ? "not found" : strerror(exec_err));
+		return exec_err == ENOENT ? 127 : 126;
 	}
 
 	if (refuse_if_privileged(program) != 0)
@@ -567,10 +579,11 @@ int main(int argc, char **argv)
 	 * swapped binary, or a PATH entry that changed in between.  argv[0]
 	 * stays as the user typed it. */
 	execv(program, &argv[i]);
+	exec_err = errno;
 
 	/* execvp's one extra: a file with no #! line and no ELF header is run
 	 * by /bin/sh.  Kept, still naming the checked file. */
-	if (errno == ENOEXEC) {
+	if (exec_err == ENOEXEC) {
 		int n = argc - i;
 		char **shargv = calloc((size_t)n + 2, sizeof(*shargv));
 
@@ -582,11 +595,14 @@ int main(int argc, char **argv)
 			for (k = 1; k < n; k++)
 				shargv[k + 1] = argv[i + k];
 			execv("/bin/sh", shargv);
+			exec_err = errno;
 			free(shargv);
 		}
 	}
 
+	/* ENOENT here is a missing #! interpreter, which a shell reports as
+	 * not found, as the supervisor does (L19). */
 	fprintf(stderr, "udpchains: cannot exec %s: %s\n", argv[i],
-	        strerror(errno));
-	return 126;
+	        strerror(exec_err));
+	return exec_err == ENOENT ? 127 : 126;
 }
