@@ -560,7 +560,11 @@ addresses. The server logged the source of every datagram and DNS query. A contr
 tool showed every datagram arriving directly. Versions: `dante-client` 1.4.3 (Ubuntu 24.04),
 PR #570 at `04f6622`, Proxando at `c7ff4ac`, graftcp v0.8.3. udpchains' supervisor mode was added
 on 2026-10-23, in the same lab, under Docker's default seccomp filter. The whole comparison was
-run again on 2026-10-27, before the next release, with the same results for every tool.
+run again on 2026-10-27, before the next release, with the same results for every tool, and on
+2026-11-12, with the same results for both udpchains modes, Dante, PR #570 and Proxando. In that
+run graftcp crashed in 2 to 11 cells of each matrix (18 to 23 round trips), and in
+`only_socks5` mode with the proxy stopped, its static Go client's datagrams reached the server
+directly; the table keeps the earlier runs.
 
 | | udpchains | udpchains `--supervise` | Dante `socksify` | PR #570 | Proxando | graftcp |
 |---|---|---|---|---|---|---|

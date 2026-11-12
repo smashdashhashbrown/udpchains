@@ -27,6 +27,7 @@ Run everything with `-v` and keep the output. The per-datagram debug line names 
 | Seven other proxies, on this host (§12) | ✅ run 2026-10-19 — Dante, 3proxy, gost, Xray, sing-box, hev-socks5-server and shadowsocks-rust. No proxy-specific udpchains defect; one general `errno` bug found and fixed. Found per-proxy datagram limits, above which the proxy silently truncates; four proxies that drop zero-length datagrams; and Dante port-restricted by default. Also covers `ATYP 0x04` to `::1`, the resolver's `CONNECT` fallback, and idle expiry |
 | The same seven as hops of chains (§13) | ✅ run 2026-10-21 — each a middle hop and an exit hop, and all seven as one chain. Every datagram limit through a chain was as predicted from the hops'; every proxy accepted a hop's relay named in a UDP header; a dead hop leaked nothing |
 | §12 and §13 again, after the release review's fixes | ✅ run 2026-10-27 — `make interop` in full, supervised checks included: 153 results ok and 28 expected, every one as recorded in §12 and §13 |
+| §12 and §13 again, before the release (after L8 to L19) | ⚠️ run 2026-11-12 — 152 ok, 26 expected, 3 failed: the shim's fidelity test through shadowsocks-rust and through the chains gost > xray and xray > sing-box. Each failed FR-F-10's scatter/gather receive, which follows the 1,024-datagram burst of FR-F-09's cap check, added for L13: the burst overflows the fixture echo server's receive buffer, and the next datagram, sent at once, is dropped there (release review L20, a defect in the test). Every other result was as recorded, and the three were as recorded on 2026-10-27 apart from that check. Rerun alone, shadowsocks-rust passed 3 times of 3. With L20 fixed, rerun the same day: 152 ok, 28 expected and 1 failed, every fidelity result as recorded. The failure was `failclosed-hop2` through Xray > sing-box: nothing reached the destination while sing-box was dead, but no send failed either, so the check, which asks for at least one, failed. That is Xray's slow passing on of a hop's death, described under §13, with its one failed re-association absorbed this time by the retry within the same send (release review L21, a weakness of the check). Rerun alone 5 times, that chain passed each time, with 1 failed send each |
 
 TFTP is **lockstep**: one block, wait for the ACK. It never has more than one datagram in flight, so
 despite the volume it says nothing about burst behaviour, receive-queue pressure, or batching. That
@@ -622,6 +623,9 @@ Each proxy did to a supervised program's datagrams exactly what it did to the sh
 zero-length results are the proxies' own, as above. Chains were not run supervised.
 
 Rerun on 2026-10-27, after the release review's fixes (H5, M11, M13, M14): the same table.
+Rerun on 2026-11-12, after L8 to L19: the same table; the shim's fidelity test through
+shadowsocks-rust failed two checks more, by L20, a defect in the test. Rerun again with L20
+fixed: the same table.
 
 ### Configurations used
 

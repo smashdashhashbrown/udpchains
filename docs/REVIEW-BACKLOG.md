@@ -214,6 +214,27 @@ None found.
   can be run, as `execvp` does.
   **Fixed (0596890)** as suggested, D-28 amended; all eight cases measured now match bash in
   both modes, and five checks in each mode test them.
+- [ ] **L20** — *Reproduced, found by `make interop` on 2026-11-12.* `t_mmsg_cap` in
+  `tests/test_fidelity.c`, added for L13 (b86f0d1), sends 1,024 datagrams to the shared echo
+  server `echo1` and closes its socket. `t_scatter_gather`, next, sends one datagram to the same
+  server at once. Through a fast proxy the burst arrives faster than the server reads it, its
+  receive buffer fills, and the next datagram is dropped there: the shim's fidelity test failed
+  FR-F-10's receive through shadowsocks-rust and the chains gost > xray and xray > sing-box.
+  Measured with a probe that does what the two tests do, 16 runs each: with no proxy at all,
+  9 of 16 next datagrams were lost, and the kernel counted 12,364 `RcvbufErrors`; through xray,
+  8 of 16; through the fixture `socks5d`, which `make test` uses, 0 of 16; with no burst, 0 of 16.
+  Not a defect in udpchains or the proxies. *Suggested:* send the burst where nothing reads it,
+  a loopback port found free by binding a socket and closing it, since only `sendmmsg`'s count
+  is checked.
+- [ ] **L21** — *Found by `make interop` on 2026-11-12, after the L20 fix.* The harness's
+  `failclosed` check passes only if nothing arrives while the hop is dead, traffic recovers, and
+  at least one send fails. Through Xray > sing-box, with sing-box killed, Xray keeps the client's
+  tunnel open for 1 to 2 s (INTEROP-CHECKLIST §13), so only udpchains' failed re-association
+  can fail a send, and in 1 full run of 4 the retry within that same send absorbed it: "leaked 0,
+  failed 0, recovered 41". Nothing leaked. Rerun alone, the chain passed 5 times of 5, each with
+  exactly 1 failed send. *Suggested:* for a dead hop behind Xray, accept no failed send, since
+  the leak and the recovery are what the check is for; or keep requiring one and record the
+  chain as one that can fail on timing.
 
 ## Documentation
 

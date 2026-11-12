@@ -386,19 +386,48 @@ static void t_mmsg_cap(void)
 	static struct mmsghdr m[1025];
 	char payload[] = "cap";
 	struct iovec iov = { payload, 3 };
-	int fd = udp4(), i;
+	struct sockaddr_in sink = { .sin_family = AF_INET };
+	socklen_t len = sizeof(sink);
+	int fd = udp4(), sinkfd = udp4(), i;
 
 	TAP_GROUP("FR-F-09: sendmmsg sends at most 1024 messages, as the kernel does");
+	/* Only the count is checked, so the burst goes to a socket of this
+	 * test's own that never reads it.  Sent to an echo server, it filled
+	 * that server's receive buffer, and the next test's datagram was
+	 * dropped there.  The socket stays open: a closed port's ICMP error
+	 * ends a Dante association, which connects to its destination, part
+	 * way through the burst (release review L20). */
+	sink.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	bind(sinkfd, (struct sockaddr *)&sink, sizeof(sink));
+	getsockname(sinkfd, (struct sockaddr *)&sink, &len);
 	memset(m, 0, sizeof(m));
 	for (i = 0; i < 1025; i++) {
-		m[i].msg_hdr.msg_name = &g_echo1;
-		m[i].msg_hdr.msg_namelen = sizeof(g_echo1);
+		m[i].msg_hdr.msg_name = &sink;
+		m[i].msg_hdr.msg_namelen = sizeof(sink);
 		m[i].msg_hdr.msg_iov = &iov;
 		m[i].msg_hdr.msg_iovlen = 1;
 	}
 	TAP_EQ_INT(sendmmsg(fd, m, 1025, 0), 1024, "sendmmsg of 1025 returns 1024");
 	TAP_EQ_INT(m[1024].msg_len, 0, "and the 1025th was not sent");
 	close(fd);
+
+	/* A real proxy can still drop a datagram while it relays the burst:
+	 * through xray, 2 in 32 straight after it.  One round trip, tried
+	 * up to ten times, shows the path is clear before the next test. */
+	for (i = 0; i < 10; i++) {
+		struct timeval tv = { 1, 0 };
+		char buf[8];
+
+		fd = socket(AF_INET, SOCK_DGRAM, 0);
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		sendto(fd, payload, 3, 0, (struct sockaddr *)&g_echo1, sizeof(g_echo1));
+		if (recv(fd, buf, sizeof(buf), 0) == 3) {
+			close(fd);
+			break;
+		}
+		close(fd);
+	}
+	close(sinkfd);
 }
 
 static void t_scatter_gather(void)
