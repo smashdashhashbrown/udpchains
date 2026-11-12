@@ -106,8 +106,11 @@ SSKEY=interop-ss-key
 # PORTSW pass | fail, for a reply from a switched port (the TFTP pattern)
 # AUTHE  errno when credentials are refused, or - if not tested
 # IDLE   a setting that shortens the UDP timeout to 4 s, or - if none known
+# HOLDS  yes if, as a middle hop, it keeps the client's tunnel open for a while
+#        after the next hop dies (INTEROP-CHECKLIST.md 13), so a send need not
+#        fail while it is dead
 
-declare -A IDX WHOLE CUT ZERO PORTSW AUTHE IDLE
+declare -A IDX WHOLE CUT ZERO PORTSW AUTHE IDLE HOLDS
 IDX=([dante]=0 [3proxy]=1 [gost]=2 [xray]=3 [singbox]=4 [hev]=5 [ssrust]=6)
 WHOLE=([dante]=65497 [3proxy]=16326 [gost]=65497 [xray]=8182 [singbox]=16122 [hev]=1490 [ssrust]=65000)
 CUT=([dante]=- [3proxy]=16327 [gost]=- [xray]=8183 [singbox]=16123 [hev]=1491 [ssrust]=-)
@@ -115,6 +118,7 @@ ZERO=([dante]=deliver [3proxy]=drop [gost]=deliver [xray]=drop [singbox]=deliver
 PORTSW=([dante]=fail [3proxy]=pass [gost]=pass [xray]=pass [singbox]=pass [hev]=pass [ssrust]=pass)
 AUTHE=([dante]=EACCES [3proxy]=ECONNRESET [gost]=EACCES [xray]=EACCES [singbox]=EACCES [hev]=EACCES [ssrust]=-)
 IDLE=([dante]=yes [3proxy]=- [gost]=- [xray]=yes [singbox]=yes [hev]=yes [ssrust]=yes)
+HOLDS=([dante]=- [3proxy]=- [gost]=- [xray]=yes [singbox]=- [hev]=- [ssrust]=-)
 
 # Ports, per proxy index i: the plain instance, the authenticated one, a
 # variant (Dante with udp.connectdst off, gost at its default buffer), and a
@@ -532,7 +536,7 @@ check_auth() {	# <auth proxy addr>
 # The proxy is killed under a steady sender, then started again.  Nothing may
 # reach the destination while it is dead (SEC-01), and the same socket must
 # carry traffic again once it is back (FR-P-08).
-check_failclosed() {	# <proxy addr> <container> [check name]
+check_failclosed() {	# <proxy addr> <container> [check name] [hop before the dead one]
 	local name=${3:-failclosed} f="$LOGS/$CUR.${3:-failclosed}.log" sink spid t_kill t_start leaked after fails errs
 	start_bg sink "sink-$CUR" "$PROBE" sink
 	shim 30 "$1" "$PROBE" steady 127.0.0.1 "$sink" 9 > "$f" 2>&1 &
@@ -553,6 +557,12 @@ check_failclosed() {	# <proxy addr> <container> [check name]
 	errs=$(awk '/^fail/{print $3}' "$f" | sort | uniq -c | awk '{printf "%s%s x%s", s, $2, $1; s=", "}')
 	if [ "$leaked" -eq 0 ] && [ "$fails" -gt 0 ] && [ "$after" -gt 0 ]; then
 		result ok "$name" "0 arrived while dead, sends failed ($errs), recovered ($after arrived)"
+	elif [ "$leaked" -eq 0 ] && [ "$fails" -eq 0 ] && [ "$after" -gt 0 ] &&
+		[ -n "${4:-}" ] && [ "${HOLDS[$4]}" = yes ]; then
+		# The hop before held the tunnel open, so udpchains could not
+		# know; its one failed re-association can be absorbed by the
+		# retry in the same send (release review L21).
+		result ok "$name" "0 arrived while dead, no send failed: $4 held the tunnel open (INTEROP-CHECKLIST 13), recovered ($after arrived)"
 	else
 		result FAIL "$name" "leaked $leaked, failed $fails, recovered $after (see $f)"
 	fi
@@ -801,7 +811,7 @@ check_named() {	# <hop 1 addr> <hop 2 port>
 # The checks for one chain.  The exit hop's expectations apply to what only it
 # decides.
 run_chain() {	# <full|short> <hop names...>
-	local depth=$1 h i=0 port c="" n=$(($# - 1))
+	local depth=$1 h i=0 port c="" n=$(($# - 1)) prev=""
 	shift
 	CUR=chain-$(IFS=-; echo "$*")
 	echo | tee -a "$LOGS/summary"
@@ -825,8 +835,10 @@ run_chain() {	# <full|short> <hop names...>
 	check_resolve "$c"
 	for h; do
 		i=$((i + 1))
-		[ "$depth" = full ] || [ $i -eq $(((n + 1) / 2)) ] || continue
-		check_failclosed "$c" "udpc-interop-$h-plain" "failclosed-hop$i"
+		[ "$depth" = full ] || [ $i -eq $(((n + 1) / 2)) ] ||
+			{ prev=$h; continue; }
+		check_failclosed "$c" "udpc-interop-$h-plain" "failclosed-hop$i" "$prev"
+		prev=$h
 	done
 }
 

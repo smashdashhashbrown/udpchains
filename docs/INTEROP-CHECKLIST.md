@@ -27,7 +27,7 @@ Run everything with `-v` and keep the output. The per-datagram debug line names 
 | Seven other proxies, on this host (§12) | ✅ run 2026-10-19 — Dante, 3proxy, gost, Xray, sing-box, hev-socks5-server and shadowsocks-rust. No proxy-specific udpchains defect; one general `errno` bug found and fixed. Found per-proxy datagram limits, above which the proxy silently truncates; four proxies that drop zero-length datagrams; and Dante port-restricted by default. Also covers `ATYP 0x04` to `::1`, the resolver's `CONNECT` fallback, and idle expiry |
 | The same seven as hops of chains (§13) | ✅ run 2026-10-21 — each a middle hop and an exit hop, and all seven as one chain. Every datagram limit through a chain was as predicted from the hops'; every proxy accepted a hop's relay named in a UDP header; a dead hop leaked nothing |
 | §12 and §13 again, after the release review's fixes | ✅ run 2026-10-27 — `make interop` in full, supervised checks included: 153 results ok and 28 expected, every one as recorded in §12 and §13 |
-| §12 and §13 again, before the release (after L8 to L19) | ⚠️ run 2026-11-12 — 152 ok, 26 expected, 3 failed: the shim's fidelity test through shadowsocks-rust and through the chains gost > xray and xray > sing-box. Each failed FR-F-10's scatter/gather receive, which follows the 1,024-datagram burst of FR-F-09's cap check, added for L13: the burst overflows the fixture echo server's receive buffer, and the next datagram, sent at once, is dropped there (release review L20, a defect in the test). Every other result was as recorded, and the three were as recorded on 2026-10-27 apart from that check. Rerun alone, shadowsocks-rust passed 3 times of 3. With L20 fixed, rerun the same day: 152 ok, 28 expected and 1 failed, every fidelity result as recorded. The failure was `failclosed-hop2` through Xray > sing-box: nothing reached the destination while sing-box was dead, but no send failed either, so the check, which asks for at least one, failed. That is Xray's slow passing on of a hop's death, described under §13, with its one failed re-association absorbed this time by the retry within the same send (release review L21, a weakness of the check). Rerun alone 5 times, that chain passed each time, with 1 failed send each |
+| §12 and §13 again, before the release (after L8 to L21) | ✅ run 2026-11-12, after two fixes to the tests: 153 ok and 28 expected, every result as recorded in §12 and §13 and as on 2026-10-27. The first run that day gave 152 ok, 26 expected and 3 failed: the shim's fidelity test through shadowsocks-rust and through the chains gost > xray and xray > sing-box, each failing FR-F-10's scatter/gather receive. That receive follows the 1,024-datagram burst of FR-F-09's cap check, added for L13, which overflowed the fixture echo server's receive buffer, so the next datagram, sent at once, was dropped there (release review L20, a defect in the test; rerun alone, shadowsocks-rust passed 3 times of 3). With L20 fixed: 152 ok, 28 expected and 1 failed, `failclosed-hop2` through Xray > sing-box. Nothing reached the destination while sing-box was dead, but no send failed either, which the check then required: Xray's slow passing on of a hop's death, described under §13, with udpchains' one failed re-association absorbed by the retry within the same send (release review L21, a weakness of the check; rerun alone 5 times, the chain passed each time, with 1 failed send each). With L21 fixed, the clean run above; one send through Xray failed in it, so the new rule was not needed, and a mutation counting no failed send showed it accepting that hop alone |
 
 TFTP is **lockstep**: one block, wait for the ACK. It never has more than one datagram in flight, so
 despite the volume it says nothing about burst behaviour, receive-queue pressure, or batching. That
@@ -625,7 +625,7 @@ zero-length results are the proxies' own, as above. Chains were not run supervis
 Rerun on 2026-10-27, after the release review's fixes (H5, M11, M13, M14): the same table.
 Rerun on 2026-11-12, after L8 to L19: the same table; the shim's fidelity test through
 shadowsocks-rust failed two checks more, by L20, a defect in the test. Rerun again with L20
-fixed: the same table.
+fixed, and again with L21 fixed: the same table.
 
 ### Configurations used
 
@@ -809,6 +809,10 @@ destination at any point. Every other middle hop closed the tunnel at once, so s
 the first one after the kill. Xray's documentation describes `policy` timers, `uplinkOnly` and
 `downlinkOnly`, that keep a connection open for a while after one side closes; whether they are
 the cause was not tested. A program cannot tell such lost datagrams from ordinary UDP loss.
+The re-association's one failure can itself be absorbed by its retry within the same send, so
+that no send fails at all, as in 1 full run of 4 on 2026-11-12. `make interop` therefore accepts
+a hop behind Xray dying with no send failed, provided nothing arrives while it is dead and
+traffic recovers (release review L21); for any other hop, a send must still fail.
 
 ### What this does not show
 
