@@ -269,8 +269,10 @@ None found.
 - [x] **D12** — `UDP-PRELOAD-REQUIREMENTS.md`: the header still describes an `LD_PRELOAD` shim for
   dynamically linked programs only, and is marked "Draft for implementation, 2026-08-17".
   **Fixed (0596890):** it describes both front ends and chains, and the document's history.
-- [ ] **D13** — Release steps not yet done: `VERSION` in the `Makefile` is still `0.2.0`, and the
+- [x] **D13** — Release steps not yet done: `VERSION` in the `Makefile` is still `0.2.0`, and the
   CHANGELOG entry is `[Unreleased]`.
+  **Fixed (bf1d615):** released as 0.3.0 on 2026-11-12, with FR-SV-17 not started, by the
+  maintainer's decision; the status lines in the requirements and design documents updated.
 
 ## Carried over
 
