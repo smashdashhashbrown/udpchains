@@ -273,6 +273,20 @@ None found.
   CHANGELOG entry is `[Unreleased]`.
   **Fixed (bf1d615):** released as 0.3.0 on 2026-11-12, with FR-SV-17 not started, by the
   maintainer's decision; the status lines in the requirements and design documents updated.
+- [x] **D14** — *Found on 2026-11-12, checking the 0.3.0 release's `make test` against the
+  table; recorded after the tag.* `docs/TRACEABILITY.md` gives fault injection as 43 assertions, with nothing to say what
+  they are, and the run shows 28 `ok` lines of the group's own. The other 15 are the numbered
+  assertions of the programs it runs through chains (`test_faults` for expiry at a middle hop,
+  `FRAG` at an inner layer and at the innermost, a forged inner source, and the descriptor range
+  running out), which it prints indented as comments: 28 + 15 = 43, and every check passed. Other
+  rows count only the group's own checks and name the programs' assertions apart: D-22 resolve
+  is "24 checks, over nine program runs making 211 assertions of their own", FR-SV "81 checks",
+  and the total of 2372 adds the rows as written, so it counts the programs' assertions for this
+  group alone. The count has stood since 841f416. *Suggested:* write the row as the others are,
+  "28 checks, and five program runs through chains making 15 assertions of their own", and
+  regenerate the total from a run (2357); or keep 43 and say what it counts.
+  **Fixed as suggested,** in this commit: the row and the total, 2357, from the 0.3.0 release's
+  run, whose groups each match the table. The CHANGELOG's released 0.3.0 entry keeps its 2372.
 
 ## Carried over
 

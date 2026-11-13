@@ -25,7 +25,7 @@ The two **M** requirements without automated verification are NFR-03 (async-sign
 SEC-05 (no listening socket), both of which the baseline itself marks `Verify: inspection`. Their
 inspection basis is recorded in the notes below.
 
-**Test totals:** 2372 assertions across 26 groups (`tests/run.sh`), all passing, plus the 91-check
+**Test totals:** 2357 assertions across 26 groups (`tests/run.sh`), all passing, plus the 91-check
 symbol gate run by `make check`. The numbers are what `tests/run.sh` prints; regenerate this table
 from a run rather than editing it by hand.
 
@@ -50,7 +50,7 @@ from a run rather than editing it by hand.
 | D-22 resolve | 24 checks, over nine program runs making 211 assertions of their own |
 | wrapper loadability | 22 |
 | TST-03 leak | 23 checks |
-| fault injection | 43 |
+| fault injection | 28 checks, and five program runs through chains making 15 assertions of their own |
 | FR-SV supervisor mode | 81 checks, seventeen of them running static programs making 27, 4, 19, 6, 37, 8, 4, 24, 31, 2, 4, 31, 5, 7, 5, 10 and 18 assertions of their own |
 | FR-SV-T1 hook matrix, `-static`, under the supervisor | 108 |
 | FR-SV-T1 the same through 2 hops | 108 |
