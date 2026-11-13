@@ -707,7 +707,7 @@ once a second, with no vaguer line after it (D-43). A dropped datagram names its
 ## 13. Supervisor mode (FR-SV-*)
 
 **Status:** built for x86-64, all six steps of [`FUTURE-STATIC-BINARIES.md`](FUTURE-STATIC-BINARIES.md)
-§7; on `develop`, not yet released. The decisions are D-48 to D-55, the requirements §2b. The supervisor carries a static program's UDP through the
+§7; released in 0.3.0. The decisions are D-48 to D-55, the requirements §2b. The supervisor carries a static program's UDP through the
 proxy or chain, from sockets it makes in a reserved range. Calls on those sockets are carried
 while their thread is stopped by `ptrace`, so a signal can never part what was done for a call
 from what it returns (D-54). Threads, `fork`, `vfork`, `clone` and `exec` are followed (step 5), and

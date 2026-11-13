@@ -9,7 +9,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
 [`UDP-PRELOAD-REQUIREMENTS.md`](UDP-PRELOAD-REQUIREMENTS.md) and mapped in
 [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md).
 
-## [Unreleased]
+## [0.3.0] — 2026-11-12
+
+Supervisor mode, for static and Go binaries, on x86-64.
 
 ### Added
 
@@ -83,8 +85,9 @@ Requirement IDs (`FR-*`, `NFR-*`, `SEC-*`) are from
     systemd-resolved's, nscd's or avahi's socket is refused, as when the daemon is not running, so
     the lookup falls through to DNS and so to `dns` rather than being resolved outside the proxy.
     `allow_resolver_daemons = yes` (`UDPCHAINS_ALLOW_RESOLVER_DAEMONS`) lets them through.
-  - **Not yet:** aarch64 (deferred). Lookups a resolver daemon receives over D-Bus are not
-    refused.
+  - **Not yet:** aarch64 (deferred). Choosing the mode automatically for static and Go binaries
+    (FR-SV-17), which waits for interop across hosts (deferred). Lookups a resolver daemon
+    receives over D-Bus are not refused.
 
 ### Changed
 
@@ -397,5 +400,6 @@ Documented in full in the README's *Security considerations* and *What does not 
   the delta between the same binary run with and without the shim. Inside the 100 µs budget, and
   an upper bound since the proxy hop is not separable.
 
+[0.3.0]: https://github.com/smashdashhashbrown/udpchains/releases/tag/v0.3.0
 [0.2.0]: https://github.com/smashdashhashbrown/udpchains/releases/tag/v0.2.0
 [0.1.0]: https://github.com/smashdashhashbrown/udpchains/releases/tag/v0.1.0

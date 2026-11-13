@@ -1,7 +1,8 @@
 # Future requirement — static and Go binaries (supervisor mode)
 
-**Status:** built for x86-64, all six steps of §7, on `develop` (merged 2026-10-26) and not yet
-released; aarch64 is deferred by the maintainer. The decisions are D-48 to D-55, the requirements
+**Status:** built for x86-64, all six steps of §7, merged into `develop` on 2026-10-26 and
+released in 0.3.0 on 2026-11-12; automatic choice of the mode (FR-SV-17) waits for interop across
+hosts, and aarch64 is deferred by the maintainer. The decisions are D-48 to D-55, the requirements
 are §2b of [`UDP-PRELOAD-REQUIREMENTS.md`](../UDP-PRELOAD-REQUIREMENTS.md), which is now the
 reference for them, and the design is DESIGN.md §13. §9 lists the known limitations the decisions
 accept. This document is the plan and its history; where it differs from those, they are current.

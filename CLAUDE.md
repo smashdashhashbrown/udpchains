@@ -53,11 +53,11 @@
 - New behaviour is checked with mutations: break it, show a test fails, restore it, and record the
   result in `docs/TRACEABILITY.md`.
 
-## Where things stand (2026-10-26)
+## Where things stand (2026-11-12)
 
-- 0.1.0 and 0.2.0 (multi-hop chains) are released. Supervisor mode (D-48 to D-55) is built for
-  x86-64 and merged into `develop`, not yet released.
-- `release_review` holds the comprehensive review of all code, documentation and tests before
-  the next tag. Record findings in `docs/REVIEW-BACKLOG.md`, in a new section for this release,
-  with IDs and severities as in the 0.1.0 review.
-- Deferred by the maintainer: supervisor mode on aarch64 (FR-SV-16), and interop across hosts.
+- 0.1.0, 0.2.0 (multi-hop chains) and 0.3.0 (supervisor mode, D-48 to D-55, x86-64) are
+  released. 0.3.0 followed a comprehensive review of all code, documentation and tests, recorded
+  in `docs/REVIEW-BACKLOG.md`; record a later review there the same way, in a new section, with
+  IDs and severities as before.
+- Deferred by the maintainer: supervisor mode on aarch64 (FR-SV-16), interop across hosts, and
+  so choosing supervisor mode automatically (FR-SV-17).
