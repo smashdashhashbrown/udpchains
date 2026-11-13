@@ -14,6 +14,9 @@
   each is met, including mutations tried.
 - `CONTRIBUTING.md`: the clean-room rule, and how to run every kind of test.
 - `docs/REVIEW-BACKLOG.md`: review findings, by ID, ticked with the commit that fixes them.
+- `docs/INTEROP-CHECKLIST.md`: real-proxy interop, §12 single proxies and §13 chains, with every
+  run recorded. What each proxy is expected to do is in the tables at the top of
+  `tests/interop/run.sh` (`WHOLE`, `CUT`, `ZERO`, `PORTSW`, `AUTHE`, `IDLE`, `HOLDS`).
 - `docs/FUTURE-STATIC-BINARIES.md`: supervisor mode's plan and history; §9 lists its accepted
   limitations.
 - `CHANGELOG.md`: what changed, by release.
@@ -35,16 +38,24 @@
   second host yet.
 - **Report faithfully:** a skipped test is not a pass, and a claim made in the docs needs a test
   or a measurement behind it.
+- **Review findings:** record each in `docs/REVIEW-BACKLOG.md` with an ID (IDs continue across
+  reviews), propose a fix, and fix only those the maintainer names. Once a fix is committed, tick
+  the item in a second commit that cites the fix's hash, unless told to do both in one.
+- **A released CHANGELOG entry is not edited** after its tag, even when a later fix changes a
+  figure it quotes. Start a new `## [Unreleased]` section for the next change.
 
 ## Testing notes
 
 - `make test` runs 26 groups; `tests/run.sh` prints each. The totals in `docs/TRACEABILITY.md` are
-  copied from a run, never edited by hand.
+  copied from a run, never edited by hand. A group's count is its own `ok` lines, numbered or
+  not; assertions that programs it runs print indented under `#` are named apart in the row
+  ("24 checks, over nine program runs making 211 assertions of their own"), not added in (D14).
 - `tests/run.sh` exports `UDPCHAINS_QUIET=1`. A check that depends on what `udpchains` writes to
   stderr must run it with `-v`, or it passes vacuously. Try a mutation under `make test`, not only
   by running a script on its own.
 - `tests/run_sanitizers.sh` runs `make clean`: rebuild afterwards, and do not run anything else
-  from `build/` while it runs.
+  from `build/` while it runs. It also removes `build/interop_probe`, which `make interop`
+  rebuilds but `tests/interop/run.sh` run alone does not.
 - `make interop` needs Docker; `tests/test_failclosed_capture.sh` needs root, so the maintainer
   runs it.
 - Wrap supervised runs in `timeout -k`: the supervisor answers `SIGTERM` by passing it to its
@@ -53,11 +64,30 @@
 - New behaviour is checked with mutations: break it, show a test fails, restore it, and record the
   result in `docs/TRACEABILITY.md`.
 
+## Releasing
+
+As for 0.2.0 (5dc484d) and 0.3.0 (bf1d615), each step when the maintainer says so:
+
+1. Set `VERSION` in the `Makefile` and the version and date in the man page's `.TH` line.
+2. In `CHANGELOG.md`, turn `[Unreleased]` into `[x.y.z] — date` with a one-line summary, and add
+   its link at the bottom. Do not add a new `[Unreleased]` heading.
+3. Change "not yet released" to "released in x.y.z" wherever the feature's status is given:
+   the requirements, `docs/TRACEABILITY.md`, `docs/DESIGN.md`, its `docs/FUTURE-*.md`, and here.
+4. Run `make test` (and `make interop` if the code changed since its last run); commit as
+   `release: x.y.z`.
+5. Fast-forward `main` to the release commit and `develop` to the branch head, and tag the
+   release commit `vx.y.z`, annotated, with a short message (`git show v0.3.0`). Push `main`,
+   `develop` and the tag only when asked.
+
 ## Where things stand (2026-11-12)
 
 - 0.1.0, 0.2.0 (multi-hop chains) and 0.3.0 (supervisor mode, D-48 to D-55, x86-64) are
-  released. 0.3.0 followed a comprehensive review of all code, documentation and tests, recorded
-  in `docs/REVIEW-BACKLOG.md`; record a later review there the same way, in a new section, with
-  IDs and severities as before.
-- Deferred by the maintainer: supervisor mode on aarch64 (FR-SV-16), interop across hosts, and
-  so choosing supervisor mode automatically (FR-SV-17).
+  released. `main` is at the 0.3.0 release commit (bf1d615, tag `v0.3.0`); `develop` has
+  only documentation since (D14, and this file). Start new work on a branch from `develop`.
+- The 0.3.0 review is finished: every finding in `docs/REVIEW-BACKLOG.md` is ticked except the
+  cross-host interop carried over from 0.1.0, and `io_uring`, a documented way around the shim
+  (D-21) that only supervisor mode closes. Its branch, `release_review`, is merged; its copy on
+  `origin` is out of date and not needed. Record a later review the same way, in a new section at
+  the top, with IDs and severities as before.
+- No feature is planned or in progress. Deferred by the maintainer: supervisor mode on aarch64
+  (FR-SV-16), interop across hosts, and so choosing supervisor mode automatically (FR-SV-17).
